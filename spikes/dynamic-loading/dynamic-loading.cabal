@@ -1,0 +1,52 @@
+cabal-version:      3.0
+name:               dynamic-loading
+version:            0.1.0.0
+synopsis:           Feasibility spike for DataCode dynamic schema loading
+description:
+  Tests three approaches to runtime schema evolution in Haskell:
+  1. hint (GHC interpreter) for runtime Haskell eval
+  2. GADT DSL interpreter (typed, no GHC at runtime)
+  3. Data.Dynamic / Typeable for runtime type representation
+
+license:            MIT
+author:             DataCode Contributors
+build-type:         Simple
+
+common warnings
+  ghc-options: -Wall -Wno-unused-top-binds
+
+executable dynamic-loading-spike
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app
+  default-language: GHC2021
+
+  other-modules:
+    Spike.HintApproach
+    Spike.GADTDSLApproach
+    Spike.DynamicTypesApproach
+    Spike.Benchmark
+
+  hs-source-dirs:   app, src
+
+  build-depends:
+    base          >= 4.14 && < 5,
+    hint          >= 0.9  && < 0.10,
+    time          >= 1.9  && < 2,
+    text          >= 1.2  && < 2.2,
+    containers    >= 0.6  && < 0.8,
+    mtl           >= 2.2  && < 2.4,
+    deepseq       >= 1.4  && < 1.6
+
+  -- GHC extensions used across the spike
+  default-extensions:
+    GADTs
+    DataKinds
+    TypeFamilies
+    RankNTypes
+    ScopedTypeVariables
+    LambdaCase
+    OverloadedStrings
+    DeriveGeneric
+    GeneralizedNewtypeDeriving
+    StandaloneDeriving
