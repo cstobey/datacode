@@ -7,6 +7,26 @@ DataCode schemas are closer to TutorialD than SQL. The core shift:
 - A **field** has a precise type with associated validation functors
 - A **query/view** is indistinguishable from a table definition — both are views over the transaction graph
 - There is **no NULL** — absent values are expressed as typed ADTs
+- Tables are organized in a **namespace tree** (see namespaces.md) — namespaces replace the SQL "database" concept
+
+## Namespace Organization
+
+Every table belongs to a namespace. Namespaces are dot-separated hierarchical paths:
+- `app.commerce.orders` — user-defined application schema
+- `connectors.mariadb.production.orders` — auto-generated connector shadow schema
+- `system.auth.users` — DataCode self-management tables
+
+Full namespace documentation: see `namespaces.md`.
+
+## Schema Visibility Layers
+
+DataCode maintains multiple layers of schema simultaneously:
+
+1. **Auto-generated connector shadow schemas** (`connectors.*`): created when a connector is added; updated automatically as the external schema changes; hidden from the default IDE view
+2. **User-defined application schemas** (`app.*`): created by schema authors; may be views or extensions over connector schemas; visible by default
+3. **System schemas** (`system.*`): DataCode internals; visible only to admin tokens
+
+This layering enables data independence: the human-understood schema (`app.*`) can evolve independently of the physical/connector schema underneath it, with coercion handled by functors between the layers.
 
 ## Type System
 
@@ -48,6 +68,36 @@ table Order {
   total       : Decimal
 }
 ```
+
+### The `all` Selector and Field Propagation
+
+Views and connector shadow schema overlays can use an `all` (or `*`) selector to include all fields from a source table. The selector determines how new fields propagate when the source schema changes:
+
+```
+-- Wildcard: tracks source schema dynamically
+-- When the source gains a new field, it automatically appears here
+view app.commerce.order_summary {
+  * FROM connectors.mariadb.production.orders   -- all fields from source
+  status : OrderStatus                           -- explicit override: coerces Text -> ADT
+}
+
+-- Explicit field list: stable, change-resistant
+-- New fields in the source do NOT propagate automatically
+view app.commerce.order_detail {
+  id     : UUID    FROM connectors.mariadb.production.orders
+  total  : Amount  FROM connectors.mariadb.production.orders
+  status : OrderStatus
+}
+```
+
+**Propagation rules:**
+- `* FROM <source>` — binds to the source's current schema at query time. New fields in the source appear in the view automatically. Explicit overrides (fields declared by name in the same view) take precedence over the wildcard for that field.
+- Named fields — stable binding. The view only exposes the named fields regardless of what the source adds. Adding a new field requires an explicit schema change to the view.
+- Mixed — a view can use `*` for the bulk of fields and override specific ones by name. The named overrides shadow the wildcard for those fields.
+
+**Functor interaction:** Validation functors declared on the view apply to the specific fields named in the functor declaration. A wildcard-included field that has no explicit functor inherits any functors declared on the source field's type. A field declared explicitly in the view can add additional functors on top of the inherited ones.
+
+**Schema transaction graph:** When a wildcard view resolves differently because the source gained a new field, that resolution is recorded in the query's provenance — the view's effective field set is always deterministic at any given schema transaction graph node. Pinning a query to a historical schema node pins both the view definition and the source schema snapshot it resolves against.
 
 ### Views and Queries
 Views are defined identically to tables — they are just table definitions whose "data" is computed from the transaction graph rather than stored directly:

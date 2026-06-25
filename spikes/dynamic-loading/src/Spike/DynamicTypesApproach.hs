@@ -62,7 +62,7 @@ type SchemaRegistry = [(String, DynSchema)]
 -- ---------------------------------------------------------------------------
 -- Registry Operations
 
-registerType :: Typeable a => String -> [(String, TypeRep)] -> [DynFunctor] -> DynSchema
+registerType :: String -> [(String, TypeRep)] -> [DynFunctor] -> DynSchema
 registerType name fields functors = DynSchema name fields functors
 
 registerFunctor
@@ -182,7 +182,7 @@ runDynSpike = do
     return $ map (\v -> (v, applyDynFunctor amountFunctor (toDyn v))) testValues
   mapM_ (\(v, r) ->
     putStrLn $ "  " ++ show v ++ " => " ++ show (fmap dynTypeRep r)
-              ++ " | " ++ show (fmap show r `either` ("ERROR: "++) $ r)
+              ++ " | " ++ either ("ERROR: "++) show r
     ) results2
 
   -- Test 3: Type mismatch detection

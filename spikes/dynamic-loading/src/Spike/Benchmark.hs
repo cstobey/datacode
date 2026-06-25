@@ -64,8 +64,6 @@ benchDSL = do
 -- Dynamic/Typeable Approach Benchmark
 
 newtype BenchAmount = BenchAmount Int deriving (Show, Eq)
-instance Eq BenchAmount where
-  BenchAmount a == BenchAmount b = a == b
 
 benchDynamic :: IO BenchResult
 benchDynamic = do

@@ -7,6 +7,7 @@
 -- Key question: is this DSL expressive enough to represent real DataCode functors?
 -- This spike tests the ceiling by trying to encode progressively complex cases.
 
+{-# LANGUAGE DuplicateRecordFields #-}
 module Spike.GADTDSLApproach
   ( DSLResult (..)
   , runDSLSpike
@@ -269,7 +270,7 @@ data FunctorExpr
 
 -- Apply a functor to a value in a context
 applyFunctor :: EvalContext -> FunctorExpr -> Either ValidationError ()
-applyFunctor ctx (FValidate _ fieldVar cond errExpr) = do
+applyFunctor ctx (FValidate _ _ cond errExpr) = do
   let ctx' = ctx  -- fieldVar should already be in ctx; we just evaluate
   result <- evalExpr ctx' cond
   case result of

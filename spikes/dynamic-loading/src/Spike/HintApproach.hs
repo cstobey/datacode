@@ -16,7 +16,6 @@ module Spike.HintApproach
 
 import Language.Haskell.Interpreter
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
-import Control.Exception (try, SomeException)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -89,7 +88,7 @@ runHintSpike = do
       putStrLn "\nTest 5: Compile same functor 5 times — does it get faster?"
       times <- mapM (\_ -> fst <$> timed (hintLoadFunctor validationSource)) [1..5 :: Int]
       mapM_ (\(i,t) -> putStrLn $ "  Run " ++ show i ++ ": " ++ showMs t ++ "ms")
-            (zip [1..] times)
+            (zip [1 :: Int ..] times)
 
       putStrLn "\nSummary:"
       putStrLn $ "  Initial load latency: " ++ showMs loadTime ++ "ms"

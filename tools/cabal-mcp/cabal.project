@@ -1,0 +1,5 @@
+packages: .
+
+constraints:
+  recv < 0.1.1,
+  crypton-pem < 0.3.0

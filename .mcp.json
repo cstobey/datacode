@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "cabal": {
+      "type": "stdio",
+      "command": "cabal",
+      "args": ["run", "--project-dir", "tools/cabal-mcp", "cabal-mcp"]
+    }
+  }
+}

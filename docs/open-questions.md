@@ -79,3 +79,51 @@ Questions that need answers before or during implementation. Grouped by urgency.
 **Question**: What is the full progression from radio buttons through "shopping cart" for relationship rendering?
 **Notes**: Chris indicated he can provide the full list later.
 **Action**: Get the full list and incorporate into `api-and-rendering.md`.
+
+---
+
+## Connector and Ingestion Questions
+
+### OQ-017: PostgreSQL Logical Replication Spike
+**Question**: Is `postgresql-replicant` forkable, or must we write a PostgreSQL logical replication client from scratch against `postgresql-libpq`?
+**Why it matters**: `postgresql-replicant` was abandoned in 2021 and is self-described as experimental. PostgreSQL's `wal2json` protocol is well-documented, so a from-scratch implementation is feasible but is 2–4 weeks of work.
+**Action**: Evaluate `postgresql-replicant` source; determine if a fork is faster than a rewrite. Also evaluate wrapping `pg_recvlogical` as a sidecar process as a short-term alternative.
+
+### OQ-018: Redis CDC Approach
+**Question**: Redis Streams (`XREAD`/`XREADGROUP`) as explicit CDC vs. implementing PSYNC replication protocol vs. wrapping an external tool (e.g., RedisShake)?
+**Tradeoffs**: Streams = simple but requires Redis source to publish to a stream (not transparent). PSYNC = transparent but significant implementation work. External tool = fastest but adds an operational dependency.
+**Action**: Determine whether "transparent to the source" is a hard requirement for Redis, or whether requiring Redis Streams is acceptable.
+
+### OQ-019: Connector Daemon Architecture
+**Question**: Is the connector daemon a separate process (separate daemon alongside the schema and data daemons) or a thread pool within the main DataCode server process?
+**Notes**: Separate process allows independent restart; same process is simpler. Connector failures should not crash the main server.
+**Action**: Decide during core architecture design; likely a separate supervised process.
+
+### OQ-020: Webhook Endpoint Security
+**Question**: How does DataCode authenticate incoming webhooks from external services (e.g., Stripe signature verification)?
+**Notes**: Each API has its own webhook authentication mechanism (HMAC, shared secret, JWT). This needs to be configurable per connector without code changes.
+**Action**: Design a webhook authentication plugin interface; configuration stored in system tables.
+
+### OQ-021: IDE Graph Layout Library
+**Question**: ELK.js (client-side WebWorker), `graphviz` (server-side process), or D3.js force-directed for ER diagram layout?
+**Notes**: ELK.js handles large graphs well and supports Sugiyama layout. `graphviz` is more mature but requires a server-side process. D3.js force-directed is simpler but produces less readable hierarchical layouts.
+**Recommendation**: ELK.js for interactive layout + `graphviz` for static export. Needs validation.
+
+### OQ-022: IDE Bootstrapping
+**Question**: Is the IDE a separate DataCode application (its own namespace/shard) or deeply integrated into the server?
+**Tradeoff**: Separate is cleaner for upgrades and lets the IDE be updated independently. Integrated avoids the bootstrapping problem (the IDE needs to work before any application schema exists).
+**Notes**: The IDE must work when the only schema is `system.*` — it must not depend on application schema to render.
+
+### OQ-023: IDE Conflict Resolution UI
+**Question**: What does the manual conflict resolution interface look like?
+**Notes**: When functor-based and timestamp-based resolution both fail, an operator must review. The UI needs to show: both versions of the conflicting record, the mutation history from both transaction logs, and a way to choose or merge.
+**Action**: Design after the connector sync protocol is implemented.
+
+### OQ-024: Namespace Access Control Inheritance
+**Question**: Does granting access to a namespace automatically grant access to all child namespaces and tables, or must each level be granted explicitly?
+**Notes**: Implicit inheritance is more convenient; explicit grants are more secure. A default-deny model with explicit grants is safer for production, but more verbose for initial setup.
+
+### OQ-025: Connector Schema Change Propagation
+**Question**: When an external schema changes (new column added to MariaDB table), how does DataCode notify users whose application schema (`app.*`) references that connector table?
+**Notes**: The shadow schema is updated automatically. But if `app.commerce.orders` is a view over the connector table and a new field appears in the connector, does it automatically appear in the view, or must the user explicitly add it?
+**Action**: Design the schema change notification and propagation rules; likely a configurable policy per view.

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:hackage.haskell.org)",
+      "WebFetch(domain:hackage-content.haskell.org)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "cabal"
+  ]
+}
