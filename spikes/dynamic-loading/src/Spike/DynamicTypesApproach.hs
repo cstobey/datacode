@@ -9,6 +9,8 @@
 -- a plugin system where functor implementations are compiled into DataCode but
 -- their wiring to schema fields is dynamic.
 
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module Spike.DynamicTypesApproach
   ( DynResult (..)
   , runDynSpike
@@ -18,11 +20,11 @@ module Spike.DynamicTypesApproach
   , applyDynFunctor
   , DynFunctor (..)
   , DynSchema (..)
+  , FunctorKind (..)
   ) where
 
 import Data.Dynamic
 import Data.Typeable
-import Data.List (intercalate)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 
 -- ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ registerType :: String -> [(String, TypeRep)] -> [DynFunctor] -> DynSchema
 registerType name fields functors = DynSchema name fields functors
 
 registerFunctor
-  :: Typeable a
+  :: forall a. Typeable a
   => String
   -> FunctorKind
   -> (a -> Either String a)   -- typed function; we wrap it into Dynamic
@@ -156,10 +158,8 @@ runDynSpike = do
 
   -- Test 1: Build a schema registry at runtime
   putStrLn "Test 1: Build a dynamic schema registry"
-  (buildTime, registry) <- timed $ do
+  (buildTime, _) <- timed $ do
     let amountFunctor = registerFunctor "PositiveAmount" Validation validatePositiveAmount
-    let emailFunctor  = registerFunctor "EmailFormat"    Validation validateEmailFormat
-    let userIdFunctor = registerFunctor "ValidUserId"    Validation validateUserId
     let fkFunctor     = registerFunctor "UserFK"
                           (ForeignKey "User" "id")
                           mockForeignKeyCheck
