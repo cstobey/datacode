@@ -9,10 +9,8 @@ Questions that need answers before or during implementation. Grouped by urgency.
 **Why it's blocking**: The entire architecture of the schema daemon and query engine depends on this choice.
 **Action**: Three feasibility spikes (see `dynamic-loading.md`). Estimate: 2–4 weeks of investigation.
 
-### OQ-002: Servant + Dynamic Schema
-**Question**: Can Servant's compile-time type-level API DSL accommodate DataCode's runtime-dynamic schema, or must the data plane use raw WAI?
-**Why it's blocking**: Affects the entire networking layer design.
-**Action**: Small prototype — a Servant app with a `Raw` fallthrough that dispatches on a runtime-defined schema. Estimate: 3–5 days.
+### OQ-002: Servant + Dynamic Schema ✓ ANSWERED
+**Answer**: Servant + Warp works. The pattern is `"schema" :> Capture "ns" String :> Capture "name" String :> Raw`. Servant handles the static URL structure; the `Raw` endpoint delegates to an IORef-backed WAI dispatch table for runtime-dynamic routing. No Yesod needed for the data plane. See `spikes/servant-warp/output.txt`.
 
 ### OQ-003: Binary Replication Format
 **Question**: Cap'n Proto, MessagePack, or custom binary format for server-to-server and thick client replication?
@@ -23,6 +21,39 @@ Questions that need answers before or during implementation. Grouped by urgency.
 **Question**: LMDB, RocksDB, or custom storage for the transaction graph and query indexes?
 **Criteria**: Transaction graph = append-only DAG (favors log-structured); query indexes = random access (favors B-tree).
 **Action**: Prototype hybrid: custom append log for transaction graph + LMDB for indexes.
+
+### OQ-026: API Version Token Format
+**Question**: What is the format of the version prefix in API paths — integer sequence number, semantic version, or abbreviated schema graph node hash?
+**Details**:
+- Integer sequence (v1, v2, v3): human-readable and simple, but requires a monotonic counter that is meaningful across shard splits and merges
+- Semantic version (v1.2.0): expressive but requires a separate versioning policy layered on top of the graph
+- Graph node hash prefix: content-addressed and unambiguous, but opaque to humans and ugly in URLs
+- The version must be deterministic given a schema graph node — two servers must agree on which version prefix corresponds to which graph node
+**Why it matters**: The version format determines how clients discover and pin API versions, and how the IDE exposes version history.
+**Action**: Decide on format; design the `/versions` discovery endpoint that lists all live version prefixes and their schema graph node references.
+
+### OQ-027: API Functor Type and Transaction Semantics
+**Question**: How is an API functor typed, and what are its transaction guarantees when it both reads and writes?
+**Details**:
+- A validation functor is `a -> Either Error a`. An API functor needs: path parameters + optional request body as input; response body + HTTP status as output
+- If a functor both reads and writes, does the read reflect the committed write (same transaction) or the pre-write snapshot?
+- How does the functor signal HTTP-level errors (404, 409, 422) vs. internal errors (500)?
+- Can an API functor trigger connector side effects (e.g., send an email via a connector functor as part of the same transaction)?
+**Action**: Design the API functor type signature; determine if it is a new functor kind or a composition of existing kinds (likely a new kind given its HTTP-aware interface).
+
+### OQ-028: Route Conflict Resolution
+**Question**: When a custom route template overlaps with an auto-generated route, which takes precedence?
+**Details**: Example: the auto-generated route for `app.commerce.orders` produces `/v{N}/records/app.commerce.orders/{id}` for GET. If a user also inserts a custom route with template `/records/app.commerce.orders/{id}`, both exist. Options:
+- Custom routes always shadow auto-generated routes at the same path
+- Auto-generated routes take precedence; custom routes must use different paths
+- Conflict is a validation error at insert time — the system rejects the custom route row
+**Action**: Choose a rule and enforce it at commit time in the `system.api.custom_routes` write path.
+
+### OQ-029: Route Trie vs. Dispatch Table Implementation
+**Question**: The current spike uses an exact-key `Map String Application`. Custom API templates require pattern matching (e.g., `/orders/{id}/ship` vs. `/orders/{id}/cancel`). What data structure?
+**Options**: A compiled route trie (fast, correct precedence), a list of compiled regex patterns tried in insertion order (simple but O(n)), or a library like `wai-routes` or `path-piece`.
+**Why it matters**: Routing is on the hot path for every request; the trie must handle thousands of registered routes without measurable overhead.
+**Action**: Prototype a trie-based dispatcher as the next spike; validate that 10k+ routes still route in under 1µs/request.
 
 ## Must Resolve During Core Development
 

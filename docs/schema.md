@@ -156,6 +156,80 @@ As data volume crosses configurable thresholds, a shard splits. The split is rec
 ### Pruning
 `logs` shards and old materialized views may be pruned. Pruning is also recorded in the transaction graph as a special node, so the system always knows that historical data before a certain point has been discarded. Analytical summary metrics are computed before pruning to preserve aggregate history.
 
+## Custom APIs
+
+DataCode exposes data through two complementary API layers — auto-generated and user-defined — both managed as **rows in system tables**. Because API registrations live in the schema transaction graph, every change is automatically versioned. Version prefixes in every URL path mean no route is ever removed: old client integrations remain valid indefinitely.
+
+### Versioning and Backwards Compatibility
+
+Every route — auto-generated and custom — is prefixed with the schema version at which it was registered:
+
+```
+/v{N}/records/app.commerce.orders      -- auto-generated CRUD at version N
+/v{N}/api/orders/{id}/ship             -- custom endpoint at version N
+```
+
+When a schema change is committed (a new transaction graph node), routes added at that node are registered under the new version prefix. Routes from all prior nodes remain in the dispatch table permanently — the table is append-only in practice. A client pinned to `/v3/...` continues working after the schema advances to version 10.
+
+This gives:
+- **No breaking changes** — clients stay on their version prefix until they explicitly migrate
+- **Multiple live versions simultaneously** — a single server process serves all version prefixes at once
+- **Trivial rollback** — clients repoint to an older prefix; the server already handles it
+
+The exact format of the version token (integer sequence, semantic version, or abbreviated graph node hash) is an open question — see OQ-026.
+
+### Auto-Generated Routes
+
+The auto-generated API is driven by a system table — one row per exposed table or view:
+
+```
+system.api.generated_routes
+  table_ref   : TableRef     -- which table or view to expose
+  methods     : [HttpMethod] -- which HTTP methods to expose (default: all)
+  format_ref  : FormatRef    -- which format functor to use
+  enabled     : Bool
+```
+
+The response format is determined by a second system table of **format functors** — pluggable representations of the same underlying data:
+
+```
+system.api.format_functors
+  name        : Text         -- e.g. "json-flat", "graphql", "csv"
+  functor_ref : FunctorRef   -- functor that transforms query results into the wire format
+```
+
+This decouples representation from schema: the same table can be served as JSON, GraphQL, or CSV from different route registrations without touching the underlying schema definition. New format functors can be registered at runtime.
+
+### Custom Routes
+
+User-defined endpoints are rows in a system table. Each row defines a URL template and the functor to invoke per HTTP method:
+
+```
+system.api.custom_routes
+  route_template : Text             -- e.g. "/orders/{id}/ship"
+  get_functor    : Maybe FunctorRef -- handler for GET, or NULL = method not allowed
+  post_functor   : Maybe FunctorRef
+  put_functor    : Maybe FunctorRef
+  patch_functor  : Maybe FunctorRef
+  delete_functor : Maybe FunctorRef
+```
+
+A `NULL` column means that HTTP method returns 405 on that route. A route with only `post_functor` set is a write-only endpoint.
+
+Each referenced functor is an **API functor**: it receives the extracted path parameters and request body (if present), performs reads and/or writes within a single transaction, and returns a response value. Authentication and authorization apply automatically (see below).
+
+Inserting or updating a row in `system.api.custom_routes` takes effect immediately — the WAI dispatch table is updated as part of committing the transaction, with no server restart.
+
+### Authentication and Authorization
+
+**Authentication** is always on. Every request to any route — auto-generated or custom — must carry a valid client token and user token. There is no mechanism to create an unauthenticated DataCode endpoint.
+
+**Authorization** is automatic and derived from the access control functors on the tables the API functor accesses. No per-route permission declaration exists: if the functor reads `app.commerce.orders`, the same access control functors apply as if the caller had queried that table directly. A custom functor that reads multiple tables must satisfy the access control functors on all of them.
+
+### HTTP Dispatch
+
+All routes — auto-generated and custom — are materialized from the system tables into a runtime WAI dispatch table (an IORef-backed route trie, as confirmed by the Servant+Warp spike). The Servant frame handles the static URL structure; the dispatch table handles the versioned and dynamic portions. Route templates are compiled into path-matchers at registration time; path parameters are extracted at request time and passed to the functor.
+
 ## Materialized Views
 
 Materialized views are pegged to **specific commit nodes** in the transaction graph. This means:
