@@ -1,0 +1,48 @@
+cabal-version: 3.0
+name:          servant-warp-spike
+version:       0.1.0.0
+synopsis:      Feasibility spike — Servant + Warp for DataCode dynamic schema serving (OQ-002)
+description:
+  Tests whether Servant's compile-time type-level API can accommodate
+  DataCode's runtime-dynamic schemas, or whether raw WAI is required.
+  Answers OQ-002 and informs OQ-013 (Yesod evaluation).
+
+license:    MIT
+author:     DataCode Contributors
+build-type: Simple
+
+common warnings
+  ghc-options: -Wall -Wno-unused-top-binds
+
+executable servant-warp-spike
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app, src
+  default-language: GHC2021
+
+  other-modules:
+    Spike.WaiDynamic
+    Spike.ServantHybrid
+
+  default-extensions:
+    DataKinds
+    TypeOperators
+    OverloadedStrings
+    LambdaCase
+    ScopedTypeVariables
+
+  build-depends:
+    base            >= 4.14  && < 5,
+    wai             >= 3.2   && < 3.3,
+    wai-extra       >= 3.1   && < 3.2,
+    warp            >= 3.3   && < 3.5,
+    servant         >= 0.19  && < 0.22,
+    servant-server  >= 0.19  && < 0.22,
+    http-types      >= 0.12  && < 0.13,
+    aeson           >= 2.0   && < 2.3,
+    text            >= 1.2   && < 2.2,
+    bytestring      >= 0.11  && < 0.13,
+    containers      >= 0.6   && < 0.8,
+    time            >= 1.9   && < 2,
+    mtl             >= 2.2   && < 2.4,
+    tagged          >= 0.8   && < 0.9

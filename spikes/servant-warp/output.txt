@@ -1,0 +1,130 @@
+╔══════════════════════════════════════════════════════════╗
+║   DataCode: Servant + Warp Dynamic Schema Spike          ║
+║   OQ-002: Can Servant serve runtime-dynamic schemas?     ║
+╚══════════════════════════════════════════════════════════╝
+
+=== Approach A: Pure WAI Dynamic Router ===
+
+Test 1: Request before any schema registered
+  GET /schema/app/orders: 404 (expect 404)
+
+Test 2: Register 'app.orders' schema at runtime
+  GET /schema/app/orders: 200
+  Body: {"schema":"app.orders","fields":[{"id":"UUID"},{"amount":"Decimal"},{"user_id":"UUID"},]}
+
+Test 3: Register 'app.users' without restarting server
+  GET /schema/app/orders: 200 (still works)
+  GET /schema/app/users:  200 — {"schema":"app.users","fields":[{"id":"UUID"},{"email":"Email"},]}
+
+Test 4: Update 'app.orders' schema (add field)
+  GET /schema/app/orders: 200
+  Body: {"schema":"app.orders","fields":[{"id":"UUID"},{"amount":"Decimal"},{"user_id":"UUID"},{"status":"Text"},]}
+
+Test 5: Deregister 'app.orders'
+  GET /schema/app/orders: 404 (expect 404)
+
+Test 6: Health endpoint
+  GET /health: 200 — ok
+
+Benchmark: 10,000 routing decisions
+  Total: 35ms (34.681073) | Per request: 3µs (3.4681073)
+
+Summary:
+  Pure WAI dynamic routing: SUCCEEDED
+  Schemas registered/updated/deregistered at runtime without restart
+  Routing overhead: O(log n) Map lookup on an IORef
+
+=== Approach B: Servant + WAI Dynamic Dispatch ===
+
+Test 1: Static Servant admin endpoints
+  GET /health:  200 — ok
+  GET /schemas: 200 — []
+
+Test 2: Schema endpoint before registration
+  GET /schema/app/orders: 404 (expect 404)
+
+Test 3: Register 'app.orders', route through Servant
+  GET /schema/app/orders: 200 — {"schema":"app.orders"}
+
+Test 4: Register 'app.users', verify independent routing
+  GET /schema/app/orders: 200 — {"schema":"app.orders"}
+  GET /schema/app/users:  200 — {"schema":"app.users"}
+
+Test 5: /schemas reflects registered schemas
+  GET /schemas: ["app.orders","app.users"]
+
+Test 6: Deregister 'app.orders'
+  GET /schema/app/orders: 404 (expect 404)
+
+Benchmark: 10,000 requests through Servant typed routing + dynamic dispatch
+  Total: 11ms (11.182703) | Per request: 1µs (1.1182703)
+
+Summary:
+  Servant + WAI hybrid: SUCCEEDED
+  Typed admin endpoints coexist with dynamic schema dispatch
+  Servant validates URL structure; Raw handler dispatches on runtime state
+
+╔══════════════════════════════════════════════════════════╗
+║   SUMMARY                                                ║
+╚══════════════════════════════════════════════════════════╝
+
+Approach A — Pure WAI Dynamic Router
+  Success: True
+  Routing latency: 3µs/request (3.4681073)
+  Key findings:
+    - WAI Application is a pure function — trivially composable and testable
+    - IORef Map gives O(log n) dispatch; use STM TVar for concurrent schema writes
+    - Schema handlers close over runtime state (GADT DSL registry, functor table)
+    - No recompilation on schema change — handler is registered, not compiled in
+    - Warp is just a TCP accept loop calling the Application function — zero friction
+    - Servant and Yesod both compile down to WAI Applications — same flexibility
+
+Approach B — Servant + WAI Hybrid
+  Success: True
+  Routing latency: 1µs/request (1.1182703)
+  Key findings:
+    - 'schema' :> Capture :> Raw — Servant owns structure, WAI owns content
+    - Admin endpoints (/health, /schemas, /metrics) get full Servant machinery
+    - Servant auto-generates client libraries and documentation for admin API
+    - Raw handler delegates to IORef Map: zero Servant overhead after route match
+    - URL structure IS fixed in DataCode — Capture covers all runtime variation
+    - Schema handler closes over Registry — same pattern as pure WAI approach
+
+Yesod analysis (OQ-013) — architectural, no code required:
+  - Yesod compiles routes via Template Haskell at build time (same as Servant)
+  - Dynamic dispatch requires the same WAI-level escape hatch in both
+  - `yesod-core`'s `waiApp` produces a WAI Application — composable identically
+  - Yesod adds: session management, auth, HTML form handling, shakespeare templates
+  - DataCode data plane needs: none of the above
+  - Yesod would add meaningful value only for the thin-client HTML rendering layer
+    (OQ-013 already deferred to post-MVP — correct call)
+  - Verdict: Yesod does NOT improve the answer to OQ-002
+
+╔══════════════════════════════════════════════════════════╗
+║   RECOMMENDATION (OQ-002)                                ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║   Use Servant + Warp. Yesod not needed for data plane.   ║
+║                                                          ║
+║   Recommended API type:                                  ║
+║                                                          ║
+║   type API                                               ║
+║     =    'health'  :> Get '[PlainText] Text              ║
+║      :<|> 'schemas' :> Get '[JSON] [SchemaRef]           ║
+║      :<|> 'schema'  :> Capture 'ns'   String             ║
+║                    :> Capture 'name'  String             ║
+║                    :> Raw                                ║
+║                                                          ║
+║   The Capture pair routes statically (URL structure is   ║
+║   fixed in DataCode). Raw hands off to the IORef         ║
+║   dispatch table populated by the schema daemon.         ║
+║                                                          ║
+║   Admin endpoints use Servant's full machinery:          ║
+║   type-safe clients, servant-swagger docs, etc.          ║
+║                                                          ║
+║   Schema handlers close over the GADT DSL registry       ║
+║   and Dynamic type table from the previous spike.        ║
+║                                                          ║
+║   For concurrent schema writes: replace IORef with       ║
+║   STM TVar — same pattern, safe under concurrent load.   ║
+╚══════════════════════════════════════════════════════════╝
