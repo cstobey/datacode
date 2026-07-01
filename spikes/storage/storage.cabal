@@ -1,0 +1,51 @@
+cabal-version: 3.0
+name:          storage-spike
+version:       0.1.0.0
+synopsis:
+  Feasibility spike — binary format (Cap'n Proto vs cereal) + LMDB storage (OQ-003, OQ-004)
+description:
+  Tests the binary transaction log format and storage architecture for DataCode.
+  Uses cereal for the working implementation; evaluates Cap'n Proto as the
+  production target. Covers row identifier design, append-only log on disk,
+  and LMDB two-database indexing.
+  Requires liblmdb-dev (or equivalent) to be installed on the system.
+
+license:    MIT
+author:     DataCode Contributors
+build-type: Simple
+
+common warnings
+  ghc-options: -Wall -Wno-unused-top-binds
+
+executable storage-spike
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app, src
+  default-language: GHC2021
+
+  other-modules:
+    Spike.RowId
+    Spike.TxLog
+    Spike.LmdbIndex
+
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+    RecordWildCards
+    DeriveGeneric
+    GeneralizedNewtypeDeriving
+    ScopedTypeVariables
+    TupleSections
+
+  build-depends:
+    base              >= 4.14  && < 5,
+    cereal            >= 0.5   && < 0.6,
+    bytestring        >= 0.11  && < 0.13,
+    containers        >= 0.6   && < 0.8,
+    time              >= 1.9   && < 2,
+    text              >= 1.2   && < 2.2,
+    deepseq           >= 1.4   && < 1.6,
+    directory         >= 1.3   && < 1.4,
+    filepath          >= 1.4   && < 1.5,
+    lmdb              >= 0.2   && < 0.3,
+    cryptohash-sha256 >= 0.11  && < 0.12
