@@ -4,23 +4,31 @@ Questions that need answers before or during implementation. Grouped by urgency.
 
 ## Must Resolve Before Writing Core Code
 
-### OQ-001: Dynamic Loading Mechanism
-**Question**: Which approach — typed DSL interpreter, `hint`/GHC API, multi-daemon, GHC dynamic linking, or a hybrid — is viable for runtime schema evolution?
-**Why it's blocking**: The entire architecture of the schema daemon and query engine depends on this choice.
-**Action**: Three feasibility spikes (see `dynamic-loading.md`). Estimate: 2–4 weeks of investigation.
+### OQ-001: Dynamic Loading Mechanism ✓ ANSWERED
+**Answer**: GADT DSL + Data.Dynamic hybrid. See `spikes/dynamic-loading/output.txt`.
+- **GADT DSL** (Approach 2): primary functor mechanism. All four functor types encoded. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors.
+- **Data.Dynamic** (Approach 3): type registry substrate. TypeRep-based type checking is O(1). Serves as the "registered type library" that the DSL references by name.
+- **hint** (Approach 1): failed to compile in the spike — GHC not on PATH or hint version mismatch. Revisit as an escape hatch for advanced user-defined functors; compile async and sandbox the result.
+- **Multi-daemon**: needed when compiled-in types must change (requires server restart to load new Haskell modules); the schema daemon restarts are coordinated by a supervisor.
 
 ### OQ-002: Servant + Dynamic Schema ✓ ANSWERED
 **Answer**: Servant + Warp works. The pattern is `"schema" :> Capture "ns" String :> Capture "name" String :> Raw`. Servant handles the static URL structure; the `Raw` endpoint delegates to an IORef-backed WAI dispatch table for runtime-dynamic routing. No Yesod needed for the data plane. See `spikes/servant-warp/output.txt`.
 
-### OQ-003: Binary Replication Format
-**Question**: Cap'n Proto, MessagePack, or custom binary format for server-to-server and thick client replication?
-**Criteria**: Must carry type provenance, schema version reference, sequence numbers, shard identity. Must support schema evolution without breaking existing receivers.
-**Action**: Evaluate Cap'n Proto Haskell bindings for maturity and schema evolution support.
+### OQ-003: Binary Replication Format ✓ ANSWERED
+**Answer**: Cap'n Proto for production; cereal during initial development. See `spikes/storage/output.txt`.
+- **cereal** (used in spike): same length-prefix framing as Cap'n Proto, no external toolchain, identical structural design. Ceiling: schema evolution requires an explicit version byte and branching decoder — adding a field to `TxNode` breaks old decoders without code.
+- **Cap'n Proto**: eliminates that ceiling. Fields are numbered (`@0` through `@5`); adding `@6` is always backward and forward compatible. Old writers omit it; old readers ignore it; new readers see the declared default. This is the Mnesia property: disk bytes are a valid in-memory message — field access is pointer arithmetic, not deserialization.
+- **Protobuf is NOT a substitute**: Protobuf requires full parsing; Cap'n Proto mmaps the bytes directly.
+- **Path**: use `cereal` in `Serialize` instances during development; swap to Cap'n Proto generated types before production. The external `capnp` C++ tool is required at compile time.
+- **Latency**: encode ~0.15µs/tx, decode ~0.10µs/tx (10 mutations/tx, cereal).
 
-### OQ-004: Storage Engine
-**Question**: LMDB, RocksDB, or custom storage for the transaction graph and query indexes?
-**Criteria**: Transaction graph = append-only DAG (favors log-structured); query indexes = random access (favors B-tree).
-**Action**: Prototype hybrid: custom append log for transaction graph + LMDB for indexes.
+### OQ-004: Storage Engine ✓ ANSWERED (LMDB threading caveat)
+**Answer**: Hybrid architecture confirmed. See `spikes/storage/output.txt`.
+- **Append-only log** (Cap'n Proto frames on disk): the transaction graph. Immutable, sequentially written, mmap-readable without deserialization. Random access by `LogEntry { offset :: Word64, length :: Word32 }` is O(1) seek+read.
+- **LMDB `log_index`** (`RowId → LogEntry`): finds any row version in the append log by RowId. Keys are 14-byte big-endian RowIds; big-endian encoding means a range scan over all rows in a transaction is a single contiguous LMDB range.
+- **LMDB `head_index`** (`UUID PK → current RowId`): resolves the user-visible primary key to the current head version.
+- **Full zero-copy read path**: `UUID → head_index → RowId → log_index → (file_offset, len) → mmap[offset:len] → Cap'n Proto → pointer arithmetic`.
+- **LMDB threading requirement**: LMDB transactions must be performed from an OS-bound thread. In Haskell, wrap all LMDB calls in `Control.Concurrent.runInBoundThread`. The spike hit this error ("must lock from a 'bound' thread!"); the architecture is correct and the fix is one wrapper call.
 
 ### OQ-026: API Version Token Format
 **Question**: What is the format of the version prefix in API paths — integer sequence number, semantic version, or abbreviated schema graph node hash?
@@ -94,9 +102,11 @@ Questions that need answers before or during implementation. Grouped by urgency.
 **Question**: How exactly are distributed materialized view computations coordinated between neighboring servers?
 **Notes**: The BitTorrent-style propagation model handles transaction replication; the analytical distribution model is a separate protocol.
 
-### OQ-013: Yesod Evaluation
-**Question**: Does Yesod's type-safe routing and session management provide enough value for the thin-client HTML layer to justify its inclusion?
-**Action**: Quick prototype (2–3 days) to validate or rule out.
+### OQ-013: Yesod Evaluation ✓ ANSWERED
+**Answer**: Yesod not needed for the data plane. Defer to thin-client HTML layer, which is post-MVP.
+- The Servant + Warp spike (OQ-002) confirmed that Servant's type-safe routing, combined with a WAI IORef dispatch table, covers all DataCode data plane needs at 1µs/request overhead.
+- Yesod would add session management and HTML templating that are irrelevant to a JSON/binary API server.
+- Revisit Yesod only if the thin-client HTML layer warrants it — after the data plane is shipping.
 
 ### OQ-014: D3.js Integration
 **Question**: How does the HTML rendering engine decide when to use D3.js visualizations vs. plain HTML?

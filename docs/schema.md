@@ -156,6 +156,68 @@ As data volume crosses configurable thresholds, a shard splits. The split is rec
 ### Pruning
 `logs` shards and old materialized views may be pruned. Pruning is also recorded in the transaction graph as a special node, so the system always knows that historical data before a certain point has been discarded. Analytical summary metrics are computed before pruning to preserve aggregate history.
 
+### Row Identifiers
+
+Every row version in the transaction graph has a **composite physical row identifier**:
+
+```haskell
+data RowId = RowId
+  { ridShard  :: Word32  -- shard index (4 bytes; supports ~4B shards)
+  , ridTxSeq  :: Word64  -- monotonic tx sequence within shard (8 bytes)
+  , ridRowPos :: Word16  -- row position within transaction (2 bytes; max 65535 rows/tx)
+  }
+-- Encoded as 14 bytes, big-endian throughout
+```
+
+Big-endian encoding is critical: LMDB sorts keys lexicographically, and big-endian integer encoding makes `lexicographic order == numeric order`. This means "all rows written by transaction 42 in shard 1" is a single contiguous LMDB range scan with no scatter-gather.
+
+Transaction nodes themselves use `rowPos = 0` by convention (`txNodeId shard txSeq = RowId shard txSeq 0`). Rows within a transaction occupy positions 1 through N.
+
+**Two-tier identifier model:**
+- **User-visible**: the `UUID` primary key declared in the schema. Stable across mutations — same UUID throughout the row's lifetime.
+- **Physical**: `RowId` — changes on every mutation, pointing to the newest version in the log.
+
+The LMDB `head_index` bridges the two: `UUID → current RowId`. Following up through `log_index` yields the physical location on disk.
+
+**Sort order confirmed by spike** (`spikes/storage/output.txt`): ByteString lexicographic sort of encoded RowIds produces the same ordering as Haskell's derived `Ord` instance.
+
+### Physical Storage Architecture
+
+The transaction graph is persisted as two complementary structures per shard:
+
+**1. Append-only transaction log (Cap'n Proto frames)**
+
+Immutable, sequentially written. Each entry is a length-prefix-framed Cap'n Proto `TxNode` message:
+
+```
+[4-byte big-endian length][Cap'n Proto TxNode bytes...]
+```
+
+Each `TxNode` carries: its own `RowId`, schema version reference, timestamp, server ID, parent RowId list, and the list of mutations (inserts/deletes). Benchmark: encode ~0.15µs/tx, decode ~0.10µs/tx at 10 mutations/tx.
+
+With Cap'n Proto + mmap, the bytes on disk **are** the runtime representation — field access is pointer arithmetic, not deserialization. This is the Mnesia analogy: the disk format evolves with the schema, not with the data.
+
+**2. Two LMDB databases per shard**
+
+| Database | Key | Value | Purpose |
+|---|---|---|---|
+| `log_index` | 14-byte RowId | 12-byte `{offset: Word64, length: Word32}` | Random access to any row version in O(1) |
+| `head_index` | UUID PK bytes | 14-byte RowId | Resolve logical row to current physical version |
+
+**Full zero-copy read path:**
+```
+UUID → head_index → RowId
+     → log_index  → (file_offset, length)
+     → mmap[offset:length] → Cap'n Proto message
+     → field access via pointer arithmetic (no copy)
+```
+
+LMDB properties that make this viable: memory-mapped (reads touch OS page cache, not a copy), MVCC (readers never block writers), crash-safe by default (copy-on-write B-tree + two root pages, no separate WAL), and sorted keys (range scans over all rows in a transaction are contiguous).
+
+**Implementation note**: LMDB transactions must be performed from an OS-bound thread. In Haskell, wrap all LMDB operations in `Control.Concurrent.runInBoundThread`.
+
+**Wire format for replication**: cereal (same `Serialize` instances) during initial development; swap to Cap'n Proto generated code before production. Cap'n Proto provides automatic schema evolution: adding a new field to `TxNode` is always backward and forward compatible with no decoder changes.
+
 ## Custom APIs
 
 DataCode exposes data through two complementary API layers — auto-generated and user-defined — both managed as **rows in system tables**. Because API registrations live in the schema transaction graph, every change is automatically versioned. Version prefixes in every URL path mean no route is ever removed: old client integrations remain valid indefinitely.
