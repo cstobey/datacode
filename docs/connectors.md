@@ -18,6 +18,8 @@ DataCode can ingest data from external sources and maintain bidirectional sync w
 ### Database Connectors (Row-Based Replication)
 
 #### MariaDB / MySQL
+**Required replication source.** This is the primary migration path and the only database replication connector in scope for v1.
+
 **Library**: `mysql-haskell` (`Database.MySQL.BinLog`) — actively maintained, pure Haskell, no FFI.
 
 DataCode connects as a pseudo-replica using `registerPseudoSlave` and opens the binlog stream with `dumpBinLog`. Only row-based replication is supported (`binlog_format=ROW` must be set on the source). `decodeRowBinLogEvent` decodes each event into Write/Delete/Update variants.
@@ -31,16 +33,10 @@ GRANT REPLICATION SLAVE ON *.* TO 'datacode'@'%';
 Position tracking: DataCode records the binlog filename and offset (from `getLastBinLogTracker`) in a system table after each processed event. This is the checkpoint — DataCode resumes from this position on reconnect.
 
 #### PostgreSQL
-**Library**: `postgresql-replicant` (Hackage) — abandoned as of 2021, experimental, not production-viable as-is.
-
-**Plan**: Fork `postgresql-replicant` or implement the PostgreSQL logical replication protocol directly against `postgresql-libpq`. PostgreSQL's `wal2json` output plugin is well-documented; the protocol is less complex than MySQL binlog. Requires `wal_level=logical` on the source.
-
-This is a **required feasibility spike** (see open-questions.md OQ-017).
+**NOT DOING.** Nice-to-have; deprioritized in favor of MariaDB/MySQL. The available library (`postgresql-replicant`) was abandoned in 2021 and would require a fork or rewrite. This is not worth the investment for v1 given the company's predominant use of MariaDB/MySQL. Revisit post-v1 if there is demand.
 
 #### Redis
-**Library**: None exists for the PSYNC replication protocol in Haskell.
-
-**Plan**: Use Redis Streams (`XREAD`/`XREADGROUP`) as an explicit change data capture mechanism rather than tapping the replication wire. This requires the Redis source to publish changes to a stream — it is not transparent to the source. Alternative: wrap `redis-replicator` (Java) via a sidecar process. This is a **required decision** (OQ-018).
+**NOT DOING.** Nice-to-have; deprioritized. No Haskell library exists for the PSYNC replication protocol, and the Redis Streams CDC approach requires changes on the Redis source side (not transparent). Not worth the complexity for v1. Revisit post-v1 if needed.
 
 ---
 
@@ -164,13 +160,13 @@ The connector daemon polls `system.connectors` for changes on a short interval (
 
 | Source | Library | Status | Action |
 |---|---|---|---|
-| MariaDB/MySQL | `mysql-haskell` `Database.MySQL.BinLog` v1.2.5 | Active, Stackage Nightly | Use directly |
-| PostgreSQL | `postgresql-replicant` v0.2.0.1 | Abandoned 2021 | Fork or rewrite needed |
-| Redis | None | Not available | Use Redis Streams or sidecar |
+| MariaDB/MySQL | `mysql-haskell` `Database.MySQL.BinLog` v1.2.5 | Active, Stackage Nightly | **Required — use directly** |
+| PostgreSQL | `postgresql-replicant` v0.2.0.1 | Abandoned 2021 | **Not doing** (post-v1 if demand) |
+| Redis | None | Not available | **Not doing** (post-v1 if demand) |
 | Web APIs | Custom per-API | — | Build tooling; no universal library |
 
 ---
 
 ## Open Questions
 
-See open-questions.md: OQ-017 (PostgreSQL logical replication spike), OQ-018 (Redis CDC approach decision), OQ-019 (connector daemon architecture), OQ-020 (webhook endpoint security).
+See open-questions.md: OQ-019 (connector daemon architecture), OQ-020 (webhook endpoint security). OQ-017 and OQ-018 (PostgreSQL and Redis) are not doing for v1.

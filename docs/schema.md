@@ -214,9 +214,11 @@ UUID → head_index → RowId
 
 LMDB properties that make this viable: memory-mapped (reads touch OS page cache, not a copy), MVCC (readers never block writers), crash-safe by default (copy-on-write B-tree + two root pages, no separate WAL), and sorted keys (range scans over all rows in a transaction are contiguous).
 
-**Implementation note**: LMDB transactions must be performed from an OS-bound thread. In Haskell, wrap all LMDB operations in `Control.Concurrent.runInBoundThread`.
+**LMDB threading**: requires `-threaded` in GHC options and a session-level `runInBoundThread` wrapping the entire LMDB session (open → read/write → close). The `lmdb` Haskell package calls `isCurrentThreadBound` before acquiring its write lock. Production pattern: one dedicated OS-bound thread (`forkOS`) for writes, with a `TQueue`; reads are concurrent (LMDB MVCC).
 
-**Wire format for replication**: cereal (same `Serialize` instances) during initial development; swap to Cap'n Proto generated code before production. Cap'n Proto provides automatic schema evolution: adding a new field to `TxNode` is always backward and forward compatible with no decoder changes.
+**LMDB latency** (confirmed in `spikes/capnproto/output.txt`): reads 11µs/op. Writes 1,107µs/op — high because LMDB `fdatasync()`s on every transaction commit. This is not a concern: DataCode batches multiple mutations per transaction (10–100 mutations/tx → 11–110µs/mutation). Single-mutation micro-benchmarks are not representative.
+
+**Wire format for replication** (confirmed in `spikes/capnproto/output.txt`): use cereal during initial development; swap to Cap'n Proto generated code before production. Wire framing (length-prefix + single-segment message header) is identical — only the payload encoding changes. Cap'n Proto provides automatic schema evolution: adding a new field to `TxNode` is always backward and forward compatible, no decoder changes needed. Adding one field costs exactly 8 bytes per message. Encode and full decode both sub-µs.
 
 ## Custom APIs
 

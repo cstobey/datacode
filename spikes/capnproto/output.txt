@@ -1,0 +1,146 @@
+================================================
+Cap'n Proto + LMDB Feasibility Spike (OQ-003 / OQ-004)
+================================================
+
+=== Part 1: Cap'n Proto Encoding ===
+
+Test 1: Encode TxNode
+  Message size: 160 bytes
+  Segment size: 152 bytes
+
+Test 2: Round-trip decode
+  timestamp:  OK
+  serverId:   OK
+  id blob:    OK
+  schemaVer:  OK
+  parents:    OK (2 parents)
+  Round-trip: OK
+
+Test 3: Zero-copy field reads (no deserialise pass)
+  timestamp: OK
+  serverId: OK
+  schemaVersion (V1→default=0): OK
+  id blob: OK
+
+Benchmark: encode 10,000 TxNode messages
+  Total: 0ms | Per message: 0µs
+
+Benchmark: full decode 10,000 TxNode messages
+  All OK: True
+  Total: 0ms | Per message: 0µs
+
+Benchmark: zero-copy timestamp read 10,000 times
+  Total: 0ms | Per read: 0µs
+  vs full decode: 0µs → 0µs
+  Speedup: ~1x for single-field access
+
+=== Part 2: mmap Zero-Copy ===
+
+Test 1: Write Cap'n Proto TxNode to file
+  Wrote 112 bytes to disk
+
+Test 2: mmap file, read fields at byte offsets (no decode pass)
+  mmap'd 112 bytes (OS page cache backed)
+  timestamp: OK
+  serverId: OK
+  id blob: OK (14 bytes, no copy)
+
+  timestamp is at message byte offset 16. Reading it is:
+    getWord64le (drop 16 mmapped)  — no other bytes touched.
+  The ByteString slice from readIdBlobZeroCopy references the mmap'd
+  page directly. No heap allocation. The GC never sees these bytes.
+
+Benchmark: 10,000 zero-copy timestamp reads from mmap'd message
+  All correct: True
+  Total: 0ms | Per read: 0µs
+
+Benchmark: 10,000 full decodes from mmap'd message
+  All correct: True
+  Total: 0ms | Per read: 0µs
+
+Summary:
+  mmap zero-copy: CONFIRMED
+  Zero-copy: 0µs — 0µs full decode
+  For queries accessing 1-2 fields, zero-copy avoids decoding all blobs.
+  Repeated reads of the same message are L1/L2 cache hits — not disk I/O.
+
+=== Part 3: Schema Evolution ===
+
+Test 1: Forward compatibility — V1 writer, V2 reader
+  V1 message: 112 bytes
+  timestamp:     1000000 ✓
+  serverId:      1 ✓
+  schemaVersion: 0 (expected 0 — default for missing field) ✓
+  V2 reads V1 bytes without error — missing field defaults to 0.
+
+Test 2: Backward compatibility — V2 writer, V1 reader
+  V2 message: 120 bytes
+  timestamp: 1000000 ✓
+  serverId:  1 ✓
+  schemaVersion: (not read — V1 decoder ignores data word 2) ✓
+  V1 reads V2 bytes without error — extra data word is silently ignored.
+
+Test 3: Why cereal can't do this (from storage spike)
+  Cereal TxNodeV1 + TxNodeV2 have different Serialize instances.
+  decode :: Either String TxNodeV2 on V1 bytes = Left (parse error)
+  because cereal's get reads exactly the bytes its structure expects.
+  Adding a field = breaking change: all existing writers must update.
+
+  Cap'n Proto avoids this because:
+    * The struct pointer in every message carries the data section word count.
+    * Readers check the actual word count before accessing a field.
+    * If a field is beyond the end of the data section: use the default (0).
+    * If a field is past what the reader knows about: silently ignored.
+  This is exactly the Mnesia property: disk format is versioned by schema,
+  not by code. No migration step. No branching decoder.
+
+Size difference: V1=112 bytes, V2=120 bytes (+8 bytes for the new field)
+
+Evolution tests: V1→V2=PASS, V2→V1=PASS
+
+=== Part 4: LMDB Threading Fix ===
+
+Fix applied: all LMDB calls wrapped in runInBoundThread
+
+Test 1: Write 10 RowId → LogEntry entries
+  Writes: OK (no bound-thread panic)
+
+Test 2: Read back by RowId
+  RowId 0/5/1: offset=1280 len=128 ✓
+  RowId 0/999/1: NOT FOUND (expected) ✓
+
+Benchmark: 1,000 writes (single session-level bound thread)
+  Total: 1107ms | Per write: 1107µs
+
+Benchmark: 1,000 reads (single session-level bound thread)
+  Hits: 1000/1000
+  Total: 11ms | Per read: 11µs
+
+Summary:
+  LMDB bound-thread fix: CONFIRMED
+  runInBoundThread eliminates the MDB_PANIC from the storage spike
+  Production note: use a dedicated bound-thread worker + STM queue
+  to batch LMDB writes; avoids per-call runInBoundThread overhead
+
+================================================
+SUMMARY
+================================================
+Cap'n Proto encoding:   PASS
+mmap zero-copy:         PASS
+Schema evolution:       PASS
+LMDB threading fix:     PASS
+
+Key latencies:
+  Encode:          0µs/tx
+  Full decode:     0µs/tx
+  Zero-copy field: 0µs/tx
+  LMDB write:      1107µs
+  LMDB read:       11µs
+  mmap zero-copy:  0µs
+
+Architecture confirmed:
+  UUID → head_index (LMDB) → RowId → log_index (LMDB) → (offset, len)
+  → mmap[offset:len] → Cap'n Proto struct → pointer arithmetic
+
+Migration path: swap cereal Serialize instances for capnp-generated
+Cerialize/Decerialize. Wire framing (length-prefix + segment) is identical.

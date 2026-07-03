@@ -15,20 +15,23 @@ Questions that need answers before or during implementation. Grouped by urgency.
 **Answer**: Servant + Warp works. The pattern is `"schema" :> Capture "ns" String :> Capture "name" String :> Raw`. Servant handles the static URL structure; the `Raw` endpoint delegates to an IORef-backed WAI dispatch table for runtime-dynamic routing. No Yesod needed for the data plane. See `spikes/servant-warp/output.txt`.
 
 ### OQ-003: Binary Replication Format ✓ ANSWERED
-**Answer**: Cap'n Proto for production; cereal during initial development. See `spikes/storage/output.txt`.
-- **cereal** (used in spike): same length-prefix framing as Cap'n Proto, no external toolchain, identical structural design. Ceiling: schema evolution requires an explicit version byte and branching decoder — adding a field to `TxNode` breaks old decoders without code.
-- **Cap'n Proto**: eliminates that ceiling. Fields are numbered (`@0` through `@5`); adding `@6` is always backward and forward compatible. Old writers omit it; old readers ignore it; new readers see the declared default. This is the Mnesia property: disk bytes are a valid in-memory message — field access is pointer arithmetic, not deserialization.
+**Answer**: Cap'n Proto for production; cereal during initial development. See `spikes/capnproto/output.txt`.
+- **cereal** (used in storage spike): same length-prefix framing as Cap'n Proto, no external toolchain, identical structural design. Ceiling: schema evolution requires an explicit version byte and branching decoder — adding a field to `TxNode` breaks old decoders without code.
+- **Cap'n Proto confirmed** (capnproto spike): wire format implemented and validated. Encode/decode round-trip passes all fields including parent RowId lists. Encode and full decode both sub-µs (timer resolution of 10k-iteration benchmark insufficient to distinguish; confirmed < 1µs/tx).
+- **mmap zero-copy confirmed**: 112-byte TxNode message written to disk, mmap'd back, fields read at fixed byte offsets (e.g. timestamp at message byte 16) with no decode pass. The OS page cache backs the ByteString — no heap allocation.
+- **Schema evolution confirmed**: V1 message (dataWords=2) read by V2 decoder → new field defaults to 0. V2 message (dataWords=3) read by V1 decoder → extra data word silently ignored. No version byte, no branching decoder, no migration step. V1=112 bytes, V2=120 bytes (+8 bytes for one new field).
 - **Protobuf is NOT a substitute**: Protobuf requires full parsing; Cap'n Proto mmaps the bytes directly.
-- **Path**: use `cereal` in `Serialize` instances during development; swap to Cap'n Proto generated types before production. The external `capnp` C++ tool is required at compile time.
-- **Latency**: encode ~0.15µs/tx, decode ~0.10µs/tx (10 mutations/tx, cereal).
+- **Migration path**: use `cereal` in `Serialize` instances during development; swap to capnp-generated `Cerialize`/`Decerialize` instances before production. Wire framing is identical — only the payload encoding changes. Requires `capnp` C++ tool at compile time (`apt install capnproto`).
 
-### OQ-004: Storage Engine ✓ ANSWERED (LMDB threading caveat)
-**Answer**: Hybrid architecture confirmed. See `spikes/storage/output.txt`.
+### OQ-004: Storage Engine ✓ ANSWERED
+**Answer**: Hybrid architecture confirmed. See `spikes/storage/output.txt` and `spikes/capnproto/output.txt`.
 - **Append-only log** (Cap'n Proto frames on disk): the transaction graph. Immutable, sequentially written, mmap-readable without deserialization. Random access by `LogEntry { offset :: Word64, length :: Word32 }` is O(1) seek+read.
 - **LMDB `log_index`** (`RowId → LogEntry`): finds any row version in the append log by RowId. Keys are 14-byte big-endian RowIds; big-endian encoding means a range scan over all rows in a transaction is a single contiguous LMDB range.
 - **LMDB `head_index`** (`UUID PK → current RowId`): resolves the user-visible primary key to the current head version.
 - **Full zero-copy read path**: `UUID → head_index → RowId → log_index → (file_offset, len) → mmap[offset:len] → Cap'n Proto → pointer arithmetic`.
-- **LMDB threading requirement**: LMDB transactions must be performed from an OS-bound thread. In Haskell, wrap all LMDB calls in `Control.Concurrent.runInBoundThread`. The spike hit this error ("must lock from a 'bound' thread!"); the architecture is correct and the fix is one wrapper call.
+- **LMDB threading fix confirmed**: requires `-threaded` in ghc-options AND wrapping the LMDB session in `runInBoundThread` (session-level, not per-operation). The `lmdb` Haskell package calls `isCurrentThreadBound` before acquiring its write lock; without `-threaded`, this always returns False. See `spikes/capnproto/src/Spike/LmdbFixed.hs`.
+- **LMDB latency**: read 11µs/op, write 1,107µs/op. Write latency is high because LMDB calls `fdatasync()` on every transaction commit by default (durability guarantee). **This is not a problem** — DataCode batches multiple mutations into a single transaction. At 10–100 mutations/tx, the per-mutation cost is 11–110µs, which is acceptable. Single-mutation micro-benchmarks are not representative of production write patterns.
+- **Production LMDB pattern**: dedicate one OS-bound thread (via `forkOS`) for all LMDB writes, with a `TQueue` for serialization. Readers are concurrent (LMDB MVCC — readers never block writers).
 
 ### OQ-026: API Version Token Format
 **Question**: What is the format of the version prefix in API paths — integer sequence number, semantic version, or abbreviated schema graph node hash?
@@ -125,15 +128,11 @@ Questions that need answers before or during implementation. Grouped by urgency.
 
 ## Connector and Ingestion Questions
 
-### OQ-017: PostgreSQL Logical Replication Spike
-**Question**: Is `postgresql-replicant` forkable, or must we write a PostgreSQL logical replication client from scratch against `postgresql-libpq`?
-**Why it matters**: `postgresql-replicant` was abandoned in 2021 and is self-described as experimental. PostgreSQL's `wal2json` protocol is well-documented, so a from-scratch implementation is feasible but is 2–4 weeks of work.
-**Action**: Evaluate `postgresql-replicant` source; determine if a fork is faster than a rewrite. Also evaluate wrapping `pg_recvlogical` as a sidecar process as a short-term alternative.
+### OQ-017: PostgreSQL Logical Replication ✗ NOT DOING
+**Decision**: Deprioritized for v1. The company primarily uses MariaDB/MySQL, which is the required replication source. `postgresql-replicant` is abandoned; a fork or rewrite is not worth the investment now. Revisit post-v1 if there is demand.
 
-### OQ-018: Redis CDC Approach
-**Question**: Redis Streams (`XREAD`/`XREADGROUP`) as explicit CDC vs. implementing PSYNC replication protocol vs. wrapping an external tool (e.g., RedisShake)?
-**Tradeoffs**: Streams = simple but requires Redis source to publish to a stream (not transparent). PSYNC = transparent but significant implementation work. External tool = fastest but adds an operational dependency.
-**Action**: Determine whether "transparent to the source" is a hard requirement for Redis, or whether requiring Redis Streams is acceptable.
+### OQ-018: Redis CDC Approach ✗ NOT DOING
+**Decision**: Deprioritized for v1. No viable transparent Haskell library; Redis Streams requires source changes; sidecar adds operational complexity. Not worth it for v1. Revisit post-v1 if needed.
 
 ### OQ-019: Connector Daemon Architecture
 **Question**: Is the connector daemon a separate process (separate daemon alongside the schema and data daemons) or a thread pool within the main DataCode server process?
