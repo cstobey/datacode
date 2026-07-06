@@ -33,15 +33,20 @@ Questions that need answers before or during implementation. Grouped by urgency.
 - **LMDB latency**: read 11µs/op, write 1,107µs/op. Write latency is high because LMDB calls `fdatasync()` on every transaction commit by default (durability guarantee). **This is not a problem** — DataCode batches multiple mutations into a single transaction. At 10–100 mutations/tx, the per-mutation cost is 11–110µs, which is acceptable. Single-mutation micro-benchmarks are not representative of production write patterns.
 - **Production LMDB pattern**: dedicate one OS-bound thread (via `forkOS`) for all LMDB writes, with a `TQueue` for serialization. Readers are concurrent (LMDB MVCC — readers never block writers).
 
-### OQ-026: API Version Token Format
-**Question**: What is the format of the version prefix in API paths — integer sequence number, semantic version, or abbreviated schema graph node hash?
-**Details**:
-- Integer sequence (v1, v2, v3): human-readable and simple, but requires a monotonic counter that is meaningful across shard splits and merges
-- Semantic version (v1.2.0): expressive but requires a separate versioning policy layered on top of the graph
-- Graph node hash prefix: content-addressed and unambiguous, but opaque to humans and ugly in URLs
-- The version must be deterministic given a schema graph node — two servers must agree on which version prefix corresponds to which graph node
-**Why it matters**: The version format determines how clients discover and pin API versions, and how the IDE exposes version history.
-**Action**: Decide on format; design the `/versions` discovery endpoint that lists all live version prefixes and their schema graph node references.
+### OQ-026: API Version Token Format ✓ ANSWERED
+**Answer**: Three interchangeable version token types, all valid as the `{version}` segment in `/v{version}/...` API paths:
+
+- **Graph node hash prefix** (canonical default): content-addressed, always deterministic. The underlying identity of every schema node. Guaranteed unambiguous across servers, shard splits, and merges.
+- **Tag**: a fixed-point alias for a specific graph node. Tags do not move after creation. Techs attach tags to commits as part of a transaction; tags are the expected primary UX for human-readable version pinning (e.g. `v2.1.0`, `stable-2026-q2`).
+- **Branch name**: a moving alias that always resolves to the current HEAD of a named branch (e.g. `main`, `experiment-checkout`). Advances automatically as new commits land on that branch.
+
+All three resolve to the same thing at dispatch time: token → schema graph node hash → routes registered at that node. The hash prefix is the lowest-level escape hatch that works even when no tag or branch name has been declared.
+
+**No-version behavior**: Requests without a version token are routed to the `main` branch HEAD by default. The server can also route unversioned requests across A/B test branches at a configurable rate; routing decisions persist via session affinity so the same client consistently receives the same branch across requests.
+
+**Promoting a version going forward**: A well-known alias URL (e.g. `/vcurrent/`) redirects to whichever tag or branch is currently designated. The `/versions` discovery endpoint lists all live tokens and marks the promoted one. Together these allow operators to tell existing clients "use this tag from now on" without requiring client code changes.
+
+**Policy**: All branches must be named — anonymous DAG forks are not permitted. The `main` branch cannot be deleted. See the Branch and Tag lifecycle documentation in `schema.md`.
 
 ### OQ-027: API Functor Type and Transaction Semantics
 **Question**: How is an API functor typed, and what are its transaction guarantees when it both reads and writes?

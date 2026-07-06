@@ -129,6 +129,32 @@ The schema itself is stored in the same transaction graph structure (in the `sys
 - The full history of schema evolution is queryable
 - Rollback is reading from an earlier graph node, not undoing changes
 
+### Branches, Tags, and Version Tokens
+
+The transaction graph supports three kinds of named references, all of which are valid version tokens in API paths (`/v{token}/records/...`):
+
+| Token type | Moves? | Example | Resolves to |
+|---|---|---|---|
+| **Graph node hash prefix** | Never | `a3f9c2b` | Itself — canonical, content-addressed |
+| **Tag** | Never | `v2.1.0`, `stable-2026-q2` | The specific node the tag was attached to |
+| **Branch name** | Yes (HEAD advances) | `main`, `experiment-checkout` | Current HEAD of that branch |
+
+All three resolve at dispatch time to a schema graph node hash, which then selects the route set registered at that node. The hash prefix is the lowest-level escape hatch — it works even when no tag or branch name has been declared.
+
+**Branch policy**: All branches must be explicitly named. Anonymous DAG forks are not permitted — creating a divergent commit requires naming the branch first. The `main` branch cannot be deleted.
+
+**Tag attachment**: Tags are attached to commits as part of a transaction (a tag is metadata on the commit node, not a side-table record). A tag, once written, is immutable — it permanently identifies the schema at a specific point in time. Semantic names (`v1.2.0`, `stable`) are the expected primary UX; the hash prefix exists as the canonical fallback.
+
+**Creating and merging branches**: A new branch forks from an existing node and accumulates commits independently. When a branch is merged back, the merge commit records **two parent pointers** — one to the prior HEAD on the target branch and one to the tip of the incoming branch. The DAG permanently shows both lineages; there is no rebase and no history rewriting.
+
+**Conflict resolution on merge**: Merge conflicts in both the schema and data graphs are resolved by defining a functor that reconciles the divergent schemas, then applying that functor to the affected data. The goal is for transparent functors to handle this automatically in the common case; manual resolution is reserved for cases the functor cannot express. The resolution functor is itself committed as a node in the schema graph.
+
+**Orphaned branches**: A branch is orphaned when it has never been merged to `main` (or any branch that has been merged to `main`) and its continued development has been abandoned. Orphaned branches are the only case where the transaction graph is editable: an orphaned branch and all nodes exclusive to it may be deleted. A branch with any path to `main` (via merge) cannot be deleted.
+
+**No-version routing**: Requests without a version token are routed to `main` HEAD by default. The server can also split unversioned traffic across named branches at a configurable rate for A/B testing; routing decisions persist via session affinity so the same client consistently receives the same branch. This makes local and A/B testing seamless without requiring clients to specify a version.
+
+**Promoting a version**: A well-known alias URL (e.g. `/vcurrent/`) redirects to whichever tag or branch name the operator has promoted. The `/versions` discovery endpoint lists all live version tokens and marks the promoted one. Operators use this to signal "use this tag going forward" without requiring client code changes. Promotion state is stored in a system table and is itself versioned.
+
 ### Schema Evolution and Coercion
 Because all functors are transparent, the system can derive a **coercion path** between any two schema graph nodes:
 - Adding a field: old records get `NOT_FOUND` for that field (handled by the `Maybe` monad)
@@ -240,7 +266,7 @@ This gives:
 - **Multiple live versions simultaneously** — a single server process serves all version prefixes at once
 - **Trivial rollback** — clients repoint to an older prefix; the server already handles it
 
-The exact format of the version token (integer sequence, semantic version, or abbreviated graph node hash) is an open question — see OQ-026.
+Version tokens may be a graph node hash prefix, a tag, or a branch name — all three are interchangeable in URL paths. See OQ-026 (answered) and the Branch and Tag lifecycle section above.
 
 ### Auto-Generated Routes
 
