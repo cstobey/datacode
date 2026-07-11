@@ -55,14 +55,14 @@ All absence types participate in the `Maybe` functor/monad chain so absent value
 ```
 -- TutorialD-style syntax (exact syntax TBD)
 table Customer {
-  id        : UUID        [primary_key]
+  id        : DataId      [primary_key]
   email     : Email                       -- Email has a validation functor
   name      : Text
   status    : CustomerStatus              -- ADT: Active | Suspended | Closed
 }
 
 table Order {
-  id          : UUID      [primary_key]
+  id          : DataId    [primary_key]
   customer_id : -> Customer               -- foreign key functor
   placed_at   : Timestamp
   total       : Decimal
@@ -115,11 +115,10 @@ The provenance of each field is tracked in the type, so the system always knows 
 
 ### Structure
 The transaction graph is an **immutable, append-only directed acyclic graph** (a git-like commit DAG). Each node records:
-- A unique content-addressed ID (hash of content)
+- A `DataId` — globally unique 12-byte identifier (see Globally Unique Identifiers below); timestamp and server identity are encoded within it
 - A sequence number within its shard
 - A pointer to the schema graph node that was current at commit time
 - The set of mutations applied (inserts, deletes — no in-place updates)
-- A timestamp and the committing server's identity
 
 Records are **idempotent** — applying the same transaction twice produces the same state. Records are **never mutated retroactively**.
 
@@ -182,6 +181,26 @@ As data volume crosses configurable thresholds, a shard splits. The split is rec
 ### Pruning
 `logs` shards and old materialized views may be pruned. Pruning is also recorded in the transaction graph as a special node, so the system always knows that historical data before a certain point has been discarded. Analytical summary metrics are computed before pruning to preserve aggregate history.
 
+### Globally Unique Identifiers
+
+Both transaction graph nodes and logical rows use a unified 12-byte `DataId`:
+
+```
+Bytes 0–4:  Unix timestamp in seconds  (big-endian, 5 bytes) — valid through year ~36 800
+Bytes 5–6:  Server ID                  (big-endian, 2 bytes) — up to 65 535 servers
+Bytes 7–11: Sequence counter           (big-endian, 5 bytes) — up to ~1.1 trillion per server per second
+────────────────────────────────────────────────────────────────────────────────────────
+Total: 12 bytes
+```
+
+- **Timestamp**: Unix epoch seconds. No sub-second precision needed — the sequence counter handles intra-second uniqueness.
+- **Server ID**: assigned sequentially at server registration; coordination required only at registration time, not at ID generation time.
+- **Sequence**: monotonically increasing counter per `(server, second)`, reset each second. 5 bytes = 2^40 ≈ 1.1 trillion increments/second/server.
+
+Big-endian encoding means lexicographic order approximates chronological order, which benefits LMDB range scans. `DataId` is globally unique without per-ID coordination.
+
+`DataId` replaces UUID as the primary key type for all DataCode-native tables and as the identity of transaction graph nodes.
+
 ### Row Identifiers
 
 Every row version in the transaction graph has a **composite physical row identifier**:
@@ -200,10 +219,10 @@ Big-endian encoding is critical: LMDB sorts keys lexicographically, and big-endi
 Transaction nodes themselves use `rowPos = 0` by convention (`txNodeId shard txSeq = RowId shard txSeq 0`). Rows within a transaction occupy positions 1 through N.
 
 **Two-tier identifier model:**
-- **User-visible**: the `UUID` primary key declared in the schema. Stable across mutations — same UUID throughout the row's lifetime.
+- **User-visible**: the `DataId` primary key declared in the schema. Stable across mutations — same `DataId` throughout the row's lifetime.
 - **Physical**: `RowId` — changes on every mutation, pointing to the newest version in the log.
 
-The LMDB `head_index` bridges the two: `UUID → current RowId`. Following up through `log_index` yields the physical location on disk.
+The LMDB `head_index` bridges the two: `DataId → current RowId`. Following up through `log_index` yields the physical location on disk.
 
 **Sort order confirmed by spike** (`spikes/storage/output.txt`): ByteString lexicographic sort of encoded RowIds produces the same ordering as Haskell's derived `Ord` instance.
 
@@ -228,14 +247,14 @@ With Cap'n Proto + mmap, the bytes on disk **are** the runtime representation �
 | Database | Key | Value | Purpose |
 |---|---|---|---|
 | `log_index` | 14-byte RowId | 12-byte `{offset: Word64, length: Word32}` | Random access to any row version in O(1) |
-| `head_index` | UUID PK bytes | 14-byte RowId | Resolve logical row to current physical version |
+| `head_index` | 12-byte DataId | 14-byte RowId | Resolve logical row to current physical version |
 
 **Full zero-copy read path:**
 ```
-UUID → head_index → RowId
-     → log_index  → (file_offset, length)
-     → mmap[offset:length] → Cap'n Proto message
-     → field access via pointer arithmetic (no copy)
+DataId → head_index → RowId
+       → log_index  → (file_offset, length)
+       → mmap[offset:length] → Cap'n Proto message
+       → field access via pointer arithmetic (no copy)
 ```
 
 LMDB properties that make this viable: memory-mapped (reads touch OS page cache, not a copy), MVCC (readers never block writers), crash-safe by default (copy-on-write B-tree + two root pages, no separate WAL), and sorted keys (range scans over all rows in a transaction are contiguous).
