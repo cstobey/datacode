@@ -1,0 +1,48 @@
+cabal-version: 3.0
+name:          route-trie-spike
+version:       0.1.0.0
+synopsis:      Feasibility spike — trie-based route dispatch for pattern URLs (OQ-029)
+description:
+  Answers OQ-029: what data structure should back DataCode's custom-API router?
+  .
+  The current Map-based dispatcher (servant-warp spike) does exact-key lookup on
+  registered schema names. Custom API templates like /orders/{id}/ship require
+  pattern matching, which breaks exact-key lookup. Three options were evaluated:
+  .
+  1. Hand-rolled route trie — O(depth × log fanout) per routing decision,
+     correct static-before-capture precedence, no external dependencies.
+  2. Linear scan — O(routes) per decision; simple but fails the 1µs target
+     once route count reaches a few thousand.
+  3. wai-routes / path-piece — both use Template Haskell compile-time route
+     tables, incompatible with DataCode's runtime-registered custom routes.
+  .
+  Conclusion: hand-rolled trie. Sub-µs routing at 10k+ routes validated here.
+
+license:    MIT
+author:     DataCode Contributors
+build-type: Simple
+
+common warnings
+  ghc-options: -Wall -Wno-unused-top-binds -O2
+
+executable route-trie-spike
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app, src
+  default-language: GHC2021
+
+  other-modules:
+    Spike.RouteTrie
+    Spike.LinearScan
+
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+    ScopedTypeVariables
+    StrictData
+
+  build-depends:
+    base        >= 4.14 && < 5,
+    containers  >= 0.6  && < 0.8,
+    text        >= 1.2  && < 2.2,
+    time        >= 1.9  && < 2

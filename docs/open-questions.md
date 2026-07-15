@@ -6,7 +6,7 @@ Questions that need answers before or during implementation. Grouped by urgency.
 
 ### OQ-001: Dynamic Loading Mechanism ✓ ANSWERED
 **Answer**: GADT DSL + Data.Dynamic hybrid. See `spikes/dynamic-loading/output.txt`.
-- **GADT DSL** (Approach 2): primary functor mechanism. All four functor types encoded. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors.
+- **GADT DSL** (Approach 2): primary functor mechanism. All five functor types must be encodable: validation, foreign key, path equivalence, access control, and event (the event functor enqueues a work item rather than executing immediately — see Event System in `schema.md`). Spike validated the first four; event functor requires a DSL extension that produces an `EventRef` (queue table row insert) instead of `Either Error a`. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors.
 - **Data.Dynamic** (Approach 3): type registry substrate. TypeRep-based type checking is O(1). Serves as the "registered type library" that the DSL references by name.
 - **hint** (Approach 1): failed to compile in the spike — GHC not on PATH or hint version mismatch. Revisit as an escape hatch for advanced user-defined functors; compile async and sandbox the result.
 - **Multi-daemon**: needed when compiled-in types must change (requires server restart to load new Haskell modules); the schema daemon restarts are coordinated by a supervisor.
@@ -65,11 +65,15 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 - Conflict is a validation error at insert time — the system rejects the custom route row
 **Action**: Choose a rule and enforce it at commit time in the `system.api.custom_routes` write path.
 
-### OQ-029: Route Trie vs. Dispatch Table Implementation
-**Question**: The current spike uses an exact-key `Map String Application`. Custom API templates require pattern matching (e.g., `/orders/{id}/ship` vs. `/orders/{id}/cancel`). What data structure?
-**Options**: A compiled route trie (fast, correct precedence), a list of compiled regex patterns tried in insertion order (simple but O(n)), or a library like `wai-routes` or `path-piece`.
-**Why it matters**: Routing is on the hot path for every request; the trie must handle thousands of registered routes without measurable overhead.
-**Action**: Prototype a trie-based dispatcher as the next spike; validate that 10k+ routes still route in under 1µs/request.
+### OQ-029: Route Trie vs. Dispatch Table Implementation ✓ ANSWERED
+**Answer**: Hand-rolled route trie. See `spikes/route-trie/output.txt`.
+- **Route trie confirmed**: 0.2µs/request at 10k registered routes — well under the 1µs target. O(depth × log fanout), independent of total route count.
+- **Linear scan ruled out**: 1µs at 100 routes, 13µs at 1k routes, 132µs at 10k routes. Scales O(n) — fails the target beyond a handful of custom routes.
+- **wai-routes ruled out**: uses Template Haskell compile-time route tables — incompatible with DataCode's runtime-registered custom routes.
+- **path-piece ruled out**: a type class for parsing individual path segments, not a router.
+- **Precedence**: static segments always beat captures at the same depth — correct, deterministic, matches every mainstream router.
+- **Integration**: replace `IORef (Map String Application)` in the Servant `Raw` handler with `IORef (RouteTrie Application)`. Schema changes rebuild the trie and atomically swap the IORef — zero request interruption.
+- **Conflict resolution** (answers OQ-028 partially): exact-path conflicts are a schema validation error at insert time. The trie's `nodeHandler` slot can only hold one handler; inserting a duplicate pattern is rejected.
 
 ## Must Resolve During Core Development
 

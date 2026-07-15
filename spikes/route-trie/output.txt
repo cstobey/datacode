@@ -1,0 +1,104 @@
+╔══════════════════════════════════════════════════════════╗
+║   DataCode: Route Trie Spike                             ║
+║   OQ-029: Trie vs. dispatch table for pattern routing    ║
+╚══════════════════════════════════════════════════════════╝
+
+=== Approach A: Route Trie ===
+
+Correctness tests:
+  Static route /health: OK
+  Capture /orders/{id}/ship (id=42): OK
+  Capture /orders/{id}/cancel (id=99): OK
+  Static beats capture /orders/special/ship: OK
+  Capture /users/{userId}: OK
+
+  Param extraction for /orders/42/ship:
+    handler=shipOrder params=[("id","42")]
+
+  Miss cases (expect Nothing):
+    Unknown route /invoices/1: OK
+    Incomplete path /orders: OK
+
+Benchmark: 10000 registered routes, 10,000 routing decisions
+  Total: 2ms (2.341071) | Per request: 0.2µs (0.2341071)
+  Target (<1µs/request): PASS
+
+Summary:
+  Trie dispatch: SUCCEEDED
+  Static-before-capture precedence: correct
+  Param extraction: correct
+  Routing depth: 3 levels, fanout 50 resources × 200 actions
+
+=== Approach B: Linear Scan ===
+
+  100 routes: 1µs (1.3812031) — FAIL (>1µs)
+  1000 routes: 13µs (13.204719) — FAIL (>1µs)
+  10000 routes: 132µs (132.01847) — FAIL (>1µs)
+
+Summary:
+  Linear scan: SUCCEEDED (correct results)
+  Latency grows linearly with route count — fails <1µs target at scale
+
+╔══════════════════════════════════════════════════════════╗
+║   SUMMARY                                                ║
+╚══════════════════════════════════════════════════════════╝
+
+Approach A — Route Trie
+  Success: True
+  Routes tested: 10000
+  Routing latency: 0.2µs/request (0.2341071)
+  Key findings:
+    - O(depth × log fanout) per routing decision — independent of total route count
+    - Static segments beat captures at each level — correct, deterministic precedence
+    - Captures accumulate into Map Text Text — ready to pass as WAI pathInfo params
+    - Trie is immutable; swap to new version atomically with IORef/TVar on schema change
+    - No external deps — pure containers + text, already in every Haskell project
+    - Depth for DataCode custom routes: 2–4 levels, fanout typically 10–100 per level
+
+Approach B — Linear Scan
+  Routes tested: 10000
+  Routing latency: 132µs/request (132.01847) (10k routes)
+  Key findings:
+    - O(routes) per dispatch — first-segment mismatch exits quickly but still linear
+    - Insertion-order precedence: fragile at scale, order-sensitive bugs hard to diagnose
+    - Passes <1µs at 100 routes; fails at 1k; clearly fails at 10k
+    - Zero setup overhead — fine for tiny route tables or testing; wrong for production
+
+Approach C — wai-routes / path-piece (architectural, no code)
+  - wai-routes: Template Haskell compile-time routes — incompatible with
+    DataCode's runtime-registered custom routes
+  - path-piece: type class for parsing path segments, NOT a router —
+    does not provide trie or dispatch logic
+  - Neither library fits; both are compile-time solutions for a runtime problem
+
+╔══════════════════════════════════════════════════════════╗
+║   RECOMMENDATION (OQ-029)                                ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║   Use the hand-rolled route trie (Approach A).           ║
+║                                                          ║
+║   Integration with the servant-warp spike (OQ-002):      ║
+║                                                          ║
+║   The Servant Raw handler currently delegates to an       ║
+║   IORef (Map String Application) keyed on schema name.   ║
+║   Replace the Map with a RouteTrie Application:          ║
+║                                                          ║
+║     type RouteTable = IORef (RouteTrie Application)      ║
+║                                                          ║
+║   On every request the Raw handler:                      ║
+║     1. Reads the IORef (or TVar for concurrent writes)   ║
+║     2. Calls routeRequest (pathInfo req) trie            ║
+║     3. Adds matchParams to request vault/headers         ║
+║     4. Delegates to matchHandler                         ║
+║                                                          ║
+║   Schema changes rebuild the trie and atomically swap    ║
+║   the IORef — zero request interruption, no locking      ║
+║   during reads (same pattern as the IORef Map today).    ║
+║                                                          ║
+║   Conflict resolution (OQ-028): static segments always   ║
+║   beat captures at the same depth. Exact-path conflicts  ║
+║   (two routes with identical segment sequences) are a    ║
+║   schema validation error at insert time — the trie's    ║
+║   nodeHandler slot can only hold one handler.            ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝

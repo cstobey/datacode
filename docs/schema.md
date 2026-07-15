@@ -9,6 +9,26 @@ DataCode schemas are closer to TutorialD than SQL. The core shift:
 - There is **no NULL** — absent values are expressed as typed ADTs
 - Tables are organized in a **namespace tree** (see namespaces.md) — namespaces replace the SQL "database" concept
 
+### Self-Hosting Principle
+
+**DataCode should use DataCode to manage its own operational data wherever practical.**
+
+Every system concern that can be expressed as a table, should be. This includes:
+
+- **API route registrations** — rows in `system.api.generated_routes` and `system.api.custom_routes`
+- **Connector configurations** — rows in `system.connectors.*`
+- **Event queues** — rows in `system.events.items` (and user-defined queue tables in `app.*`)
+- **Scheduler state** — rows in `system.events.*`
+- **Auth tokens and sessions** — rows in `system.auth.*`
+- **Schema version promotions** — rows in `system.branches` and `system.tags`
+- **Operational metrics and logs** — rows in `system.logs.*` (logs shard, prunable)
+
+The practical consequences:
+- DataCode's own configuration is inspectable and queryable with standard DataCode tooling
+- System operations (connector sync, event dispatch, shard maintenance) are auditable in the transaction log
+- The IDE can show system state the same way it shows application state
+- Bootstrapping is the only exception — the very first system tables must exist before DataCode can use DataCode to manage them
+
 ## Namespace Organization
 
 Every table belongs to a namespace. Namespaces are dot-separated hierarchical paths:
@@ -110,6 +130,31 @@ view ActiveOrders {
 }
 ```
 The provenance of each field is tracked in the type, so the system always knows which underlying table a result field originated from.
+
+## Functor Types
+
+DataCode has five functor kinds. All five are first-class schema objects — defined as rows in system tables, referenced by `FunctorRef`, and encoded in the GADT DSL (confirmed in `spikes/dynamic-loading/output.txt`).
+
+| # | Kind | Signature | When it runs | Purpose |
+|---|---|---|---|---|
+| 1 | **Validation** | `a → Either Error a` | On commit | Rejects invalid field values (range checks, format checks, domain invariants) |
+| 2 | **Foreign key** | `DataId → Either Error Row` | On commit | Referential integrity — resolves a DataId to a live row in the referenced table |
+| 3 | **Path equivalence** | `(a, a) → Either Error ()` | On commit | Asserts that two schema-graph paths reach the same value (e.g. billing address matches order) |
+| 4 | **Access control** | `(User, a) → Either Error a` | On read and write | Gates reads and writes based on the requesting user's identity and role; can redact individual fields |
+| 5 | **Event** | `a → EventRef` | On commit | Schedules a deferred side effect — enqueues a work item in a DataCode queue table rather than executing immediately |
+
+Functors 1–4 are synchronous and transactional: they run as part of the commit and can abort it. Functor 5 is asynchronous and decoupled: the commit always succeeds (inserting the queue row is the commit), and the side effect runs later under the event scheduler.
+
+### Event Functor
+
+An event functor, when attached to a table, fires whenever a matching row is inserted or updated. It does not execute the side effect itself — it writes a work item into a designated DataCode queue table. This keeps the commit path fast and ensures external side effects are:
+
+- **Durable** — the queue row survives a server crash
+- **Observable** — queue depth, failure rates, and retry counts are queryable
+- **Retryable** — the scheduler owns the retry policy; the functor just writes the payload
+- **Rate-limited** — the scheduler applies volume-based backoff before dispatching
+
+The queue table is a normal DataCode table (`app.events.email_queue`, `app.events.webhook_queue`, etc.) — inspectable in the IDE, filterable, and audited in the transaction log.
 
 ## Transaction Graph
 
@@ -338,6 +383,107 @@ Inserting or updating a row in `system.api.custom_routes` takes effect immediate
 ### HTTP Dispatch
 
 All routes — auto-generated and custom — are materialized from the system tables into a runtime WAI dispatch table (an IORef-backed route trie, as confirmed by the Servant+Warp spike). The Servant frame handles the static URL structure; the dispatch table handles the versioned and dynamic portions. Route templates are compiled into path-matchers at registration time; path parameters are extracted at request time and passed to the functor.
+
+## Event System
+
+The event scheduler is DataCode's mechanism for all deferred and external side effects — both system maintenance and user-triggered outbound calls. It is not a separate message broker; the queues are DataCode tables.
+
+### Design Principle
+
+**No external call may be made from within a commit transaction.** Any operation that touches an external system (send an email, call a webhook, update a third-party API endpoint) must go through a queue table. A transaction that needs to trigger an external effect inserts a row into a queue table; the commit completes; the scheduler picks it up later and executes the side effect. This means:
+
+- Commits are never blocked by external latency
+- Side effects are durable — a crash between commit and execution loses nothing
+- The queue is inspectable and auditable with standard DataCode tools
+- Retry logic and backoff are centralized in the scheduler, not scattered across application code
+
+### User-Defined Queue Tables
+
+Applications define their own queue tables for outbound side effects:
+
+```
+table app.events.email_queue {
+  id          : DataId        [primary_key]
+  recipient   : Email
+  template    : EmailTemplate
+  payload     : JsonObject
+  [event_functor: system.connectors.email.SendFunctor]
+}
+
+table app.events.webhook_queue {
+  id          : DataId        [primary_key]
+  destination : URL
+  body        : JsonObject
+  [event_functor: system.connectors.http.PostFunctor]
+}
+```
+
+The `event_functor` attribute links the queue table to the connector functor that knows how to process it. When the scheduler dequeues a row, it calls that functor with the row as input.
+
+### System Queue Tables
+
+The scheduler also drives internal DataCode maintenance through system-managed queues:
+
+```
+system.events.maintenance_queue
+  -- log compaction, shard splits, materialized view refreshes,
+  -- LMDB vacuum, index rebuilds, orphaned branch cleanup
+  -- Populated by the server itself; not user-accessible
+```
+
+This means maintenance scheduling is itself observable through DataCode — operators can query `system.events.maintenance_queue` to see what maintenance is pending and when.
+
+### System Tables
+
+```
+system.events.queues
+  name         : Text         -- queue name (e.g. "app.events.email_queue")
+  handler_ref  : FunctorRef   -- functor that processes items from this queue
+  max_attempts : Int          -- retry limit before marking Failed
+  backoff_base : Duration     -- base duration for exponential backoff
+
+system.events.items
+  id            : DataId      [primary_key]
+  queue_name    : Text
+  payload       : Bytes       -- serialized row snapshot at enqueue time
+  scheduled_at  : Timestamp   -- not-before time (set by backoff logic)
+  attempt_count : Int
+  last_error    : Maybe Text
+  status        : EventStatus -- Pending | InFlight | Failed | Done
+
+system.events.backoff_state
+  destination   : Text        -- endpoint or queue identifier
+  failure_rate  : Decimal     -- rolling failure rate (recent window)
+  volume_count  : Int         -- events dispatched in current window
+  backoff_until : Timestamp   -- do not dispatch until this time
+```
+
+### Volume-Based Backoff
+
+The scheduler uses **volume-based backoff**, not just time-based backoff. This matters because:
+
+- A destination may be healthy but rate-limited — backing off by time alone starves other destinations sharing the same worker pool
+- A destination may have started failing due to volume (the caller is overwhelming it) — the correct response is to reduce volume, not just delay
+
+Backoff logic:
+1. **Per-destination failure tracking**: rolling failure rate over a recent window. If the rate exceeds a threshold, enter backoff.
+2. **Volume throttling**: if the queue depth for a destination exceeds a configured limit, throttle new dispatches to that destination regardless of failure rate.
+3. **Exponential delay**: `backoff_duration = backoff_base × 2^(failure_count)`, capped at a maximum.
+4. **Jitter**: randomized ±20% on the delay to prevent thundering-herd recovery.
+
+Backoff state lives in `system.events.backoff_state` — observable and adjustable by operators without a server restart.
+
+### Scheduler Architecture
+
+The event scheduler is a dedicated DataCode process (similar to the connector daemon — see OQ-019). It:
+
+1. Polls `system.events.items` for rows with `status = Pending` and `scheduled_at ≤ now`
+2. Marks each item `InFlight` atomically (prevents double-dispatch)
+3. Calls the queue's `handler_ref` functor with the payload
+4. On success: marks `Done`, updates `system.events.backoff_state` (reset failure count)
+5. On failure: increments `attempt_count`, logs `last_error`, computes next `scheduled_at` from backoff, marks `Pending` again (or `Failed` if `attempt_count ≥ max_attempts`)
+
+The poll interval is adaptive — shorter when the queue is non-empty, longer when idle.
 
 ## Materialized Views
 
