@@ -188,7 +188,23 @@ All three resolve at dispatch time to a schema graph node hash, which then selec
 
 **Branch policy**: All branches must be explicitly named. Anonymous DAG forks are not permitted — creating a divergent commit requires naming the branch first. The `main` branch cannot be deleted.
 
-**Tag attachment**: Tags are attached to commits as part of a transaction (a tag is metadata on the commit node, not a side-table record). A tag, once written, is immutable — it permanently identifies the schema at a specific point in time. Semantic names (`v1.2.0`, `stable`) are the expected primary UX; the hash prefix exists as the canonical fallback.
+**Tag attachment**: Tags are rows in `system.version_refs` (see below), inserted as part of a transaction. A tag, once written, is immutable — it permanently identifies the schema at a specific point in time. Semantic names (`v1.2.0`, `stable`) are the expected primary UX; the hash prefix exists as the canonical fallback.
+
+**Version ref storage**: Branches and tags share a single system table. The `VersionRef` ADT encodes the mutability difference directly in the type — no discriminator column needed:
+
+```haskell
+data VersionRef
+  = Branch DataId    -- mutable: HEAD pointer advances as commits land on this branch
+  | Tag    DataId    -- immutable: permanently pinned to one schema node
+```
+
+```
+system.version_refs
+  name : Text        [primary_key]  -- unique across all branches and tags
+  ref  : VersionRef                 -- Branch DataId | Tag DataId
+```
+
+The `Tag` variant's immutability is enforced by a validation functor that rejects any update to a row whose current `ref` is a `Tag`. The `Branch` variant has no such restriction — HEAD advances freely. Deletion of the `main` branch is rejected by a separate validation functor. Hash prefixes are implicit graph node identifiers and require no row in this table.
 
 **Creating and merging branches**: A new branch forks from an existing node and accumulates commits independently. When a branch is merged back, the merge commit records **two parent pointers** — one to the prior HEAD on the target branch and one to the tip of the incoming branch. The DAG permanently shows both lineages; there is no rebase and no history rewriting.
 
@@ -376,6 +392,21 @@ A `NULL` column means that HTTP method returns 405 on that route. A route with o
 Each referenced functor is an **API functor**: it receives the extracted path parameters and request body (if present), performs reads and/or writes within a single transaction, and returns a response value. Authentication and authorization apply automatically (see below).
 
 Inserting or updating a row in `system.api.custom_routes` takes effect immediately — the WAI dispatch table is updated as part of committing the transaction, with no server restart.
+
+### Route Conflict Resolution
+
+Custom routes shadow auto-generated routes at the same path. If a custom route is registered at `/records/app.commerce.orders/{id}`, it handles all requests to that path — the auto-generated handler is bypassed for that schema version. Removing the custom route restores auto-generated behavior.
+
+**Reserved `raw/` prefix**: `/v{N}/raw/<table-path>` always routes to the auto-generated handler. Custom routes whose template starts with `raw/` are rejected at insert time. This guarantees auto-generated CRUD is always reachable regardless of custom route registrations:
+
+```
+GET /v{N}/records/app.commerce.orders/{id}  -- custom handler if registered; auto-generated otherwise
+GET /v{N}/raw/app.commerce.orders/{id}      -- always auto-generated
+```
+
+**Path validation**: A custom route registered under the `/records/` prefix must reference a table or view that exists in the current schema. Phantom overrides (custom routes for non-existent tables) are rejected at insert time.
+
+**Version semantics**: Custom routes are schema objects — they are committed to the transaction graph and are naturally included or excluded based on which schema node a version token resolves to. No special routing-mode flag is needed on branches or tags; the schema graph already captures when a custom route existed.
 
 ### Authentication and Authorization
 

@@ -55,13 +55,13 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 - **Error signaling**: The transaction is atomic — it either fully commits or fully fails. On failure, only the HTTP request log is written (to a per-server system shard that always succeeds independently). The error is returned to the client. 500s should be avoided; all known failure modes return 4xx.
 - **Event functors**: Internal events (e.g., index updates, view refresh) resolve within the transaction as they occur. External side effects (email, webhooks, etc.) are never executed inline — they are written to a queue table and processed asynchronously by the event scheduler functor. No external calls from within a transaction.
 
-### OQ-028: Route Conflict Resolution
-**Question**: When a custom route template overlaps with an auto-generated route, which takes precedence?
-**Details**: Example: the auto-generated route for `app.commerce.orders` produces `/v{N}/records/app.commerce.orders/{id}` for GET. If a user also inserts a custom route with template `/records/app.commerce.orders/{id}`, both exist. Options:
-- Custom routes always shadow auto-generated routes at the same path
-- Auto-generated routes take precedence; custom routes must use different paths
-- Conflict is a validation error at insert time — the system rejects the custom route row
-**Action**: Choose a rule and enforce it at commit time in the `system.api.custom_routes` write path.
+### OQ-028: Route Conflict Resolution ✓ ANSWERED
+
+- **Custom routes shadow auto-generated at the same path.** The most useful behavior — registering a custom route at `/records/app.commerce.orders/{id}` clearly intends to override the generated handler.
+- **Reserved `raw/` prefix**: `/v{N}/raw/<table-path>` is always auto-generated; custom routes starting with `raw/` are rejected at insert time. This guarantees the auto-generated handler is always reachable.
+- **Path validation**: custom routes under `/records/` must reference an existing table/view; phantom overrides are rejected at insert time.
+- **Version semantics**: custom routes are schema objects in the transaction graph — no routing-mode flag on branches or tags needed. A version token resolves to a schema node, and the routes at that node (generated + any custom overrides) follow naturally.
+- **Version ref uniqueness**: branches and tags share `system.version_refs` with a `VersionRef` ADT (`Branch DataId | Tag DataId`). The `Tag` variant's immutability is enforced by a validation functor. No discriminator column — the type encodes the rule.
 
 ### OQ-029: Route Trie vs. Dispatch Table Implementation ✓ ANSWERED
 **Answer**: Hand-rolled route trie. See `spikes/route-trie/output.txt`.
