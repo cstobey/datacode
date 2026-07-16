@@ -22,6 +22,7 @@ Every system concern that can be expressed as a table, should be. This includes:
 - **Auth tokens and sessions** — rows in `system.auth.*`
 - **Schema version promotions** — rows in `system.branches` and `system.tags`
 - **Operational metrics and logs** — rows in `system.logs.*` (logs shard, prunable)
+- **HTTP request logs** — rows in `system.logs.http_requests` (per-server log shard; written regardless of transaction outcome — see HTTP Request Logging below)
 
 The practical consequences:
 - DataCode's own configuration is inspectable and queryable with standard DataCode tooling
@@ -221,6 +222,8 @@ A shard is a named slice of the schema containing related tables. Five shard typ
 | `user` | Scales with user count | High | Shard-local |
 | `logs` | Massive cardinality; prunable | Very high | Shard-local, time-bounded |
 
+`logs`-type shards are **server-local by default**: each server is authoritative for its own log data and does not replicate it to peers. This is a deliberate tradeoff — log volume makes cross-server replication expensive, and per-server logs are sufficient for auditability (query each server's log shard independently, or aggregate via a materialized view). The HTTP request log shard is a specific instance of this pattern (see HTTP Request Logging below).
+
 As data volume crosses configurable thresholds, a shard splits. The split is recorded as a special node in the transaction graph so the history of which data lived in which shard is always recoverable.
 
 ### Pruning
@@ -383,6 +386,34 @@ Inserting or updating a row in `system.api.custom_routes` takes effect immediate
 ### HTTP Dispatch
 
 All routes — auto-generated and custom — are materialized from the system tables into a runtime WAI dispatch table (an IORef-backed route trie, as confirmed by the Servant+Warp spike). The Servant frame handles the static URL structure; the dispatch table handles the versioned and dynamic portions. Route templates are compiled into path-matchers at registration time; path parameters are extracted at request time and passed to the functor.
+
+### HTTP Request Logging
+
+Every HTTP request to any DataCode endpoint is logged to `system.logs.http_requests` — a per-server `logs`-type shard. This write is **independent of the main transaction**: it succeeds whether the transaction commits, is rejected, or errors. It is the only write that DataCode guarantees on every request path.
+
+```
+system.logs.http_requests
+  id            : DataId          [primary_key]
+  server_id     : ServerId        -- which server handled this request
+  received_at   : Timestamp
+  method        : HttpMethod
+  path          : Text
+  version_token : Text            -- the version token from the URL (branch, tag, or hash)
+  status_code   : Int
+  duration_ms   : Int
+  client_token  : Maybe TokenId
+  user_token    : Maybe TokenId
+  tx_id         : Maybe DataId    -- null when the transaction did not commit
+  error         : Maybe Text      -- null on success
+```
+
+Key properties:
+- **Always written** — a failed, rejected, or errored transaction still produces a log row
+- **Per-server** — not cross-replicated; each server is authoritative for its own request history
+- **Prunable** — subject to the same time-bounded retention as other `logs` shards
+- **Auditable** — inspectable in the IDE; queryable with standard DataCode tools
+
+This log is the foundation for observability: correlating `tx_id` with the transaction graph gives the full audit trail from HTTP request through to committed mutations.
 
 ## Event System
 

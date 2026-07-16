@@ -23,8 +23,11 @@ Namespaces are:
 (root)
 ├── system/              -- DataCode self-management tables
 │   ├── auth/            -- users, tokens, sessions
+│   ├── api/             -- generated_routes, custom_routes, format_functors
 │   ├── connectors/      -- connector configuration and logs
-│   ├── schema/          -- schema transaction graph metadata
+│   ├── events/          -- queues, items, backoff_state, maintenance_queue
+│   ├── logs/            -- http_requests and other operational logs (per-server, prunable)
+│   ├── schema/          -- schema transaction graph metadata, branches, tags
 │   ├── shards/          -- shard topology and server roles
 │   └── telemetry/       -- view materialization stats, replication lag
 │

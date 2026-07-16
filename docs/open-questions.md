@@ -48,14 +48,12 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 
 **Policy**: All branches must be named — anonymous DAG forks are not permitted. The `main` branch cannot be deleted. See the Branch and Tag lifecycle documentation in `schema.md`.
 
-### OQ-027: API Functor Type and Transaction Semantics
-**Question**: How is an API functor typed, and what are its transaction guarantees when it both reads and writes?
-**Details**:
-- A validation functor is `a -> Either Error a`. An API functor needs: path parameters + optional request body as input; response body + HTTP status as output
-- If a functor both reads and writes, does the read reflect the committed write (same transaction) or the pre-write snapshot?
-- How does the functor signal HTTP-level errors (404, 409, 422) vs. internal errors (500)?
-- Can an API functor trigger connector side effects (e.g., send an email via a connector functor as part of the same transaction)?
-**Action**: Design the API functor type signature; determine if it is a new functor kind or a composition of existing kinds (likely a new kind given its HTTP-aware interface).
+### OQ-027: API Functor Type and Transaction Semantics ✓ ANSWERED
+
+- **Typing**: No separate API functor type. Field types are referenced directly from the schema everywhere they are used — the schema IS the type system. Auto-generated routes are fully typed by the table definition.
+- **Transaction semantics**: Reads and writes share the same transaction graph snapshot. The primary server linearizes and executes transactions one at a time. Cross-shard transactions require all shard primaries to agree: a cross-server lock is taken on a `transaction_id` across the involved shards and held until all operations complete. Consequence: the system should group related shards on the same server, and should prefer placing the primary close to the users making requests.
+- **Error signaling**: The transaction is atomic — it either fully commits or fully fails. On failure, only the HTTP request log is written (to a per-server system shard that always succeeds independently). The error is returned to the client. 500s should be avoided; all known failure modes return 4xx.
+- **Event functors**: Internal events (e.g., index updates, view refresh) resolve within the transaction as they occur. External side effects (email, webhooks, etc.) are never executed inline — they are written to a queue table and processed asynchronously by the event scheduler functor. No external calls from within a transaction.
 
 ### OQ-028: Route Conflict Resolution
 **Question**: When a custom route template overlaps with an auto-generated route, which takes precedence?
@@ -86,6 +84,7 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 **Question**: How does the cluster detect a failed primary and who initiates elevation of a secondary?
 **Options**: Heartbeat with timeout, lease-based (primary must renew a lease), or external witness node.
 **Constraint**: Must not split-brain — two secondaries must not both believe they are primary.
+**Additional failure mode (from OQ-027)**: Cross-shard transactions take a distributed lock across all involved shard primaries and hold it until all operations complete. If any participating primary dies mid-lock, the recovery protocol must detect the partial lock and either complete or roll back the transaction. This is effectively a two-phase commit recovery problem — the failure detection mechanism chosen here must also handle lock-holder crash recovery, not just primary elevation for normal reads and writes.
 
 ### OQ-007: Shard Split Trigger
 **Question**: Are shard splits automatic (threshold-triggered) or operator-initiated (with threshold warnings)?
