@@ -58,20 +58,47 @@ Access control is not a separate ACL system — it is a category of functors app
 - Composition: token A's access is the intersection of the client token's schema-level access and the user token's row-level access
 - Access rules can be analyzed statically for consistency (no contradictions, complete coverage) before deployment
 
-### Example
+ACL rules use the same `assert` keyword as path-equivalence constraints — both are path-equivalence assertions; ACL just has the requesting token as one term.
+
+### Syntax
+
 ```
--- Only a user can see their own orders
-access_control OrderVisibility {
-  path: User -> Order [via Order.user_id]
-  allowed_tokens: [user_token where user_token.user_id = Order.user_id]
+-- Inline in table definition
+table app.commerce.Order {
+  customer : -> Customer
+
+  -- Only a user can see/write their own orders
+  assert access { user.id == customer.user_id }
 }
 
--- Client application can only access the Order schema, not User PII
-access_control ClientSchema {
-  restrict_schema: [Order, OrderLine, Product]
-  token_type: client
-}
+-- Standalone (add or update after the table is defined)
+assert Order.access { user.id == customer.user_id }
 ```
+
+`user` refers to the requesting user token. The exact fields exposed on `user` (full user row vs. just `user.id`) are TBD — see open questions in the design plan.
+
+### Schema-Level Access (Client Token Restrictions)
+
+Client tokens restrict which tables and fields are accessible at the schema level. This is configured in `system.auth.*` tables — not expressed as `assert` rules in the table definition. A client token that is scoped to `app.commerce` cannot access `app.hr.*` regardless of what row-level `assert access` rules exist on those tables.
+
+### Path Equivalence (Data Constraints)
+
+Path equivalence constraints that are not about token access use the same `assert` syntax without the `access` name:
+
+```
+table Order {
+  customer  : -> Customer
+  bill_addr : Address
+
+  -- Assert: two FK paths reach the same address
+  assert billingMatch { customer.billing_address == bill_addr }
+}
+
+-- Standalone
+assert Order.billingMatch { customer.billing_address == bill_addr }
+```
+
+Both ACL and path-equivalence constraints are first-class schema objects stored as `FunctorRef`s in the system schema.
 
 ## Self-Management and Extensibility
 

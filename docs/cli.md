@@ -20,10 +20,10 @@ datacode
 # Connect to a remote instance with explicit credentials
 datacode --host db.example.com --port 7432 --client-token <token> --user-token <token>
 
-# Execute a single command and exit (scriptable)
-datacode --exec "DESCRIBE TABLE app.commerce.orders"
+# Execute a single expression and exit (scriptable)
+datacode --exec "app.commerce.Order where total > 100"
 
-# Execute a script file
+# Execute a schema definition file
 datacode --file schema/initial.dc
 
 # Connect to a specific shard directly (for DR purposes)
@@ -32,112 +32,258 @@ datacode --shard user.commerce --host shard2.example.com
 
 ## Interface Style
 
-The CLI is a REPL with a prompt indicating the current namespace context:
+The CLI is a REPL with a prompt indicating the current namespace context. Everything typed is staged in a transaction until explicitly committed — nothing persists to the schema until `:commit`.
 
 ```
-datacode[system]> USE NAMESPACE app.commerce
-datacode[app.commerce]> DESCRIBE TABLE orders
-datacode[app.commerce]> 
+datacode[system]> :use app.commerce
+datacode[app.commerce]> :describe Order
+datacode[app.commerce]> :commit
+datacode[app.commerce]> :rollback
+datacode[app.commerce]> :help
 ```
 
-The current namespace context is a convenience default for unqualified names. Fully-qualified names (`app.commerce.orders`) always work regardless of context.
+The current namespace context is a convenience default for unqualified names. Fully-qualified names (`app.commerce.Order`) always work regardless of context.
 
-## Command Categories
+**REPL meta-commands** (prefixed with `:`):
 
-### Schema Definition
+| Command | Effect |
+|---|---|
+| `:use <namespace>` | Set the current namespace context |
+| `:describe <name>` | Show the definition of a table, trait, or type |
+| `:history <name>` | Show the schema transaction graph for a table |
+| `:commit` | Commit all staged changes to the schema |
+| `:rollback` | Discard all staged changes |
+| `:explain <expr>` | Show the functor chain and query plan for an expression |
+| `:help` | Show available commands |
+
+## DSL Categories
+
+### Type and Trait Definitions
 
 ```
--- Create a namespace
-CREATE NAMESPACE app.commerce
+-- Domain types (colon means "is a kind of")
+-- Note: { validate: ... } syntax is tentative
+type Email  : Text    { validate: isValidEmail }
+type Amount : Decimal { validate: \a -> a >= 0 }
+type Zip    : Text    { validate: \z -> length z == 5 }
 
--- Define a table
-CREATE TABLE app.commerce.orders {
-  id          : UUID       [primary_key]
-  customer_id : -> app.commerce.customers
-  total       : Amount
-  status      : OrderStatus
+-- Custom absence types (used in outer joins)
+type MissingCustomer : Null
+
+-- Traits (abstract — cannot be instantiated directly)
+trait Active {
+  is_active : ActiveStatus | InactiveStatus
+
+  active   self = self where is_active is ActiveStatus
+  inactive self = self where is_active is InactiveStatus
 }
 
--- Define a view (with all selector — see Schema DSL docs)
-CREATE VIEW app.commerce.order_summary {
-  * FROM connectors.mariadb.production.orders   -- wildcard: tracks source schema
-  status : OrderStatus                           -- explicit override
+-- Replication traits (built-in; user traits can extend them)
+-- trait Reference     -- replicates to all servers
+-- trait UserData      -- shard-local
+-- trait LogData       -- prunable, server-local
+-- trait Configuration -- all-server, operator-managed
+
+trait Catalog : Reference {
+  is_visible : Bool = True
+}
+```
+
+### Table Definitions
+
+Namespaces are implicit — just use them in table names.
+
+```
+-- Table with trait inheritance; DataId primary key is always implicit
+table app.commerce.Customer : Active, UserData {
+  email : Email unique
+  name  : Text
+  phone : Phone | NotGiven
 }
 
--- Add a functor to an existing table
-ADD FUNCTOR PositiveAmount ON app.commerce.orders.total
-  VALIDATE amount > 0
-  ERROR "Order total must be positive"
+-- FK field (arrow creates FK functor automatically)
+-- Per-table default ordering declared inline
+table app.commerce.Order : UserData {
+  customer  : -> Customer
+  placed_at : Timestamp
+  total     : Amount
+  status    : Pending | Processing | Shipped | Cancelled = Pending
+  order by placed_at desc
+}
 
--- Add a path equivalence constraint
-ADD CONSTRAINT BillingAddrEquiv ON app.commerce.orders
-  ASSERT orders.customer_id -> customers.billing_address
-      == orders.billing_address
+-- Multi-field uniqueness constraint
+table app.commerce.OrderLine : UserData {
+  order   : -> Order
+  product : -> Product
+  qty     : Int
+  price   : Amount
+  unique lineRef { order, product }
+}
 
--- Alter visibility
-SET VISIBILITY app.commerce.orders STANDARD
-SET VISIBILITY connectors.mariadb.production.* CONNECTOR
-
--- Show the schema transaction graph for a table
-SHOW HISTORY app.commerce.orders [SINCE "2026-01-01"] [LIMIT 20]
+-- Inline subtable (creates app.commerce.Address as sibling table)
+table app.commerce.Customer {
+  address : Address {
+    street : Text
+    city   : Text
+    zip    : Zip
+  }
+}
 ```
 
-### Query
+### Constraints and Access Control
 
 ```
--- Basic select
-SELECT id, total, status FROM app.commerce.orders WHERE total > 100
+-- Inline in table body
+table app.commerce.Order : UserData {
+  customer  : -> Customer
+  bill_addr : Address
 
--- With namespace context set:
-SELECT id, total FROM orders WHERE status = Active()
+  -- Path-equivalence constraint
+  assert billingMatch { customer.billing_address == bill_addr }
+  -- Access control: requesting user must match customer's owner
+  assert access { user.id == customer.user_id }
+}
 
--- Outer join (returns NOT_FOUND for unmatched)
-SELECT o.id, c.email FROM orders o LEFT JOIN customers c ON o.customer_id = c.id
+-- Standalone (add after the fact)
+assert app.commerce.Order.billingMatch { customer.billing_address == bill_addr }
+assert app.commerce.Order.access { user.id == customer.user_id }
+unique app.commerce.Order.lineRef { order, product }
+```
+
+### Schema Evolution
+
+Redeclaring a table with the same name auto-hides the old type (still reachable via version tokens). Use `rename from` to disambiguate renames from add+remove.
+
+```
+-- Same-name redeclare: system diffs against last version
+table app.commerce.Customer {
+  account_status : AccountStatus rename from status  -- explicit rename
+  loyalty_tier   : Tier = Bronze                     -- new field (default provided)
+  -- phone omitted → automatically deprecated
+}
+
+-- Extend an existing sum type with a new variant
+extend app.commerce.Customer.account_status with Archived
+
+-- Deprecate and prune
+deprecate app.commerce.Customer.phone   -- hide field; data stays in graph
+deprecate app.commerce.OldCustomer      -- hide table; dependent views stay alive
+prune app.commerce.OldCustomer          -- remove data (only valid once no live references)
+
+-- Split one table into two
+split app.commerce.Customer into {
+  Person      { name : Text; birth_date : Date }
+  ContactInfo { email : Email; phone : Phone | NotGiven }
+}
+
+-- Merge two tables into one
+merge app.commerce.Person, app.commerce.ContactInfo into app.commerce.Customer {
+  name       : Text
+  birth_date : Date
+  email      : Email
+  phone      : Phone | NotGiven
+}
+
+-- Schema visibility
+set visibility app.commerce.Order standard
+set visibility connectors.mariadb.production.* connector
+```
+
+### Queries
+
+```
+-- Filter and project
+app.commerce.Order
+  where total > 100
+  { customer.name as name, total }
+
+-- With namespace context set (after :use app.commerce)
+Order where status is Active
+
+-- Natural join (FK-default path)
+Order >< Customer
+  where total > 100
+  { customer.name as name, total as order_total }
+
+-- Outer join: guard semantics — MissingCustomer (: Null) always matches
+Order >< Customer | MissingCustomer
+
+-- Chained outer join fallback
+Order >< Customer | HistoricalCustomer | MissingCustomer
+
+-- Explicit FK path when multiple FKs exist between two tables
+Order >< Customer via customer
+
+-- Grouping: non-grouped fields collapse into a nested table
+Order
+  group customer
+  { customer, orders.total sum as total_spend }
+
+-- Ordering override
+Order order by total desc { customer, total }
+
+-- Local binding
+let activeOrders = Order where status is Active
+activeOrders >< Customer { customer.name, total }
 
 -- Pin query to a historical schema version
-SELECT * FROM app.commerce.orders AT SCHEMA "schema-txn-abc123"
+Order at "schema-txn-abc123" where total > 100
 
 -- Inspect a materialized view
-SELECT * FROM VIEW app.reporting.monthly_summary
+app.reporting.monthly_summary
 
--- Explain (show the functor chain and query plan)
-EXPLAIN SELECT * FROM orders WHERE total > 100
+-- Query plan
+:explain Order >< Customer where total > 100
 ```
 
 ### Data Mutation
 
 ```
 -- Insert
-INSERT INTO app.commerce.orders { customer_id: "uuid-...", total: Amount(99.99), status: Active() }
+app.commerce.Order { customer: customerId, total: 99.99, status: Pending }
 
--- Update (DataCode uses functional update — returns new version)
-UPDATE app.commerce.orders SET status = Shipped() WHERE id = "uuid-..."
+-- Functional update (returns new version; all functors re-evaluated)
+Order where id = "uuid-..." { status: Shipped }
 
--- Delete (soft delete by default — recorded in transaction log)
-DELETE FROM app.commerce.orders WHERE id = "uuid-..."
+-- Soft delete (recorded in transaction log; data stays in graph)
+delete Order where id = "uuid-..."
 
 -- Hard delete (removes from active state; record remains in transaction graph)
-DELETE HARD FROM app.commerce.orders WHERE id = "uuid-..."
+delete! Order where id = "uuid-..."
+```
+
+### Functions
+
+Top-level function definitions are global — committed to the schema when `:commit` is issued.
+
+```
+-- Global function (stored in schema)
+isPositive a = a > 0
+premiumFilter = Order where total > 1000
+
+-- Import extra Haskell packages (admin allow-list controls availability)
+import Data.Time (UTCTime, diffUTCTime)
+import Data.Aeson (Value)
 ```
 
 ### System Administration
 
 ```
 -- Server roles
-SHOW SERVERS
-SHOW SERVERS FOR SHARD user.commerce
-ELEVATE SECONDARY shard2.example.com TO PRIMARY FOR SHARD user.commerce
-DEMOTE PRIMARY shard1.example.com TO TERTIARY FOR SHARD user.commerce
+show servers
+show servers for shard user.commerce
+elevate secondary shard2.example.com to primary for shard user.commerce
+demote primary shard1.example.com to tertiary for shard user.commerce
 
 -- Shards
-SHOW SHARDS
-DESCRIBE SHARD user.commerce
-SPLIT SHARD user.commerce AT KEY "customer_id > uuid-..."
+show shards
+describe shard user.commerce
+split shard user.commerce at key "customer_id > uuid-..."
 
 -- Connector management
-SHOW CONNECTORS
-DESCRIBE CONNECTOR mariadb.production
-ADD CONNECTOR mariadb "production" {
+show connectors
+describe connector mariadb.production
+add connector mariadb "production" {
   host: "db.example.com",
   port: 3306,
   user: "datacode_repl",
@@ -145,24 +291,27 @@ ADD CONNECTOR mariadb "production" {
   latency_window_ms: 5000,
   authority_model: Symmetric
 }
-PAUSE CONNECTOR mariadb.production
-RESUME CONNECTOR mariadb.production
-SHOW CONNECTOR CONFLICTS mariadb.production [LIMIT 20]
-RESOLVE CONFLICT <conflict-id> USING DataCode | External | MERGE { ... }
+pause connector mariadb.production
+resume connector mariadb.production
+show connector conflicts mariadb.production [limit 20]
+resolve conflict <conflict-id> using DataCode | External | merge { ... }
 
 -- Token management
-SHOW TOKENS [TYPE server | client | user]
-ISSUE CLIENT TOKEN FOR "MyApplication" SCOPED TO app.commerce
-REVOKE TOKEN <token-id>
+show tokens [type server | client | user]
+issue client token for "MyApplication" scoped to app.commerce
+revoke token <token-id>
 
 -- Materialized views
-SHOW MATERIALIZED VIEWS [SHARD user.commerce]
-REFRESH VIEW app.reporting.monthly_summary [AT SCHEMA "schema-txn-abc123"]
-DROP MATERIALIZED VIEW app.reporting.monthly_summary
+show materialized views [shard user.commerce]
+refresh view app.reporting.monthly_summary [at "schema-txn-abc123"]
+drop materialized view app.reporting.monthly_summary
 
 -- Transaction log inspection
-SHOW TRANSACTIONS [SHARD user.commerce] [SINCE seq 1000] [LIMIT 50]
-SHOW TRANSACTION <txn-id>
+show transactions [shard user.commerce] [since seq 1000] [limit 50]
+show transaction <txn-id>
+
+-- Schema history
+:history app.commerce.Order [since "2026-01-01"] [limit 20]
 ```
 
 ### Disaster Recovery Commands
@@ -170,80 +319,82 @@ SHOW TRANSACTION <txn-id>
 These commands are explicitly designed for DR scenarios where the IDE may be unavailable:
 
 ```
--- Force-elect a new primary (use when primary is unresponsive)
-FORCE ELECT PRIMARY shard2.example.com FOR SHARD user.commerce
-  -- WARNING: run this only when you are certain the old primary is dead.
-  -- Split-brain will occur if the old primary recovers.
+-- Force-elect a new primary (use only when you are certain the old primary is dead)
+-- WARNING: split-brain will occur if the old primary recovers
+force elect primary shard2.example.com for shard user.commerce
 
--- Verify shard integrity
-VERIFY SHARD user.commerce [DEEP]
-  -- Compares transaction log checksums across all replicas
+-- Verify shard integrity (compares transaction log checksums across all replicas)
+verify shard user.commerce [deep]
 
 -- Replay transactions from a known-good checkpoint
-REPLAY SHARD user.commerce FROM SEQ 5000 TO SEQ 6000
+replay shard user.commerce from seq 5000 to seq 6000
 
 -- Export shard state for manual inspection
-EXPORT SHARD user.commerce TO "/tmp/shard-export.json" [AT SEQ 5000]
+export shard user.commerce to "/tmp/shard-export.json" [at seq 5000]
 
 -- Import shard state (for rebuilding a shard from scratch)
-IMPORT SHARD user.commerce FROM "/tmp/shard-export.json"
+import shard user.commerce from "/tmp/shard-export.json"
 
 -- Check replication lag
-SHOW REPLICATION LAG [FOR SHARD user.commerce]
+show replication lag [for shard user.commerce]
 
 -- Sync a tertiary server manually
-FORCE SYNC tertiary3.example.com FOR SHARD user.commerce
+force sync tertiary3.example.com for shard user.commerce
 ```
 
 ## Output Formats
 
 ```bash
 # Default: aligned table output (like psql)
-datacode> SELECT id, total FROM orders LIMIT 3
- id                                   | total
---------------------------------------+-------
- 550e8400-e29b-41d4-a716-446655440000 | 99.99
- 6ba7b810-9dad-11d1-80b4-00c04fd430c8 | 149.50
+datacode[app.commerce]> Order where total > 100 { id, total } limit 3
+ id                           | total
+------------------------------+-------
+ 05KG3N0000...                | 99.99
+ 05KG3N0001...                | 149.50
 
 # JSON output (for scripting)
-datacode --format json --exec "SELECT id, total FROM orders LIMIT 3"
+datacode --format json --exec "Order where total > 100 { id, total }"
 
 # CSV output
-datacode --format csv --exec "SELECT id, total FROM orders LIMIT 3"
+datacode --format csv --exec "Order where total > 100 { id, total }"
 
 # Raw (for piping into other commands)
-datacode --format raw --exec "SHOW SERVERS"
+datacode --format raw --exec "show servers"
 ```
 
 ## Scripting
 
-Schema definition files use the `.dc` extension (DataCode schema file). They are plain text with CLI commands, one per line, with `--` comments:
+Schema definition files use the `.dc` extension (DataCode schema file). They are plain text DSL, one statement per logical block, with `--` comments. Files are idempotent — running them twice produces the same result (create-if-not-exists semantics by default).
 
 ```
 -- Initial schema for the commerce application
 -- Run with: datacode --file schema/commerce.dc
 
-CREATE NAMESPACE app.commerce
+-- Note: { validate: ... } block syntax is tentative
+type Email  : Text    { validate: isValidEmail }
+type Amount : Decimal { validate: \a -> a >= 0 }
 
-CREATE TABLE app.commerce.customers {
-  id    : UUID  [primary_key]
-  email : Email
+table app.commerce.Customer : UserData {
+  email : Email unique
   name  : Text
 }
 
-CREATE TABLE app.commerce.orders {
-  id          : UUID  [primary_key]
-  customer_id : -> app.commerce.customers
-  total       : Amount
-  status      : OrderStatus
+table app.commerce.Order : UserData {
+  customer  : -> Customer
+  total     : Amount
+  status    : Pending | Processing | Shipped | Cancelled = Pending
+  order by placed_at desc
+
+  assert access { user.id == customer.user_id }
 }
 
-ADD FUNCTOR PositiveAmount ON app.commerce.orders.total
-  VALIDATE amount > 0
-  ERROR "Order total must be positive"
+table app.commerce.OrderLine : UserData {
+  order   : -> Order
+  product : -> Product
+  qty     : Int
+  unique lineRef { order, product }
+}
 ```
-
-Schema files are idempotent — running them twice produces the same result (CREATE IF NOT EXISTS semantics by default).
 
 ## Relationship to the Admin IDE
 
@@ -257,6 +408,7 @@ For disaster recovery, operators should maintain a set of `.dc` script files tha
 
 - The CLI is likely the **first deliverable** in the DataCode implementation sequence — it forces the core schema definition, query, and mutation APIs to be built before anything else
 - The REPL can be implemented using `haskeline` (Haskell readline library) for editing, history, and tab completion
-- Tab completion should complete namespace paths, table names, field names, and command keywords
+- Tab completion should complete namespace paths, table names, field names, trait names, and DSL keywords
+- The REPL uses a transaction model: all changes are staged until `:commit`; `:rollback` discards them
 - The CLI connects to DataCode via the same binary protocol as thick clients — it is itself a thick client
 - In localhost mode, the server token is implicit; the CLI prompts for user credentials on first connect

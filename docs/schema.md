@@ -6,8 +6,9 @@ DataCode schemas are closer to TutorialD than SQL. The core shift:
 - A **table** is a named collection of typed tuples (no row ordering, no implicit keys unless declared)
 - A **field** has a precise type with associated validation functors
 - A **query/view** is indistinguishable from a table definition — both are views over the transaction graph
-- There is **no NULL** — absent values are expressed as typed ADTs
-- Tables are organized in a **namespace tree** (see namespaces.md) — namespaces replace the SQL "database" concept
+- There is **no NULL** — absent values are expressed as typed ADTs with meaningful names
+- Tables are organized in a **namespace tree** (see `namespaces.md`) — namespaces replace the SQL "database" concept
+- **Traits** provide abstract base types for tables, encoding replication policy, shared fields, and shared functions
 
 ### Self-Hosting Principle
 
@@ -37,7 +38,7 @@ Every table belongs to a namespace. Namespaces are dot-separated hierarchical pa
 - `connectors.mariadb.production.orders` — auto-generated connector shadow schema
 - `system.auth.users` — DataCode self-management tables
 
-Full namespace documentation: see `namespaces.md`.
+Namespaces are created implicitly when a table is first defined in them — no explicit creation syntax. Full namespace documentation: see `namespaces.md`.
 
 ## Schema Visibility Layers
 
@@ -52,85 +53,502 @@ This layering enables data independence: the human-understood schema (`app.*`) c
 ## Type System
 
 ### Primitive Types
-Standard Haskell scalar types plus DataCode-defined domain types:
-- `Text`, `Int`, `Decimal`, `Bool`, `Timestamp`, `UUID`, etc.
-- Domain types are newtypes over primitives with validation functors attached
 
-### Abstract Data Types for Absence
-```haskell
--- The base absence type — inherits Maybe.Nothing behavior via typeclass
-data NOT_FOUND a = NOT_FOUND
+Standard scalar types:
 
--- Outer join result: field is either present or not found
-type Outer a = Maybe a  -- NOT_FOUND is Nothing, value is Just
+| Type | Description |
+|---|---|
+| `Text` | Unicode string |
+| `Int` | Integer |
+| `Decimal` | Arbitrary-precision decimal |
+| `Bool` | Boolean |
+| `Date` | Calendar date |
+| `Timestamp` | Point in time |
+| `DataId` | 12-byte globally unique identifier (see Globally Unique Identifiers) |
 
--- Other typed absences can be defined similarly
-data REDACTED a = REDACTED      -- present but access-controlled away
-data PENDING a  = PENDING       -- not yet computed/arrived
-data DELETED a  = DELETED       -- tombstoned in history
+### Domain Types
+
+Domain types are named subtypes of primitives. The `:` operator means "is a kind of" throughout DataCode. Domain types carry validation functors.
+
+```
+type Email  : Text    { validate: isValidEmail }
+type Amount : Decimal { validate: \a -> a >= 0 }
+type Zip    : Text    { validate: \z -> length z == 5 }
 ```
 
-All absence types participate in the `Maybe` functor/monad chain so absent values compose correctly without special-casing.
+Note: the `{ validate: ... }` inline syntax is tentative and may change.
 
-### Table Definitions
+Domain types are reusable named types. When a field in a table references a domain type, it creates a new named subtype scoped to that field (`namespace.table.field`) — validations are inherited and can be extended. Two fields in different tables are always distinct types even if they share the same domain type as their parent.
+
+### Sum Types (ADTs)
+
+The `|` operator builds sum types. This is the same operator used for relational union — context (type-annotation position vs. query-expression position) disambiguates.
+
 ```
--- TutorialD-style syntax (exact syntax TBD)
-table Customer {
-  id        : DataId      [primary_key]
-  email     : Email                       -- Email has a validation functor
-  name      : Text
-  status    : CustomerStatus              -- ADT: Active | Suspended | Closed
+type CustomerStatus = Active | Suspended | Closed
+
+-- Inline in a field declaration
+status : Active | Suspended | Closed
+```
+
+### Product Types
+
+Multiple fields in a record body form a product type. Tuple notation `(A, B)` is available for and-types used outside a named record.
+
+### Absence Types
+
+There is no `NULL`. Absent values are expressed as typed ADTs that extend the `Null` base type. This encodes the *reason* for absence, not just the fact of it.
+
+Built-in absence types (all extend `Null`):
+
+| Type | Meaning |
+|---|---|
+| `NotFound` | Row or value does not exist |
+| `Redacted` | Present but access-controlled away |
+| `Pending` | Not yet computed or arrived |
+| `Deleted` | Tombstoned in history |
+
+Custom absence types:
+
+```
+type MissingCustomer : Null
+type NoActiveSubscription : Null
+```
+
+Using absence types in fields:
+
+```
+phone       : Phone | NotGiven         -- NotGiven extends Null; reason for absence is typed
+billing_zip : Zip   | NotFound         -- built-in absence type
+```
+
+### The `is` Operator
+
+`is` checks the outermost constructor of a sum type, regardless of any payload. Distinct from `=` which checks exact value equality including payload.
+
+```
+status is Active              -- constructor match (works with or without payload)
+status is Suspended           -- matches any Suspended regardless of reason payload
+status = Suspended "overdue"  -- exact equality including payload
+phone is NotGiven             -- absence check
+phone is not NotGiven         -- negation
+```
+
+## Table Definitions
+
+### Basic Syntax
+
+```
+-- DataId primary key is always implicit — no declaration needed
+-- Namespace created implicitly on first use
+table app.commerce.Customer {
+  email        : Email
+  name         : Text
+  status       : Active | Suspended | Closed
+  phone        : Phone | NotGiven
+  loyalty_tier : Tier = Bronze      -- field default with =
+}
+```
+
+Every table has two automatic virtual columns:
+- `created_at` — timestamp extracted from the row's `DataId`
+- `updated_at` — timestamp of the most recent `RowId` that mutated the row
+
+`RowId` (the physical row identifier) is internal only and not exposed in the schema DSL.
+
+### Field Defaults
+
+```
+loyalty_tier : Tier = Bronze
+name         : Text = "Unknown"
+is_active    : Bool = True
+```
+
+### Uniqueness Constraints
+
+```
+-- Single-field: `unique` keyword suffix
+email : Email unique
+
+-- Multi-field: named constraint in table body
+table Order {
+  customer  : -> Customer
+  order_num : Int
+  unique orderRef { customer, order_num }
 }
 
+-- Standalone post-definition (add after table exists)
+unique Order.orderRef { customer, order_num }
+```
+
+Multiple unique constraints per table are all enforced. `DataId` remains the primary key; unique constraints define natural keys used for fast lookup.
+
+### Default Ordering
+
+```
 table Order {
-  id          : DataId    [primary_key]
-  customer_id : -> Customer               -- foreign key functor
-  placed_at   : Timestamp
-  total       : Decimal
+  placed_at : Timestamp
+  total     : Amount
+  order by placed_at desc    -- default ordering for queries against this table
+}
+```
+
+System default (if no `order by` declared): unique key ascending. Overridable per-query.
+
+### Foreign Keys
+
+The `->` arrow creates an FK field and automatically attaches an FK functor. The field gets its own named type (`namespace.table.field`) which wraps the referenced table's `DataId`.
+
+```
+table app.commerce.Order {
+  customer  : -> Customer       -- FK to Customer; creates Order.customer type
+  placed_at : Timestamp
+  total     : Amount
+}
+```
+
+### Inline Sub-Tables
+
+Defining a table inline inside a field declaration automatically creates the sub-table as a sibling in the parent's namespace.
+
+```
+-- Creates app.commerce.Address as a sibling table
+table app.commerce.Customer {
+  address : Address {
+    street : Text
+    city   : Text
+    zip    : Zip
+  }
+}
+```
+
+To place the sub-table in a different namespace, use a fully-qualified name in the inline definition.
+
+### Schema Constraints and ACL
+
+`assert` is the unified keyword for both path-equivalence constraints and access control rules. Both are path-equivalence assertions — ACL is simply a path-equivalence where one term is the requesting user token.
+
+```
+table Order {
+  customer  : -> Customer
+  bill_addr : Address
+
+  -- Path-equivalence constraint: two paths must resolve to the same value
+  assert billingMatch { customer.billing_address == bill_addr }
+
+  -- ACL: requesting user must be reachable from this row via customer.user_id
+  assert access { user.id == customer.user_id }
+}
+```
+
+Both inline and standalone forms are supported:
+
+```
+-- Add after table is already defined
+assert Order.billingMatch { customer.billing_address == bill_addr }
+assert Order.access { user.id == customer.user_id }
+```
+
+`user` refers to the requesting user token inside `access` assertions.
+
+## Traits
+
+Traits are abstract table types. They cannot be instantiated directly — they are extended by concrete tables. A trait adds fields, functions, replication policy, and (optionally) UI template hints to every table that extends it.
+
+### Declaring a Trait
+
+```
+trait Active {
+  is_active : ActiveStatus | InactiveStatus
+
+  -- Functions defined in a trait are available on any table extending it
+  active   self = self where is_active is ActiveStatus
+  inactive self = self where is_active is InactiveStatus
+}
+```
+
+### Extending a Table from Traits
+
+The `:` operator after the table name declares which traits the table extends. Same colon-as-"is a kind of" convention used throughout the type system.
+
+```
+table app.commerce.Customer : Active, UserData {
+  email : Email
+  name  : Text
+}
+
+-- active/inactive functions now work on Customer
+active (app.commerce.Customer where email is not NotGiven)
+```
+
+### Multiple Inheritance
+
+Tables may extend multiple traits. If two traits define a field with the same name, the concrete table must resolve the conflict explicitly:
+
+```
+trait A { name : Text { validate: isNotEmpty } }
+trait B { name : Text { validate: maxLen 100 } }
+
+-- Keep both fields separately: rename A's field
+table Foo : A, B {
+  a_name : Text from A.name   -- rename; keeps A's validations; B's name unchanged
+}
+
+-- Or merge into one field: inherits validations from both A and B
+table Bar : A, B {
+  name : Text   -- bare redeclaration; validations from A and B are both applied
+}
+```
+
+### Replication Traits
+
+The five shard types map to built-in traits. Tables declare their replication policy by extending one of these.
+
+| Trait | Replication | Cardinality |
+|---|---|---|
+| `Reference` | All servers | Low–medium |
+| `Configuration` | All servers | Medium |
+| `UserData` | Shard-local | High |
+| `LogData` | Server-local, prunable | Very high |
+
+Built-in replication traits are regular traits — user-defined traits can extend them freely:
+
+```
+trait Catalog : Reference {
+  is_visible : Bool = True
+}
+
+table app.commerce.Product : Catalog, Active {
+  name  : Text
+  price : Amount
+}
+-- Product replicates to all servers (inherits Reference via Catalog)
+```
+
+Having multiple replication base traits in a single inheritance hierarchy is a compile-time error.
+
+### UI Template Hints
+
+Traits can declare UI hints that are stored in system tables and used by the HTML rendering engine:
+
+```
+trait Card {
+  ui { template: "card", density: "compact" }
+}
+```
+
+Exact syntax for UI hints is TBD.
+
+## Schema Evolution
+
+All previous versions of a table are always present in the transaction graph. "Evolution" means creating a new schema node, not modifying historical data.
+
+### Redeclaring a Table
+
+Redeclare the table body. The system diffs the new declaration against the last version:
+
+- **Column added** → new column; uses field default if provided
+- **Column omitted** → deprecated (hidden from queries; data stays in graph)
+- **`rename from` hint** → rename (explicit because rename vs. add+remove is ambiguous)
+- **Same name** → old type is auto-hidden in the current schema node; still reachable via version tokens
+- **Type change** → requires a migration functor (syntax TBD)
+
+```
+-- Old Customer had: email, name, status, phone
+-- New Customer: renames status, adds loyalty_tier, drops phone
+table Customer {
+  account_status : AccountStatus rename from status
+  loyalty_tier   : Tier = Bronze
+  -- phone omitted → deprecated
+}
+```
+
+### Keeping Old Names
+
+If the redeclaration uses a *different* name, both old and new stay visible. Deprecate old manually when ready.
+
+```
+table CustomerV2 { ... }   -- Customer still accessible by name
+deprecate Customer          -- hide later when migration is complete
+```
+
+### Deprecation and Pruning
+
+```
+deprecate Customer          -- hides table; existing views stay alive; data stays in graph
+deprecate Customer.phone    -- hide a single field
+prune Customer              -- permanently remove data (only valid once no live references remain)
+```
+
+### Table Split and Merge
+
+```
+split Customer into {
+  Person      { name : Text; birth_date : Date }
+  ContactInfo { email : Email; phone : Phone | NotGiven }
+}
+
+merge Person, ContactInfo into Customer {
+  name       : Text
+  birth_date : Date
+  email      : Email
+  phone      : Phone | NotGiven
+}
+```
+
+Source tables in a split/merge stay visible by default; deprecate them explicitly.
+
+### ADT Extension
+
+Sum types can gain or lose variants after the fact. Removing a variant that has existing data requires specifying how those rows are migrated.
+
+```
+extend Customer.status with Archived
+
+shrink Customer.status removing Archived migrate (\_ -> Closed)
+```
+
+## Joins and Queries
+
+### Join Operator
+
+`><` (bowtie) is the natural join operator. It joins on matching FK columns by default.
+
+```
+-- Natural join: uses FK constraint between Order and Customer
+Order >< Customer
+
+-- Explicit FK path: required when multiple FKs exist between two tables
+Order >< Customer via customer
+```
+
+### Outer Joins
+
+Outer joins use guard semantics: the right side of `><` is a sum type written with `|`. The system tries each type left-to-right; the first that produces a matching row wins. Null-derived types always match and serve as the catch-all.
+
+```
+type MissingCustomer : Null
+
+-- Left outer join equivalent
+Order >< Customer | MissingCustomer
+
+-- Chained fallback: try Customer, then HistoricalCustomer, then catch-all
+Order >< Customer | HistoricalCustomer | MissingCustomer
+```
+
+The result row's customer field has type `Customer | MissingCustomer` — a sum type. Pattern matching and functor targeting can address each variant. `MissingCustomer` carries no fields; the absence IS the value.
+
+### Filter, Projection, Alias
+
+```
+Order >< Customer
+  where total > 100
+  { customer.name as name, total as order_total }
+```
+
+- `where` — row filter
+- `{ field, ... }` — projection (bare braces, no `select` keyword)
+- `as` — alias
+
+Field references: `TableName.field_name` or `alias.field_name`. Table aliases are encouraged when the full namespace path is in the name.
+
+### Grouping
+
+`group` puts the grouped field on the left; all other fields collapse into a nested table field. Aggregate functions operate on that nested table.
+
+```
+Order
+  group customer
+  { customer, orders.total sum as total_spend }
+-- Result: { customer: DataId, total_spend: Amount }
+-- The intermediate orders nested table is computed then projected away
+```
+
+### Ordering
+
+```
+-- Per-query ordering (overrides table default)
+Order
+  where total > 100
+  order by total desc
+  { customer, total }
+```
+
+### Views
+
+Views are defined identically to tables — they are table definitions whose data is computed from the transaction graph rather than stored directly. The distinction is a storage hint, not a schema distinction.
+
+```
+view app.commerce.active_orders {
+  customer : -> Customer
+  total    : Amount
+  where status is Active
 }
 ```
 
 ### The `all` Selector and Field Propagation
 
-Views and connector shadow schema overlays can use an `all` (or `*`) selector to include all fields from a source table. The selector determines how new fields propagate when the source schema changes:
+Views and connector overlays can use `*` to include all fields from a source table:
 
 ```
 -- Wildcard: tracks source schema dynamically
--- When the source gains a new field, it automatically appears here
 view app.commerce.order_summary {
-  * FROM connectors.mariadb.production.orders   -- all fields from source
-  status : OrderStatus                           -- explicit override: coerces Text -> ADT
+  * from connectors.mariadb.production.orders
+  status : OrderStatus    -- explicit override: coerces Text -> ADT
 }
 
 -- Explicit field list: stable, change-resistant
--- New fields in the source do NOT propagate automatically
 view app.commerce.order_detail {
-  id     : UUID    FROM connectors.mariadb.production.orders
-  total  : Amount  FROM connectors.mariadb.production.orders
+  id     : DataId from connectors.mariadb.production.orders
+  total  : Amount from connectors.mariadb.production.orders
   status : OrderStatus
 }
 ```
 
-**Propagation rules:**
-- `* FROM <source>` — binds to the source's current schema at query time. New fields in the source appear in the view automatically. Explicit overrides (fields declared by name in the same view) take precedence over the wildcard for that field.
-- Named fields — stable binding. The view only exposes the named fields regardless of what the source adds. Adding a new field requires an explicit schema change to the view.
-- Mixed — a view can use `*` for the bulk of fields and override specific ones by name. The named overrides shadow the wildcard for those fields.
+`*` binds to the source's schema at query time — new fields in the source appear automatically. Named fields bind stably — new source fields don't propagate. Mixed views can use `*` for the bulk and override specific fields by name.
 
-**Functor interaction:** Validation functors declared on the view apply to the specific fields named in the functor declaration. A wildcard-included field that has no explicit functor inherits any functors declared on the source field's type. A field declared explicitly in the view can add additional functors on top of the inherited ones.
+## Functions
 
-**Schema transaction graph:** When a wildcard view resolves differently because the source gained a new field, that resolution is recorded in the query's provenance — the view's effective field set is always deterministic at any given schema transaction graph node. Pinning a query to a historical schema node pins both the view definition and the source schema snapshot it resolves against.
+### Scope
 
-### Views and Queries
-Views are defined identically to tables — they are just table definitions whose "data" is computed from the transaction graph rather than stored directly:
+Top-level declarations are **global** — committed to the schema transaction graph. `let` is only for local bindings inside function bodies. There is no `def` keyword.
+
 ```
-view ActiveOrders {
-  customer_name : Text      -- from Customer.name
-  order_id      : UUID      -- from Order.id
-  total         : Decimal
-  [where Order.customer_id -> Customer, Customer.status = Active]
-}
+-- Top-level: stored in schema
+isPositive a = a > 0
+
+premiumFilter = Order where total > 1000
+
+-- Local: inside a function body only
+processOrder order =
+  let discount = if order.total > 1000 then 0.1 else 0
+  in order { total = order.total * (1 - discount) }
 ```
-The provenance of each field is tracked in the type, so the system always knows which underlying table a result field originated from.
+
+### REPL Transactions
+
+The REPL operates in a transaction model: everything typed is staged but not committed until `:commit`. Use `:rollback` to discard. This prevents accidental schema changes from exploratory queries.
+
+### Haskell Functions
+
+Functions are written in Haskell style. Types are automatically threaded through the system monad.
+
+Auto-wrapping rules:
+- `a -> b` (pure) → lifted automatically
+- `a -> Maybe b` → `Nothing` becomes a validation failure
+- `a -> IO b` → **rejected** at schema commit; use an event functor queue instead
+
+```
+import Data.Time (UTCTime, diffUTCTime)
+
+-- Standard library is auto-available; extra packages via import
+validateEmail : Text -> Bool
+validateEmail e = e =~ "^[^@]+@[^@]+\\.[^@]+"
+```
+
+Standard library always available (no import needed): `Data.Text`, `Data.Time`, `Data.Maybe`, `Data.List`, `Data.Map`, `Text.Regex.TDFA`, standard numeric packages.
+
+Extra packages require `import` at the schema file level. The allowed package list is managed by admins in `system.config.allowed_packages`.
 
 ## Functor Types
 
@@ -140,11 +558,13 @@ DataCode has five functor kinds. All five are first-class schema objects — def
 |---|---|---|---|---|
 | 1 | **Validation** | `a → Either Error a` | On commit | Rejects invalid field values (range checks, format checks, domain invariants) |
 | 2 | **Foreign key** | `DataId → Either Error Row` | On commit | Referential integrity — resolves a DataId to a live row in the referenced table |
-| 3 | **Path equivalence** | `(a, a) → Either Error ()` | On commit | Asserts that two schema-graph paths reach the same value (e.g. billing address matches order) |
+| 3 | **Path equivalence** | `(a, a) → Either Error ()` | On commit | Asserts that two schema-graph paths reach the same value; used for both data constraints and ACL |
 | 4 | **Access control** | `(User, a) → Either Error a` | On read and write | Gates reads and writes based on the requesting user's identity and role; can redact individual fields |
 | 5 | **Event** | `a → EventRef` | On commit | Schedules a deferred side effect — enqueues a work item in a DataCode queue table rather than executing immediately |
 
 Functors 1–4 are synchronous and transactional: they run as part of the commit and can abort it. Functor 5 is asynchronous and decoupled: the commit always succeeds (inserting the queue row is the commit), and the side effect runs later under the event scheduler.
+
+Path equivalence functors (kind 3) are the implementation backing of both `assert` constraints and `assert access` rules in the DSL. The difference is only in what the two path terms refer to — data paths vs. data path and requesting token.
 
 ### Event Functor
 
@@ -200,8 +620,8 @@ data VersionRef
 
 ```
 system.version_refs
-  name : Text        [primary_key]  -- unique across all branches and tags
-  ref  : VersionRef                 -- Branch DataId | Tag DataId
+  name : Text unique    -- unique across all branches and tags
+  ref  : VersionRef     -- Branch DataId | Tag DataId
 ```
 
 The `Tag` variant's immutability is enforced by a validation functor that rejects any update to a row whose current `ref` is a `Tag`. The `Branch` variant has no such restriction — HEAD advances freely. Deletion of the `main` branch is rejected by a separate validation functor. Hash prefixes are implicit graph node identifiers and require no row in this table.
@@ -218,7 +638,7 @@ The `Tag` variant's immutability is enforced by a validation functor that reject
 
 ### Schema Evolution and Coercion
 Because all functors are transparent, the system can derive a **coercion path** between any two schema graph nodes:
-- Adding a field: old records get `NOT_FOUND` for that field (handled by the `Maybe` monad)
+- Adding a field: old records get `NotFound` for that field
 - Removing a field: new records simply don't have it; old records still have it in the historical graph
 - Changing a type: a migration functor must be provided that maps old values to new values; it is recorded in the schema graph as an edge
 
@@ -228,22 +648,22 @@ This enables:
 - **Zero-downtime schema changes**: no `ALTER TABLE` locks
 
 ### Data Shards
-A shard is a named slice of the schema containing related tables. Five shard types:
+A shard is a named slice of the schema containing related tables. Five shard types, each corresponding to a built-in replication trait:
 
-| Type | Description | Cardinality | Replication |
+| Shard / Trait | Description | Cardinality | Replication |
 |---|---|---|---|
+| `Reference` | Code tables; treated as code, propagated everywhere | Low-medium | All servers |
+| `Configuration` | Tuning tables managed by operators | Medium | All servers |
+| `UserData` | Scales with user count | High | Shard-local |
+| `LogData` | Massive cardinality; prunable | Very high | Shard-local, time-bounded |
 | `system` | DataCode self-management tables | Low | All servers |
-| `reference` | Code tables; treated as code, propagated everywhere | Low-medium | All servers |
-| `configuration` | Tuning tables managed by operators | Medium | All servers |
-| `user` | Scales with user count | High | Shard-local |
-| `logs` | Massive cardinality; prunable | Very high | Shard-local, time-bounded |
 
-`logs`-type shards are **server-local by default**: each server is authoritative for its own log data and does not replicate it to peers. This is a deliberate tradeoff — log volume makes cross-server replication expensive, and per-server logs are sufficient for auditability (query each server's log shard independently, or aggregate via a materialized view). The HTTP request log shard is a specific instance of this pattern (see HTTP Request Logging below).
+`LogData`-type shards are **server-local by default**: each server is authoritative for its own log data and does not replicate it to peers. This is a deliberate tradeoff — log volume makes cross-server replication expensive, and per-server logs are sufficient for auditability (query each server's log shard independently, or aggregate via a materialized view). The HTTP request log shard is a specific instance of this pattern (see HTTP Request Logging below).
 
 As data volume crosses configurable thresholds, a shard splits. The split is recorded as a special node in the transaction graph so the history of which data lived in which shard is always recoverable.
 
 ### Pruning
-`logs` shards and old materialized views may be pruned. Pruning is also recorded in the transaction graph as a special node, so the system always knows that historical data before a certain point has been discarded. Analytical summary metrics are computed before pruning to preserve aggregate history.
+`LogData` shards and old materialized views may be pruned. Pruning is also recorded in the transaction graph as a special node, so the system always knows that historical data before a certain point has been discarded. Analytical summary metrics are computed before pruning to preserve aggregate history.
 
 ### Globally Unique Identifiers
 
@@ -263,7 +683,7 @@ Total: 12 bytes
 
 Big-endian encoding means lexicographic order approximates chronological order, which benefits LMDB range scans. `DataId` is globally unique without per-ID coordination.
 
-`DataId` replaces UUID as the primary key type for all DataCode-native tables and as the identity of transaction graph nodes.
+`DataId` is the primary key type for all DataCode-native tables and the identity of transaction graph nodes.
 
 ### Row Identifiers
 
@@ -283,8 +703,8 @@ Big-endian encoding is critical: LMDB sorts keys lexicographically, and big-endi
 Transaction nodes themselves use `rowPos = 0` by convention (`txNodeId shard txSeq = RowId shard txSeq 0`). Rows within a transaction occupy positions 1 through N.
 
 **Two-tier identifier model:**
-- **User-visible**: the `DataId` primary key declared in the schema. Stable across mutations — same `DataId` throughout the row's lifetime.
-- **Physical**: `RowId` — changes on every mutation, pointing to the newest version in the log.
+- **User-visible**: the `DataId` primary key. Stable across mutations — same `DataId` throughout the row's lifetime.
+- **Physical**: `RowId` — changes on every mutation, pointing to the newest version in the log. Internal only; not exposed in the schema DSL.
 
 The LMDB `head_index` bridges the two: `DataId → current RowId`. Following up through `log_index` yields the physical location on disk.
 
@@ -380,14 +800,14 @@ User-defined endpoints are rows in a system table. Each row defines a URL templa
 ```
 system.api.custom_routes
   route_template : Text             -- e.g. "/orders/{id}/ship"
-  get_functor    : Maybe FunctorRef -- handler for GET, or NULL = method not allowed
-  post_functor   : Maybe FunctorRef
-  put_functor    : Maybe FunctorRef
-  patch_functor  : Maybe FunctorRef
-  delete_functor : Maybe FunctorRef
+  get_functor    : FunctorRef | NotAllowed
+  post_functor   : FunctorRef | NotAllowed
+  put_functor    : FunctorRef | NotAllowed
+  patch_functor  : FunctorRef | NotAllowed
+  delete_functor : FunctorRef | NotAllowed
 ```
 
-A `NULL` column means that HTTP method returns 405 on that route. A route with only `post_functor` set is a write-only endpoint.
+`NotAllowed` means that HTTP method returns 405 on that route. A route with only `post_functor` set is a write-only endpoint.
 
 Each referenced functor is an **API functor**: it receives the extracted path parameters and request body (if present), performs reads and/or writes within a single transaction, and returns a response value. Authentication and authorization apply automatically (see below).
 
@@ -420,28 +840,28 @@ All routes — auto-generated and custom — are materialized from the system ta
 
 ### HTTP Request Logging
 
-Every HTTP request to any DataCode endpoint is logged to `system.logs.http_requests` — a per-server `logs`-type shard. This write is **independent of the main transaction**: it succeeds whether the transaction commits, is rejected, or errors. It is the only write that DataCode guarantees on every request path.
+Every HTTP request to any DataCode endpoint is logged to `system.logs.http_requests` — a per-server `LogData`-type shard. This write is **independent of the main transaction**: it succeeds whether the transaction commits, is rejected, or errors. It is the only write that DataCode guarantees on every request path.
 
 ```
-system.logs.http_requests
-  id            : DataId          [primary_key]
-  server_id     : ServerId        -- which server handled this request
+system.logs.http_requests {
+  server_id     : ServerId
   received_at   : Timestamp
   method        : HttpMethod
   path          : Text
-  version_token : Text            -- the version token from the URL (branch, tag, or hash)
+  version_token : Text
   status_code   : Int
   duration_ms   : Int
-  client_token  : Maybe TokenId
-  user_token    : Maybe TokenId
-  tx_id         : Maybe DataId    -- null when the transaction did not commit
-  error         : Maybe Text      -- null on success
+  client_token  : TokenId | NotFound
+  user_token    : TokenId | NotFound
+  tx_id         : DataId  | NotFound
+  error         : Text    | NotFound
+}
 ```
 
 Key properties:
 - **Always written** — a failed, rejected, or errored transaction still produces a log row
 - **Per-server** — not cross-replicated; each server is authoritative for its own request history
-- **Prunable** — subject to the same time-bounded retention as other `logs` shards
+- **Prunable** — subject to the same time-bounded retention as other `LogData` shards
 - **Auditable** — inspectable in the IDE; queryable with standard DataCode tools
 
 This log is the foundation for observability: correlating `tx_id` with the transaction graph gives the full audit trail from HTTP request through to committed mutations.
@@ -465,22 +885,20 @@ Applications define their own queue tables for outbound side effects:
 
 ```
 table app.events.email_queue {
-  id          : DataId        [primary_key]
-  recipient   : Email
-  template    : EmailTemplate
-  payload     : JsonObject
-  [event_functor: system.connectors.email.SendFunctor]
+  recipient : Email
+  template  : EmailTemplate
+  payload   : JsonObject
+  assert event { system.connectors.email.SendFunctor }
 }
 
 table app.events.webhook_queue {
-  id          : DataId        [primary_key]
   destination : URL
   body        : JsonObject
-  [event_functor: system.connectors.http.PostFunctor]
+  assert event { system.connectors.http.PostFunctor }
 }
 ```
 
-The `event_functor` attribute links the queue table to the connector functor that knows how to process it. When the scheduler dequeues a row, it calls that functor with the row as input.
+The `assert event` attribute links the queue table to the connector functor that knows how to process it. When the scheduler dequeues a row, it calls that functor with the row as input.
 
 ### System Queue Tables
 
@@ -498,26 +916,28 @@ This means maintenance scheduling is itself observable through DataCode — oper
 ### System Tables
 
 ```
-system.events.queues
-  name         : Text         -- queue name (e.g. "app.events.email_queue")
-  handler_ref  : FunctorRef   -- functor that processes items from this queue
-  max_attempts : Int          -- retry limit before marking Failed
-  backoff_base : Duration     -- base duration for exponential backoff
+system.events.queues {
+  name         : Text unique
+  handler_ref  : FunctorRef
+  max_attempts : Int
+  backoff_base : Duration
+}
 
-system.events.items
-  id            : DataId      [primary_key]
+system.events.items {
   queue_name    : Text
-  payload       : Bytes       -- serialized row snapshot at enqueue time
-  scheduled_at  : Timestamp   -- not-before time (set by backoff logic)
+  payload       : Bytes
+  scheduled_at  : Timestamp
   attempt_count : Int
-  last_error    : Maybe Text
-  status        : EventStatus -- Pending | InFlight | Failed | Done
+  last_error    : Text | NotFound
+  status        : Pending | InFlight | Failed | Done
+}
 
-system.events.backoff_state
-  destination   : Text        -- endpoint or queue identifier
-  failure_rate  : Decimal     -- rolling failure rate (recent window)
-  volume_count  : Int         -- events dispatched in current window
-  backoff_until : Timestamp   -- do not dispatch until this time
+system.events.backoff_state {
+  destination   : Text unique
+  failure_rate  : Decimal
+  volume_count  : Int
+  backoff_until : Timestamp
+}
 ```
 
 ### Volume-Based Backoff
@@ -539,7 +959,7 @@ Backoff state lives in `system.events.backoff_state` — observable and adjustab
 
 The event scheduler is a dedicated DataCode process (similar to the connector daemon — see OQ-019). It:
 
-1. Polls `system.events.items` for rows with `status = Pending` and `scheduled_at ≤ now`
+1. Polls `system.events.items` for rows with `status is Pending` and `scheduled_at ≤ now`
 2. Marks each item `InFlight` atomically (prevents double-dispatch)
 3. Calls the queue's `handler_ref` functor with the payload
 4. On success: marks `Done`, updates `system.events.backoff_state` (reset failure count)

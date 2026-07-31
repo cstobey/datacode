@@ -75,10 +75,18 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 
 ## Must Resolve During Core Development
 
-### OQ-005: Schema DSL Syntax
-**Question**: What does the DataCode schema definition language actually look like? TutorialD-inspired but Haskell-native.
-**Notes**: Must express tables, field types, foreign key functors, path equivalence constraints, and access control functors. Should be parseable and round-trippable.
-**Action**: Design and implement a parser for the DSL as one of the first core tasks.
+### OQ-005: Schema DSL Syntax ✓ ANSWERED
+**Answer**: Designed. See `docs/schema.md` (type system, traits, queries), `docs/cli.md` (DSL reference and REPL), and `docs/auth.md` (ACL syntax). Full design decisions recorded in `.claude/plans/lets-talk-about-the-hazy-valiant.md`.
+
+Key decisions:
+- **Tables**: `table Name : Trait1, Trait2 { field : Type = default; order by field }` — DataId PK implicit
+- **Types**: `type Email : Text { validate: ... }` — colon = "is a kind of"; sum types `A | B`; absence types `type X : Null`
+- **Traits**: abstract base types (`trait` keyword); tables extend via `:` syntax; replication traits (`Reference`, `UserData`, `LogData`, `Configuration`) are regular traits
+- **Joins**: `><` bowtie operator; outer join = `Order >< Customer | MissingCustomer` (guard semantics)
+- **Constraints/ACL**: unified `assert name { expr }` keyword; `assert access { user.field == row.field }` for ACL
+- **Schema evolution**: redeclare table body; system diffs; `rename from` hint; same-name hides old type; `deprecate`/`prune` for removal
+- **Scope**: top-level = global (stored in schema); `let` = local inside function bodies; REPL = transaction model (`:commit`/`:rollback`)
+- **Open**: validation block syntax `{ validate: ... }` is tentative; migration functor syntax, pagination config, UI template hints, package import scope, ACL token field access — see plan file
 
 ### OQ-006: Failure Detection and Primary Elevation
 **Question**: How does the cluster detect a failed primary and who initiates elevation of a secondary?
