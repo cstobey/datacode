@@ -13,32 +13,50 @@ Schema authors do not define monads; they define **functors** — the rules that
 
 ## Functors
 
-A functor in DataCode is a structure-preserving mapping between categories. In practice, each functor is a Haskell function applied to a type or relationship that enforces a rule. There are four functor types, each applied on an as-needed basis per type or relationship:
+A functor in DataCode is a structure-preserving mapping between categories. In practice, each functor is a Haskell function applied to a type or relationship that enforces a rule. There are four functor kinds, each applied on an as-needed basis per type or relationship.
+
+This document is the *why*; [schema/functors.md](schema/functors.md) is the operational reference (signatures, when each runs, surface syntax).
 
 ### 1. Type Validation Functors
 Applied to individual fields. Enforce invariants on values within a type:
 - Range checks, format validation, referential integrity within a field
 - Example: `Email` type with a functor that validates RFC 5322 format
 - Automatically applied whenever a value of that type is constructed or mutated
+- Written as a `where` clause on a type or field declaration
 
 ### 2. Foreign Key Functors (Relational Functors)
 The primary set/relational connection between tables. Map objects in one table to objects in another:
 - Encode the "arrows" of the schema category
 - Compose: a foreign key chain is functor composition
 - Carry provenance: the query result type retains the chain of functors that produced it
+- Written with the `:>` field token
 
-### 3. Schema-Level Constraint Functors (Path Equivalence)
-Enforce commutativity of diagrams in the schema graph. If two different paths through the schema should produce the same result, a constraint functor encodes that requirement:
+### 3. Path Equivalence Functors
+Enforce commutativity of diagrams in the schema graph. If two different paths through the schema should produce the same result, a path equivalence encodes that requirement:
 - Based on David Spivak's formalism for database schemas as categories (see *Functorial Data Migration*)
-- Example: `order.customer.billing_address` must equal `order.billing_address` at commit time
 - Applied during mutation validation, not at query time
-- These are the primary mechanism for enforcing business rules that span tables
+- Written with `assert`
 
-### 4. Access Control Functors (Authorization Path Equivalence)
-Structurally identical to schema constraint functors, but evaluated against the authentication context:
-- Restrict which morphisms (paths through the schema) a given token can traverse
-- Compose with relational functors: you can only follow a foreign key if your token has the appropriate path traversal right
-- Because they are path equivalences, they can be statically analyzed for consistency (no contradictions, no gaps) before deployment
+This is a single functor kind with **two varieties**, distinguished only by what the two path terms refer to:
+
+**Data constraint** — both terms are data paths from the row.
+- Example: `order.customer.billing_address` must equal `order.billing_address` at commit time
+- The primary mechanism for enforcing business rules that span tables
+
+**Access control** — one term is the requesting token, the other a data path.
+- Restricts which morphisms (paths through the schema) a given token can traverse
+- Composes with relational functors: you can only follow a foreign key if your token has the appropriate path traversal right
+
+The two are *structurally identical*, which is why they are one kind rather than two. That identity is the payoff of the categorical framing: authorization is not a bolt-on subsystem with its own semantics, it is the same commutative-diagram machinery pointed at the authentication context. Consequences follow for free — access rules can be statically analyzed for consistency (no contradictions, no gaps) before deployment by exactly the analysis that checks data constraints, and both render as edges in the same schema diagram.
+
+Where they differ is only in evaluation timing, and that difference is derived rather than stipulated: a data constraint has nothing to check until a mutation is proposed, so it runs at commit; an access-control equivalence is meaningful on any traversal, so it runs on read as well. On a failed read the field resolves to `Redacted` rather than aborting — absence is typed, so "you may not see this" is expressible in the result rather than only as an error.
+
+### 4. Event Functors
+Schedule a deferred effect rather than enforcing an invariant. An event functor maps a committed row to an `EventRef` — a work item inserted into a queue table — instead of to `Either Error a`:
+- The only functor kind that cannot abort a commit; inserting the queue row *is* the commit
+- Keeps the category closed under composition: an external side effect would not be a morphism in the schema category at all, so it is reified as data (a queue row) that later processing consumes
+- This is why "no external calls inside a transaction" is a structural consequence of the model, not merely an operational policy
+- Surface syntax is not yet settled — see OQ-030
 
 ## Path Equivalence (David Spivak Model)
 
@@ -60,22 +78,33 @@ All functors must be **transparent** — their behavior is fully inspectable by 
 
 Opaque functions (arbitrary IO, FFI calls with side effects) are not permitted inside functors.
 
-## Type Classes and Inheritance
+## Absent Values
 
-DataCode uses Haskell's typeclass system to encode functor behavior. When a new type is defined, it can inherit the typeclass instances of existing types:
+Because NULL is eliminated, any value that might be absent says so in its type. Absence is modelled as an ADT family rooted at `Null` — **not** as `Maybe`:
 
-```haskell
--- NOT_FOUND inherits the behavior of Maybe's Nothing
-class (Functor Maybe) => NOT_FOUND a where
-  -- NOT_FOUND carries the type of the field that was absent
+```
+type MissingCustomer : Null
 ```
 
-This means `NOT_FOUND` participates in all the same functor machinery as `Maybe`, and query results that include outer joins produce well-typed values that compose correctly with downstream computations.
+Built-in members are `NotFound`, `Redacted`, `Pending`, and `Deleted`; schema authors add their own. The distinction from `Maybe` is the point. `Nothing` is a single inhabitant carrying no information, so it conflates every reason a value might be missing — which is the same defect NULL has, merely better typed. A `Null`-rooted family makes the *reason* part of the type, so "no phone number was given", "you are not permitted to see this", and "the join found no counterpart" are different types with different handling.
 
-## The Maybe Monad and Absent Values
+A field's type is the sum of its present and absent cases:
 
-Because NULL is eliminated, any relationship that might be absent is expressed in the type. Outer joins add `NOT_FOUND` to the field types on the outer side. This means:
+```
+phone     : Phone    | NotGiven
+customer :> Customer | MissingCustomer
+```
 
-- Every consumer of an outer-joined field is forced by the type system to handle the absent case
-- `NOT_FOUND` composes with the `Maybe` monad naturally — a chain of absent-capable lookups is a `do`-notation chain
+Outer joins add a `Null`-derived variant to the field types on the outer side, and the guard semantics of `><` are exactly the left-to-right resolution of that sum. This means:
+
+- Every consumer of an outer-joined field is forced by the type system to handle the absent case, and to handle each *reason* separately if they differ
 - No silent propagation of NULL through computations
+- Absence composes with pattern matching and functor targeting the same way any other sum type does — no special case in the category
+
+`Maybe` does appear, but only at the Haskell function boundary: a user-supplied functor with signature `a -> Maybe b` has its `Nothing` lifted into a validation failure by the auto-wrapping rules (see [schema/functions.md](schema/functions.md)). That is an interop convenience for writing predicates in idiomatic Haskell, not the data model's representation of absence.
+
+## Type Classes and Inheritance
+
+DataCode uses Haskell's typeclass system to encode functor behavior. When a new type is defined, it inherits the constraints of the type it extends — `type Email : Text where isValidEmail` is a `Text` with an additional validation functor attached, and a field declared `email : Email` further narrows it to a field-scoped subtype at `namespace.table.field`.
+
+Domain types therefore form a subtyping chain, and validation functors accumulate down it rather than replacing one another. The same is true across trait inheritance: a field merged from two traits carries both traits' predicates, each still addressable at its originating path. See [schema/types.md](schema/types.md) and [schema/traits.md](schema/traits.md).

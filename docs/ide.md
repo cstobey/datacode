@@ -99,12 +99,13 @@ Opened by double-clicking a table node or clicking in the sidebar. Shows:
 
 ### Functor Editor
 
-A structured form for defining and editing functors. Not a raw code editor — the four functor types each have their own form layout:
+A structured form for defining and editing functors. Not a raw code editor — each functor kind has its own form layout (see `schema/functors.md`):
 
-- **Type validation**: field selector + DSL expression builder + error message template
+- **Validation**: field selector + DSL expression builder + error message template
 - **Foreign key**: source table/field + target table/field + optional resolver config
-- **Path equivalence**: two path selectors through the schema graph + description
-- **Access control**: token type selector + path condition builder
+- **Path equivalence — data constraint**: two path selectors through the schema graph + description
+- **Path equivalence — access control**: token type selector + path condition builder. Same underlying functor as the data-constraint variety; the form differs only in that the left term is a token path
+- **Event**: queue table selector + handler functor selector + trigger condition. Blocked on the event functor surface syntax, which is not yet defined
 
 Advanced users can toggle to a raw DSL text editor for the expression. The IDE previews the functor's effect on sample data before saving.
 

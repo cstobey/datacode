@@ -6,7 +6,7 @@ Questions that need answers before or during implementation. Grouped by urgency.
 
 ### OQ-001: Dynamic Loading Mechanism ✓ ANSWERED
 **Answer**: GADT DSL + Data.Dynamic hybrid. See `spikes/dynamic-loading/output.txt`.
-- **GADT DSL** (Approach 2): primary functor mechanism. All five functor types must be encodable: validation, foreign key, path equivalence, access control, and event (the event functor enqueues a work item rather than executing immediately — see Event System in `schema.md`). Spike validated the first four; event functor requires a DSL extension that produces an `EventRef` (queue table row insert) instead of `Either Error a`. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors.
+- **GADT DSL** (Approach 2): primary functor mechanism. All four functor kinds must be encodable: validation, foreign key, path equivalence (in both its data-constraint and access-control varieties), and event (the event functor enqueues a work item rather than executing immediately — see `events.md`). Spike validated the first three; the event functor requires a DSL extension that produces an `EventRef` (queue table row insert) instead of `Either Error a`. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors.
 - **Data.Dynamic** (Approach 3): type registry substrate. TypeRep-based type checking is O(1). Serves as the "registered type library" that the DSL references by name.
 - **hint** (Approach 1): failed to compile in the spike — GHC not on PATH or hint version mismatch. Revisit as an escape hatch for advanced user-defined functors; compile async and sandbox the result.
 - **Multi-daemon**: needed when compiled-in types must change (requires server restart to load new Haskell modules); the schema daemon restarts are coordinated by a supervisor.
@@ -46,7 +46,7 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 
 **Promoting a version going forward**: A well-known alias URL (e.g. `/vcurrent/`) redirects to whichever tag or branch is currently designated. The `/versions` discovery endpoint lists all live tokens and marks the promoted one. Together these allow operators to tell existing clients "use this tag from now on" without requiring client code changes.
 
-**Policy**: All branches must be named — anonymous DAG forks are not permitted. The `main` branch cannot be deleted. See the Branch and Tag lifecycle documentation in `schema.md`.
+**Policy**: All branches must be named — anonymous DAG forks are not permitted. The `main` branch cannot be deleted. See the Branch and Tag lifecycle documentation in `transaction-graph.md`.
 
 ### OQ-027: API Functor Type and Transaction Semantics ✓ ANSWERED
 
@@ -76,17 +76,73 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 ## Must Resolve During Core Development
 
 ### OQ-005: Schema DSL Syntax ✓ ANSWERED
-**Answer**: Designed. See `docs/schema.md` (type system, traits, queries), `docs/cli.md` (DSL reference and REPL), and `docs/auth.md` (ACL syntax). Full design decisions recorded in `.claude/plans/lets-talk-about-the-hazy-valiant.md`.
+**Answer**: Designed. See `docs/schema/` (normative syntax reference, one file per topic),
+`docs/schema/railroad.md` (full EBNF + railroad diagrams), `docs/cli.md` (REPL and admin
+commands), `docs/auth.md` (ACL model), and `docs/category-model.md` (the categorical
+rationale). The decision record is the bullet list below plus OQ-030 and OQ-031.
 
 Key decisions:
-- **Tables**: `table Name : Trait1, Trait2 { field : Type = default; order by field }` — DataId PK implicit
-- **Types**: `type Email : Text { validate: ... }` — colon = "is a kind of"; sum types `A | B`; absence types `type X : Null`
+- **Tables**: `table Name : Trait1, Trait2 { field : Type = default, order by field }` — DataId PK implicit
+- **Types**: `type Email : Text where isValidEmail` — colon = "is a kind of"; sum types `A | B`; absence types `type X : Null`
+- **Validation**: `where <predicate>` as a trailing clause on a type or field declaration. Replaces the earlier tentative `{ validate: ... }` block. **One `where` per declaration**, Haskell-style: the body is a single predicate inline, or an indented block of predicates that are implicitly conjoined. No repeated `where`, no `and` between block entries.
+- **Validation addressing**: a field's `where` is addressed by the field's path (`app.commerce.Customer.email`), which is also the name of its computed field type — no separate naming syntax. `assert` must be named because it spans two paths and has no single field path to inherit. Origin addresses survive trait inheritance, so a merged field enforces `A.name`, `B.name`, and its own predicates, each individually addressable.
+- **Termination**: inside a body, declarations are `,`-separated and closed by `}`; the separator may be leading or trailing (leading-comma style keeps block `where` readable), and a comma before `}` is allowed. At top level there is no separator — a declaration ends at the next token in column 0. Continuation in both cases is by indentation (offside rule), which is what delimits a block `where`.
+- **References**: `:>` declares a foreign key (`customer :> Customer`). `:` requires a type on the right, `:>` requires a table or view; using the wrong one is a compile-time error. Replaces the earlier two-token `: -> Customer`.
+- **Head rule**: in an alternation only the first variant decides the token, so `customer :> Customer | MissingCustomer` and `phone : Phone | NotGiven` both typecheck against a single `Null` root — no separate reference-absence hierarchy.
+- **Clause order**: `field ( ":" | ":>" ) Type [rename from / from] [unique] [= default] [where pred]`. The default precedes `where` so an `=` inside a predicate is never ambiguous.
+- **Inline sub-tables**: `address :> Address { ... }` — sugar for a sibling table plus an FK; there is no embedded product-in-row.
 - **Traits**: abstract base types (`trait` keyword); tables extend via `:` syntax; replication traits (`Reference`, `UserData`, `LogData`, `Configuration`) are regular traits
-- **Joins**: `><` bowtie operator; outer join = `Order >< Customer | MissingCustomer` (guard semantics)
-- **Constraints/ACL**: unified `assert name { expr }` keyword; `assert access { user.field == row.field }` for ACL
+- **Joins**: `><` bowtie operator; outer join = `Order >< Customer | MissingCustomer` (guard semantics — the same rule as a nullable `:>` field)
+- **Constraints/ACL**: unified `assert name { expr }` keyword; `assert access { user.field == row.field }` for ACL. `where` is unnamed and field-scoped; `assert` is named and row-scoped.
+- **Functor kinds reduced to four**: data constraints and access control are the *same* functor (path equivalence), differing only in whether the left path term is a data path or the requesting token. That difference determines when it runs (commit vs. read+write) and what a read failure does (`Redacted` rather than abort).
 - **Schema evolution**: redeclare table body; system diffs; `rename from` hint; same-name hides old type; `deprecate`/`prune` for removal
 - **Scope**: top-level = global (stored in schema); `let` = local inside function bodies; REPL = transaction model (`:commit`/`:rollback`)
-- **Open**: validation block syntax `{ validate: ... }` is tentative; migration functor syntax, pagination config, UI template hints, package import scope, ACL token field access — see plan file
+- **Equality**: `=` is binding only (field default, function definition, sum-type declaration, `let`, row construction and update), `==` is comparison, `is` is constructor match ignoring payload. Follows Haskell. Resolves the earlier doubling where `=` also meant exact value equality.
+- **Operator spelling** follows Haskell: `==`, `/=`, `&&`, `||`, `not`, `True`, `False`. No `!=`, `and`, or `or` (OQ-031).
+- **Guiding principle**: where a choice is otherwise balanced, pick the spelling a Haskell reader would expect. DataCode's operators may carry narrower meanings than Haskell's — `where` constrains rather than binds — but the shape should be familiar.
+- **Open**: event functor syntax (OQ-030); migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`); ACL token field access — what `user` exposes beyond `user.id` (`auth.md`)
+
+### OQ-030: Event Functor Syntax
+**Question**: How is an event functor declared on a table?
+
+The placeholder in the docs is `assert event { <FunctorRef> }`, which is wrong on three counts:
+- An event registration is not an assertion. It declares a deferred side effect, not an invariant. Overloading `assert` conflates the two.
+- It carries no **trigger condition** — the functor currently fires on every insert or update, with no way to say "only when `status` becomes `Shipped`".
+- It carries no **queue binding or retry policy**. Those live in `system.events.queues`, disconnected from the table declaration that produces the work.
+
+**Constraints on any answer**:
+- Must produce an `EventRef` (a queue-table row insert), not `Either Error a` — the commit cannot be aborted by an event functor
+- Must be encodable in the GADT DSL (see OQ-001); this is the one functor kind the dynamic-loading spike did not validate
+- The queue table is an ordinary DataCode table, so the binding is an FK-like reference to it
+
+**Notes**: The semantics are settled and documented in `events.md`; only the surface syntax is open. Candidate directions include a distinct `on <condition> emit <queue> { ... }` clause in the table body, or a queue-side declaration that names its source rather than a table-side declaration that names its queue.
+
+### OQ-031: Record Literals and Operator Spelling ✓ ANSWERED
+**Answer**: Both resolved in favour of Haskell spelling.
+
+**(a) Record literals use `=`.** Row construction and row update take `field = value`, as in Haskell record syntax. This removes the construction/update split that previously had construction on `:` and update on `=`:
+
+```
+app.commerce.Order { customer = customerId, total = 99.99 }   -- construction
+Order where id == "uuid-..." { status = Shipped }             -- update
+order { total = order.total * (1 - discount) }                -- update in a function body
+```
+
+Every brace-delimited key-value form follows: connector config (`add connector … { host = "…" }`) and UI hints (`ui { template = "card" }`) construct rows in system tables, so they take `=` too. `:` is left free to mean only "is a kind of".
+
+Consequence for parsing: a brace block in query position is a projection when its items are bare paths and a row update when they are `field = value` bindings — one token of lookahead past the identifier.
+
+**(b) Operator spelling follows Haskell.**
+
+| Was | Now |
+|---|---|
+| `!=` | `/=` |
+| `and` | `&&` |
+| `or` | `\|\|` |
+
+`and` and `or` are no longer reserved words. They were never Haskell operators — they are list functions (`and :: [Bool] -> Bool`) — so the old spelling misled a Haskell reader. `not`, `True`, and `False` were already correct; the reserved-word list had `true`/`false` lowercase and has been fixed.
+
+New lexing note: `|` and `||` share a prefix, and `|` is already heavily loaded (sum types, unions, outer-join guards). Maximal munch resolves it, but a missing space turns a type alternation into a boolean expression. See `schema/railroad.md`.
 
 ### OQ-006: Failure Detection and Primary Elevation
 **Question**: How does the cluster detect a failed primary and who initiates elevation of a secondary?

@@ -54,14 +54,13 @@ Namespaces are:
 
 ## Namespace Declarations
 
-Namespaces are declared in the schema DSL. Any name with dot-separated components implicitly declares all intermediate namespaces:
+Namespaces are declared in the schema DSL (see [schema/](schema/)). Any name with dot-separated components implicitly declares all intermediate namespaces:
 
 ```
 namespace app.commerce
 
 table orders {
-  id          : UUID       [primary_key]
-  customer_id : -> app.commerce.customers
+  customer_id :> app.commerce.customers,   -- DataId primary key is implicit
   total       : Amount
 }
 ```
@@ -85,10 +84,9 @@ These namespaces are:
   ```
   -- app.commerce.orders is a refined view of the connector shadow schema
   view app.commerce.orders {
-    id       : UUID    -- from connectors.mariadb.production.orders.id
-    customer : -> app.commerce.customers
-    total    : Amount  -- coerced from connectors.mariadb.production.orders.total_cents / 100
-    status   : OrderStatus  -- coerced from String to ADT
+    customer :> app.commerce.customers,
+    total     : Amount,      -- coerced from connectors.mariadb.production.orders.total_cents / 100
+    status    : OrderStatus  -- coerced from String to ADT
   }
   ```
 

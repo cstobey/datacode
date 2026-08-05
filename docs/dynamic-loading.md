@@ -2,27 +2,110 @@
 
 ## The Problem
 
-DataCode must be able to absorb schema changes at runtime — new tables, new types, new functors — and immediately behave as if those changes were compiled into the system. This is the single hardest technical challenge in the project.
+DataCode must be able to absorb schema changes at runtime — new tables, new types, new
+functors — and immediately behave as if those changes were compiled into the system. This is
+the single hardest technical challenge in the project.
 
-The tension: Haskell's type safety comes from compile-time type checking. Runtime dynamic loading inherently escapes the type system. The goal is to recover as much safety as possible while retaining dynamism.
+The tension: Haskell's type safety comes from compile-time type checking. Runtime dynamic
+loading inherently escapes the type system. The goal is to recover as much safety as
+possible while retaining dynamism.
 
-## Approaches Under Consideration
+## Decision
 
-### Option A: Custom DSL with Typed Interpreter
+**OQ-001 is answered: GADT DSL + `Data.Dynamic` hybrid.** Validated in
+`spikes/dynamic-loading/output.txt`.
+
+| Layer | Mechanism | Role |
+|---|---|---|
+| Functor representation | **GADT DSL** | Primary mechanism. Every functor is a value in a strongly-typed embedded DSL, interpreted by statically-typed Haskell |
+| Type registry | **`Data.Dynamic`** | The registered type library the DSL references by name. `TypeRep`-based type checking is O(1) |
+| Operational restarts | **Multi-daemon** | Needed only when compiled-in types must change; schema daemon restarts are coordinated by a supervisor |
+
+**Zero runtime GHC dependency.** ~0µs functor apply latency.
+
+This is the *Typed DSL* approach (Option A in the addendum) taken as the foundation, with
+the multi-daemon architecture (Option C) covering the cases the DSL cannot absorb. The
+runtime-Haskell escape hatch (Option E) is deferred, not adopted — see below.
+
+### What the DSL must encode
+
+All four functor kinds (see [schema/functors.md](schema/functors.md)):
+
+| Kind | Spike status |
+|---|---|
+| Validation | ✓ Validated |
+| Foreign key | ✓ Validated |
+| Path equivalence — data constraint | ✓ Validated |
+| Path equivalence — access control | ✓ Validated (same DSL construct; differs only in whether a path term is a token path) |
+| Event | ✗ **Not validated.** Requires a DSL extension producing an `EventRef` — a queue-table row insert — rather than `Either Error a`. Surface syntax also undefined; see OQ-030 |
+
+Collapsing data constraints and access control into a single path-equivalence functor means
+the DSL needs one construct where it previously appeared to need two.
+
+### Known ceilings
+
+The DSL is a ceiling by construction. Three limits are already identified:
+
+- **Regex** requires a DSL extension (or a registered primitive)
+- **Recursive types** require a DSL extension
+- **User-defined functions** require new DSL constructors — they cannot be arbitrary Haskell
+
+Hitting any of these is the trigger to revisit the addendum below.
+
+### `hint` status
+
+`hint` (Option B) **failed to compile in the spike** — GHC not on PATH, or a version
+mismatch. It is not ruled out on the merits; it was not evaluated. Revisit it as an escape
+hatch for advanced user-defined functors if and when the GADT DSL's ceiling is actually hit.
+Any adoption must compile asynchronously and sandbox the result.
+
+## Constraints on Dynamic Code
+
+Regardless of the mechanism, dynamically loaded code must obey:
+
+- **No arbitrary IO** — functors must be pure or use a restricted effect set. Enforced at schema commit: an `a -> IO b` signature is rejected outright (see [schema/functions.md](schema/functions.md)); external side effects go through the event queue instead (see [events.md](events.md))
+- **No FFI** — prevents sandbox escape
+- **Transparent** — all behavior must be inspectable by the runtime for optimization and access control analysis
+- **Versioned** — every loaded code unit references a schema graph node; the runtime knows which version of each functor is active
+
+## Feasibility Studies
+
+| Spike | Status |
+|---|---|
+| GADT DSL for all functor kinds | ✓ Done — every kind validated except the event functor |
+| `Data.Dynamic` type registry | ✓ Done — O(1) `TypeRep` checking confirmed |
+| `hint` for user-defined functors | ✗ Did not run — failed to compile (GHC not on PATH / version mismatch) |
+| Servant + dynamic dispatch | ✓ Done — OQ-002 answered; see [tech-stack.md](tech-stack.md) |
+| GHC dynamic linking | ⬚ Not run — only needed if the DSL ceiling is hit |
+| Multi-daemon restart latency | ⬚ Not run — what is the minimum downtime for a schema daemon restart with in-flight query draining? Is sub-100ms achievable? |
+
+---
+
+# Addendum: Options Considered
+
+Retained in full. The chosen approach is A as the foundation plus C for operational
+reliability; B, D, and E remain live if the GADT DSL's ceilings (regex, recursive types,
+user-defined functions) turn out to bind in practice.
+
+## Option A: Custom DSL with Typed Interpreter — **CHOSEN (foundation)**
+
 **Model**: project-m36, DDlog, Datalog engines
 
-Define a strongly-typed DataCode schema DSL that is interpreted at runtime. The interpreter is statically typed Haskell; only the schema expression language is dynamic.
+Define a strongly-typed DataCode schema DSL that is interpreted at runtime. The interpreter
+is statically typed Haskell; only the schema expression language is dynamic.
 
 - **Pro**: Type-safe interpreter; no GHC dependency at runtime; well-understood pattern
 - **Pro**: Can embed the DSL as a proper GADT — type safety propagates into schema expressions
 - **Con**: The DSL is a ceiling — any capability not in the DSL requires a runtime update
 - **Con**: User-defined functions (custom validation functors) cannot be arbitrary Haskell; they must be DSL expressions
-- **Verdict**: Probably necessary as a foundation, but insufficient alone for user-defined functors
+- **Verdict**: Adopted. Sufficient for all built-in functor kinds. Insufficient alone for arbitrary user-defined functors, which is an accepted limitation for now
 
-### Option B: `hint` / GHC API (Runtime Haskell Evaluation)
-**Model**: GHCi, some plugins systems
+## Option B: `hint` / GHC API (Runtime Haskell Evaluation) — deferred
 
-Use the `hint` library (or GHC API directly) to compile and evaluate Haskell expressions at runtime.
+**Model**: GHCi, some plugin systems
+
+Use the `hint` library (or GHC API directly) to compile and evaluate Haskell expressions at
+runtime.
 
 - **Pro**: Full Haskell expressiveness for user-defined types and functors
 - **Pro**: project-m36 has explored this path — prior art exists
@@ -31,17 +114,21 @@ Use the `hint` library (or GHC API directly) to compile and evaluate Haskell exp
 - **Con**: Security surface — arbitrary code execution is a serious concern; must sandbox
 - **Con**: Compilation latency on schema changes (seconds, not milliseconds)
 - **Con**: Type checking is still compile-time within each evaluated snippet — inter-snippet type checking is lost
-- **Feasibility**: Partial — likely usable for user-defined functors but requires extensive sandboxing and a compilation queue
+- **Spike result**: Failed to compile — GHC not on PATH or version mismatch. Not evaluated on the merits
+- **Verdict**: Deferred. The escape hatch of last resort if the DSL ceiling binds
 
-### Option C: Multi-Daemon Architecture
+## Option C: Multi-Daemon Architecture — **CHOSEN (operational layer)**
+
 **Model**: Erlang hot-code-loading; microkernel architecture
 
 Separate the runtime into multiple daemons:
+
 - **Schema daemon**: manages the schema graph and query optimizer; reboots on schema changes
 - **Data daemon(s)**: manage actual data storage and query execution; do not need to reboot on schema changes
 - **Query broker**: routes queries to the appropriate daemon; remains stable
 
-Schema changes trigger a graceful restart of the schema daemon only. In-flight queries drain before the restart.
+Schema changes trigger a graceful restart of the schema daemon only. In-flight queries drain
+before the restart.
 
 - **Pro**: Each daemon is statically compiled; full Haskell type safety within each
 - **Pro**: Bounded restart scope — only the schema daemon restarts
@@ -49,46 +136,32 @@ Schema changes trigger a graceful restart of the schema daemon only. In-flight q
 - **Con**: Schema daemon restart is still a brief interruption; must design for zero-downtime restarts
 - **Con**: Inter-daemon communication requires a stable wire protocol that can carry dynamic types
 - **Con**: Complexity of coordinating multiple daemons
-- **Verdict**: Most pragmatic option for production reliability; not ideal but workable
+- **Verdict**: Adopted, but narrowed. Because the GADT DSL absorbs ordinary schema changes with no restart, the multi-daemon path is needed only when *compiled-in types* change. Supervisor design is still open
 
-### Option D: GHC Plugins / Dynamic Linking
-Compile schema modules as shared libraries (`.so` / `.dylib`) and load them via GHC's dynamic linker.
+## Option D: GHC Plugins / Dynamic Linking — not pursued
+
+Compile schema modules as shared libraries (`.so` / `.dylib`) and load them via GHC's
+dynamic linker.
 
 - **Pro**: Full Haskell type safety within each module; real compiled performance
 - **Pro**: No GHC needed at runtime — just a linker
 - **Con**: Requires a build system on the schema change path (compilation step before loading)
 - **Con**: Dynamic linking in GHC has historically been fragile; symbol conflicts, ABI issues
 - **Con**: Still need a compiled GHC toolchain for schema changes
-- **Feasibility**: Requires investigation; GHC's dynamic linker has improved in recent versions
+- **Verdict**: Not pursued. The GADT DSL removed the need. Requires investigation if revisited; GHC's dynamic linker has improved in recent versions
 
-### Option E: Typed DSL + Escape Hatch
-A hybrid: define a typed DSL (Option A) that covers 90% of use cases, with a controlled escape hatch to runtime-evaluated Haskell (Option B) for advanced user-defined functors.
+## Option E: Typed DSL + Escape Hatch — deferred
+
+A hybrid: define a typed DSL (Option A) that covers 90% of use cases, with a controlled
+escape hatch to runtime-evaluated Haskell (Option B) for advanced user-defined functors.
 
 The escape hatch would:
+
 - Be sandboxed (no IO, no FFI, pure computation only — enforced by type)
 - Be compiled asynchronously (background compilation queue)
 - Fall back to the DSL interpreter until compilation completes
 - Be audited and stored in the schema transaction graph
 
-- **Verdict**: Likely the right long-term architecture; start with Option A, add the escape hatch incrementally
-
-## Recommended Approach (Tentative)
-
-1. **Start with a typed DSL interpreter (Option A)** for all built-in functor types and schema operations. This gives a working system with full type safety.
-2. **Use multi-daemon architecture (Option C)** for operational reliability during schema changes.
-3. **Spike Option B and D** to determine if runtime-evaluated Haskell is viable for user-defined functors. This is a required feasibility study before committing to Option E.
-
-## Feasibility Studies Required
-
-- [ ] **Spike: `hint` for user-defined functors** — Can we evaluate a schema functor as a `hint` expression, extract a pure function, and apply it safely? What is compilation latency? What sandboxing is available?
-- [ ] **Spike: GHC dynamic linking** — Can we compile a schema module to a shared library and hot-load it into a running DataCode process without symbol conflicts?
-- [ ] **Spike: Multi-daemon restart latency** — What is the minimum downtime for a schema daemon restart with in-flight query draining? Is sub-100ms achievable?
-- [ ] **Spike: Servant + dynamic dispatch** — Can a Servant-defined API serve dynamic schema endpoints? (See `tech-stack.md`)
-
-## Constraints on Dynamic Code
-
-Regardless of the mechanism chosen, dynamically loaded code must obey:
-- **No arbitrary IO** — functors must be pure or use a restricted effect set
-- **No FFI** — prevents sandboxing escape
-- **Transparent** — all behavior must be inspectable by the runtime for optimization and access control analysis
-- **Versioned** — every loaded code unit references a schema graph node; the runtime knows which version of each functor is active
+- **Verdict**: Still likely the right long-term architecture. Deferred rather than rejected —
+  Option A is in place, and the escape hatch is added incrementally if and when user-defined
+  functors demand it

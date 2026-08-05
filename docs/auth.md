@@ -51,21 +51,24 @@ Server tokens:
 
 ## Access Control Functors
 
-Access control is not a separate ACL system — it is a category of functors applied to the schema graph:
+Access control is not a separate ACL system — it is not even a separate functor kind. It is
+one of the two varieties of path-equivalence functor, distinguished only by the fact that
+one of its two path terms is the requesting token rather than a data path. See
+[schema/functors.md](schema/functors.md#path-equivalence-and-its-two-varieties).
 
 - An access control functor is a path equivalence constraint evaluated against the active token
 - It restricts which morphisms (foreign key traversals, field reads) a token can perform
 - Composition: token A's access is the intersection of the client token's schema-level access and the user token's row-level access
 - Access rules can be analyzed statically for consistency (no contradictions, complete coverage) before deployment
 
-ACL rules use the same `assert` keyword as path-equivalence constraints — both are path-equivalence assertions; ACL just has the requesting token as one term.
+ACL rules use the same `assert` keyword as path-equivalence constraints — both are path-equivalence assertions; ACL just has the requesting token as one term. Full syntax reference: [schema/constraints.md](schema/constraints.md).
 
 ### Syntax
 
 ```
 -- Inline in table definition
 table app.commerce.Order {
-  customer : -> Customer
+  customer :> Customer,
 
   -- Only a user can see/write their own orders
   assert access { user.id == customer.user_id }
@@ -87,8 +90,8 @@ Path equivalence constraints that are not about token access use the same `asser
 
 ```
 table Order {
-  customer  : -> Customer
-  bill_addr : Address
+  customer  :> Customer,
+  bill_addr :> Address,
 
   -- Assert: two FK paths reach the same address
   assert billingMatch { customer.billing_address == bill_addr }
