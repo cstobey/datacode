@@ -18,21 +18,22 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [schema/README.md](schema/README.md) | Design philosophy, visibility layers, notation conventions (`:` vs `:>`, clause order, layout) |
-| [schema/types.md](schema/types.md) | Primitives, domain types, sum types, absence types, `is` |
+| [schema/types.md](schema/types.md) | Primitives, domain types, sum types, absence types, `is`, `Secret` and `Hashed` |
 | [schema/tables.md](schema/tables.md) | Table bodies, fields, defaults, `unique`, ordering, foreign keys, sub-tables |
-| [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits |
+| [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Extensible` |
 | [schema/constraints.md](schema/constraints.md) | `assert`, path equivalence, access control |
+| [schema/documents.md](schema/documents.md) | The `Doc` type, shredding, key interning |
 | [schema/evolution.md](schema/evolution.md) | Redeclare, deprecate, prune, split, merge, ADT extension |
 | [schema/queries.md](schema/queries.md) | Filter, projection, joins, grouping, views, mutation |
 | [schema/functions.md](schema/functions.md) | Scope, Haskell functions, auto-wrapping, imports |
-| [schema/functors.md](schema/functors.md) | The four functor kinds |
+| [schema/functors.md](schema/functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [namespaces.md](namespaces.md) | Namespace tree, visibility levels, namespace ACL |
 
 ## Engine
 
 | Document | Covers |
 |---|---|
-| [transaction-graph.md](transaction-graph.md) | Append-only DAG, branches and tags, shards, `DataId` / `RowId` |
+| [transaction-graph.md](transaction-graph.md) | Append-only DAG, branches and tags, shards, `DataId`, component ordinals, `PhysicalLocator` |
 | [storage.md](storage.md) | Append-only log, LMDB indexes, Cap'n Proto, zero-copy reads, materialized views |
 | [distribution.md](distribution.md) | Server roles, replication protocol, shard splits, geo-diversity |
 | [tech-stack.md](tech-stack.md) | Library and format decisions, with the OQ and spike that settled each |
@@ -53,7 +54,8 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [connectors.md](connectors.md) | External data ingestion, sync protocol, conflict resolution |
-| [events.md](events.md) | Event scheduler, queue tables, volume-based backoff |
+| [events.md](events.md) | Event scheduler, queue tables, volume-based backoff, repair queues |
+| [integrity.md](integrity.md) | Nonconformance, enforcement modes, the violations table, admin reporting |
 
 ## Status
 
@@ -71,5 +73,5 @@ cabal project whose `output.txt` holds the recorded run cited by the answered OQ
 | `spikes/dynamic-loading` | OQ-001 | GADT DSL + `Data.Dynamic`; `hint` failed to compile |
 | `spikes/servant-warp` | OQ-002 | Servant static frame + `Raw` delegating to a WAI dispatch table |
 | `spikes/capnproto` | OQ-003, OQ-004 | Cap'n Proto wire format, mmap zero-copy, LMDB threading fix |
-| `spikes/storage` | OQ-004 | Append-only log + two LMDB indexes; RowId sort order |
+| `spikes/storage` | OQ-004 | Append-only log + two LMDB indexes; locator sort order |
 | `spikes/route-trie` | OQ-029 | Hand-rolled trie at 0.2µs/request across 10k routes |

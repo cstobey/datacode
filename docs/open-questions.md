@@ -17,7 +17,7 @@ Questions that need answers before or during implementation. Grouped by urgency.
 ### OQ-003: Binary Replication Format ✓ ANSWERED
 **Answer**: Cap'n Proto for production; cereal during initial development. See `spikes/capnproto/output.txt`.
 - **cereal** (used in storage spike): same length-prefix framing as Cap'n Proto, no external toolchain, identical structural design. Ceiling: schema evolution requires an explicit version byte and branching decoder — adding a field to `TxNode` breaks old decoders without code.
-- **Cap'n Proto confirmed** (capnproto spike): wire format implemented and validated. Encode/decode round-trip passes all fields including parent RowId lists. Encode and full decode both sub-µs (timer resolution of 10k-iteration benchmark insufficient to distinguish; confirmed < 1µs/tx).
+- **Cap'n Proto confirmed** (capnproto spike): wire format implemented and validated. Encode/decode round-trip passes all fields including parent locator lists. Encode and full decode both sub-µs (timer resolution of 10k-iteration benchmark insufficient to distinguish; confirmed < 1µs/tx).
 - **mmap zero-copy confirmed**: 112-byte TxNode message written to disk, mmap'd back, fields read at fixed byte offsets (e.g. timestamp at message byte 16) with no decode pass. The OS page cache backs the ByteString — no heap allocation.
 - **Schema evolution confirmed**: V1 message (dataWords=2) read by V2 decoder → new field defaults to 0. V2 message (dataWords=3) read by V1 decoder → extra data word silently ignored. No version byte, no branching decoder, no migration step. V1=112 bytes, V2=120 bytes (+8 bytes for one new field).
 - **Protobuf is NOT a substitute**: Protobuf requires full parsing; Cap'n Proto mmaps the bytes directly.
@@ -26,9 +26,10 @@ Questions that need answers before or during implementation. Grouped by urgency.
 ### OQ-004: Storage Engine ✓ ANSWERED
 **Answer**: Hybrid architecture confirmed. See `spikes/storage/output.txt` and `spikes/capnproto/output.txt`.
 - **Append-only log** (Cap'n Proto frames on disk): the transaction graph. Immutable, sequentially written, mmap-readable without deserialization. Random access by `LogEntry { offset :: Word64, length :: Word32 }` is O(1) seek+read.
-- **LMDB `log_index`** (`RowId → LogEntry`): finds any row version in the append log by RowId. Keys are 14-byte big-endian RowIds; big-endian encoding means a range scan over all rows in a transaction is a single contiguous LMDB range.
-- **LMDB `head_index`** (`DataId → current RowId`): resolves the user-visible primary key to the current head version.
-- **Full zero-copy read path**: `DataId → head_index → RowId → log_index → (file_offset, len) → mmap[offset:len] → Cap'n Proto → pointer arithmetic`.
+- **LMDB `log_index`** (`PhysicalLocator → LogEntry`): finds any row version in the append log by locator. Keys are 14-byte big-endian locators; big-endian encoding means a range scan over all rows in a transaction is a single contiguous LMDB range.
+- **LMDB `head_index`** (`DataId → current PhysicalLocator`): resolves the user-visible primary key to the current head version.
+- **Full zero-copy read path**: `DataId → head_index → PhysicalLocator → log_index → (file_offset, len) → mmap[offset:len] → Cap'n Proto → pointer arithmetic`.
+- **Naming note**: the spike code calls the physical address `RowId`. It is `PhysicalLocator` in the design docs — `RowId` read as "the id of a row", which is what `DataId` is, and the collision was the source of recurring confusion. See `transaction-graph.md`.
 - **LMDB threading fix confirmed**: requires `-threaded` in ghc-options AND wrapping the LMDB session in `runInBoundThread` (session-level, not per-operation). The `lmdb` Haskell package calls `isCurrentThreadBound` before acquiring its write lock; without `-threaded`, this always returns False. See `spikes/capnproto/src/Spike/LmdbFixed.hs`.
 - **LMDB latency**: read 11µs/op, write 1,107µs/op. Write latency is high because LMDB calls `fdatasync()` on every transaction commit by default (durability guarantee). **This is not a problem** — DataCode batches multiple mutations into a single transaction. At 10–100 mutations/tx, the per-mutation cost is 11–110µs, which is acceptable. Single-mutation micro-benchmarks are not representative of production write patterns.
 - **Production LMDB pattern**: dedicate one OS-bound thread (via `forkOS`) for all LMDB writes, with a `TQueue` for serialization. Readers are concurrent (LMDB MVCC — readers never block writers).
@@ -117,6 +118,8 @@ The placeholder in the docs is `assert event { <FunctorRef> }`, which is wrong o
 
 **Notes**: The semantics are settled and documented in `events.md`; only the surface syntax is open. Candidate directions include a distinct `on <condition> emit <queue> { ... }` clause in the table body, or a queue-side declaration that names its source rather than a table-side declaration that names its queue.
 
+**Also blocked on this**: the `repair <ValidationRef> into <queue>` enforcement mode (`integrity.md`) binds a validation to a queue table. Its `into` clause is a placeholder in the same way `assert event` is, and should be settled by the same answer rather than independently.
+
 ### OQ-031: Record Literals and Operator Spelling ✓ ANSWERED
 **Answer**: Both resolved in favour of Haskell spelling.
 
@@ -143,6 +146,47 @@ Consequence for parsing: a brace block in query position is a projection when it
 `and` and `or` are no longer reserved words. They were never Haskell operators — they are list functions (`and :: [Bool] -> Bool`) — so the old spelling misled a Haskell reader. `not`, `True`, and `False` were already correct; the reserved-word list had `true`/`false` lowercase and has been fixed.
 
 New lexing note: `|` and `||` share a prefix, and `|` is already heavily loaded (sum types, unions, outer-join guards). Maximal munch resolves it, but a missing space turns a type alternation into a boolean expression. See `schema/railroad.md`.
+
+### OQ-032: Retention of Observational Violations
+**Question**: How long are violations kept, and what protects the ones that cannot be rebuilt?
+
+`system.integrity.violations` carries the `LogData` trait, so it is prunable and server-local
+— correct for the volume, since a single bad ingest can produce violations at data rate.
+
+But the two classes of violation are not equally recoverable (`integrity.md`). A `Derived`
+violation is a materialized view over a query and can be recomputed at any time from the
+transaction graph. An `Observed` one cannot: its witness was transient — a password plaintext
+present only during a login — and pruning it destroys the only record that the finding was
+ever made. `Forced` violations, raised by an operator, have the same property.
+
+**Options**: retain `Observed` and `Forced` rows indefinitely while pruning `Derived` ones on
+the ordinary log schedule (simple, but makes a `LogData` table partly non-prunable, which the
+shard model does not currently express); promote them to a separate `Configuration`-trait
+table at write time (clean separation, but splits one concept across two tables and two
+shards); or summarize before pruning, as analytical metrics already do, accepting that
+per-row detail is lost.
+
+**Constraint**: whatever is chosen must not make "prune the log shard" an operation that can
+silently destroy audit evidence, since that is the operation most likely to be run under
+pressure.
+
+### OQ-033: Document Key Interning Cap
+**Question**: What is the default key-cardinality cap for a `Doc indexed` field, and how is a
+spill surfaced?
+
+Interned document keys are schema objects replicated to every server, so unbounded key
+cardinality from an external source is a cluster-wide problem, not a local one — a payload
+using UUIDs as object keys would grow a `Reference` table on every node
+(`schema/documents.md`). Above the cap, keys spill to a shard-local data table; the cap is
+what makes that boundary safe.
+
+**Needs**: an empirical default, and a policy for what happens as a field approaches it.
+Spilling silently makes the field quietly slower and larger; refusing to spill makes ingest
+fail, which is exactly the outcome `monitor` mode exists to avoid.
+
+**Notes**: should be tunable per field and overridable per connector, in the same spirit as
+OQ-009's rendering thresholds. Validate against real webhook payloads (Stripe, GitHub) and
+real application log context before fixing a number.
 
 ### OQ-006: Failure Detection and Primary Elevation
 **Question**: How does the cluster detect a failed primary and who initiates elevation of a secondary?

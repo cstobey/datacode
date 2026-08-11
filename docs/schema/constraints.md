@@ -100,7 +100,7 @@ assert app.commerce.Order.billingMatch { customer.billing_address == bill_addr }
 table app.events.email_queue {
   recipient : Email,
   template  : EmailTemplate,
-  payload   : JsonObject,
+  payload   : Doc,
   assert event { system.connectors.email.SendFunctor }
 }
 ```

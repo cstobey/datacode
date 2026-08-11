@@ -50,6 +50,30 @@ validateEmail e = e =~ "^[^@]+@[^@]+\\.[^@]+"
 type Email : Text where validateEmail
 ```
 
+On a field whose type is `Secret` — which every `Hashed` type is — only `a -> Bool` is
+admitted. `a -> Either Error a` and `a -> Maybe b` are rejected, because their failure
+channels can carry the value out into an error payload and thence into the append-only log,
+where nothing can subsequently remove it. See [types.md](types.md#secret-types).
+
+## Infix Application
+
+A named function may be written infix in backticks, as in Haskell, at Haskell's default
+fixity for the form (`infixl 9`):
+
+```
+attempt `matches` user.password
+```
+
+`$` is low-precedence right-associative application (`infixr 0`), which reads as an opening
+parenthesis that closes at the end of the expression:
+
+```
+\p -> not $ isBreached p || isCommonWord p
+```
+
+Both are covered in [README.md](README.md#backticks-and-) and specified in
+[railroad.md](railroad.md#functions-and-expressions).
+
 Standard library always available (no import needed): `Data.Text`, `Data.Time`,
 `Data.Maybe`, `Data.List`, `Data.Map`, `Text.Regex.TDFA`, standard numeric packages.
 

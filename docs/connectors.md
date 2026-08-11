@@ -76,10 +76,16 @@ connector_log entry:
   operation           Enum(Insert, Update, Delete, StateCheck)
   external_table      Text
   external_key        Text        -- serialized PK of the affected row
-  external_payload    JSONB       -- the raw external record
+  external_payload    Doc         -- the raw external record; bytes preserved verbatim
   datacode_txn_id     UUID?       -- linked DataCode transaction, if applied
   sync_status         Enum(Pending, Applied, Conflict, Skipped)
 ```
+
+`external_payload` is a `Doc` (see [schema/documents.md](schema/documents.md)) rather than an
+opaque blob or a JSON column. The received bytes are stored verbatim — which is required for
+webhook signature verification, since an HMAC is computed over the body exactly as sent — and
+the shredded, queryable form is a materialized view over them, requested per field with
+`indexed`.
 
 DataCode maps the two logs together by matching external records to internal ones via key mappings defined in the connector configuration. This gives DataCode full visibility into both sides' mutation history for any given entity.
 
@@ -99,6 +105,34 @@ The authority model is tunable per connector:
 - `DataCode-authoritative`: DataCode's version wins on unresolvable conflict; external is updated
 - `External-authoritative`: External version wins; DataCode records the override
 - `Symmetric`: Full resolution protocol as above (default)
+
+### Nonconforming External Data
+
+Conflicts are about two systems disagreeing. This is the separate problem of an external
+system sending something that is internally valid *there* and invalid *here* — a malformed
+email, a negative amount, a status code we have never seen. Data integrity problems in
+systems we do not control are not an exceptional case; they are the normal case.
+
+**Rules applied over connector-sourced data default to `monitor`, never to `enforce`.**
+
+This is not a preference. A commit that fails on a MariaDB binlog event stops the connector
+at that offset and it never advances — one malformed row halts replication for the entire
+connector, and the backlog grows until someone notices. On the webhook side a rejected commit
+becomes a delivery failure, then a retry, then a retry storm at the source, and eventually a
+disabled endpoint. In both cases enforcement converts a data problem into an outage.
+
+Under `monitor` the row lands, the violation is recorded against the functor it broke, and
+the pipe keeps moving. See [integrity.md](integrity.md).
+
+Unknown code values are handled the same way and land in the same queue. If the target
+`Reference` table carries the `Extensible` trait, the connector issues a schema transaction
+adding the variant and records which connector and token did it; if it does not, the value is
+recorded as a violation. See
+[schema/traits.md](schema/traits.md#extensible).
+
+The practical effect is that the connector conflict queue and the integrity violation queue
+are one review surface. An operator asking "what is wrong with the data coming from
+production?" should not have to check two places to find out.
 
 ### State Verification
 

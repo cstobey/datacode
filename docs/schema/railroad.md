@@ -67,6 +67,7 @@ Statement    ::= ImportDecl
                | StandaloneAssert
                | StandaloneUnique
                | EvolutionStmt
+               | ModeStmt
                | FunctionDecl
                | TypeSigDecl
 
@@ -78,12 +79,14 @@ ImportDecl   ::= 'import' ModuleName ( '(' Ident ( ',' Ident )* ')' )?
 ## Types
 
 ```ebnf
-TypeDecl     ::= 'type' Ident ( ':' TypeExpr | '=' TypeExpr ) WhereClause*
+TypeDecl     ::= 'type' Ident ( ':' TypeExpr | '=' TypeExpr ) UsingClause? WhereClause*
 
 TypeExpr     ::= Variant ( '|' Variant )*
 Variant      ::= QName TypeArg*
                | '(' TypeExpr ( ',' TypeExpr )+ ')'
 TypeArg      ::= QName | Literal
+
+UsingClause  ::= 'using' QName
 
 TypeSig      ::= TypeExpr ( '->' TypeExpr )*
 TypeSigDecl  ::= Ident ':' TypeSig
@@ -94,15 +97,27 @@ TypeSigDecl  ::= Ident ':' TypeSig
 from `FieldDecl` by position — signatures appear at file top level, field declarations only
 inside a table, view, or trait body.
 
+`UsingClause` supplies a parameter row to a parameterised type constructor. It is currently
+valid only on `Hashed`, where it names a row in `system.crypto.hash_policies`:
+
+```
+type Password : Hashed Text using system.crypto.password_v2 where minLen 12
+```
+
+It precedes `where` for the same reason `DefaultClause` does — `where` is the only clause
+with an open-ended expression to its right, so everything with a fixed shape comes first.
+See [types.md](types.md#hashed-types).
+
 ---
 
 ## Fields
 
 ```ebnf
-FieldDecl    ::= Ident RefToken TypeExpr SubTableBody?
-                 SourceClause? 'unique'? DefaultClause? WhereClause?
+FieldDecl    ::= Ident RefToken TypeExpr SubTableTraits? SubTableBody?
+                 SourceClause? 'unique'? 'indexed'? DefaultClause? WhereClause?
 
 RefToken     ::= ':' | ':>'
+SubTableTraits ::= ':' TraitList
 SubTableBody ::= '{' TableBody '}'
 SourceClause ::= 'rename' 'from' QName
                | 'from' QName
@@ -123,7 +138,12 @@ Constraints not expressible in the grammar, enforced at compile time:
 - `:` — no `Variant` in the `TypeExpr` may name a table or view.
 - `:>` — the **first** `Variant` must name a table or view. Later variants may name further
   tables/views or `Null`-derived types. See the head rule in [README.md](README.md).
-- `SubTableBody` is only valid with `:>`.
+- `SubTableBody` and `SubTableTraits` are only valid with `:>`. `SubTableTraits` mirrors
+  `TableDecl`'s trait list and is how an inline sub-table declares `Component`.
+- `indexed` is valid only where the `TypeExpr` is `Doc`. See
+  [documents.md](documents.md).
+- `unique` is rejected on a field whose type is `Secret` (including every `Hashed` type),
+  because per-row salts make the constraint unenforceable in principle.
 
 A `FieldDecl`'s `WhereClause` is addressed by the field's path
 (`<namespace>.<table>.<field>`), which is also the name of the field's computed type. There
@@ -207,13 +227,47 @@ VisibilityLevel ::= 'system' | 'connector' | 'internal' | 'standard' | 'featured
 
 ---
 
+## Enforcement Modes
+
+```ebnf
+ModeStmt      ::= 'enforce' ValidationRef ( 'always' | 'forward' )
+                | 'monitor' ValidationRef
+                | 'repair'  ValidationRef 'into' QName
+
+ValidationRef ::= QName ( '/' Ident )?
+```
+
+`ValidationRef` addresses a validation by the path that already names it: a field path names
+the field's computed type and the predicates on it, and `/ <predicate>` selects one predicate
+from a block. An `assert` is addressed by its own name and takes no `/`.
+
+```
+enforce app.auth.User.username / minLen12 forward
+monitor app.commerce.Order.billingMatch
+repair  app.commerce.Order.total / isRoundedToCents into app.events.repair_queue
+```
+
+`always` is the default and need not be written. `forward` grandfathers: the predicate binds
+new and changed values, existing ones are recorded and left alone.
+
+The `/` here is unambiguous with division because `ValidationRef` is not an `Expr` — no
+production admits both at this position.
+
+`repair`'s `into` binding is provisional and will be revised with the event functor syntax
+(OQ-030).
+
+Modes are not written inside `where` blocks. See [../integrity.md](../integrity.md) for why,
+and for the rule that adding a predicate to a populated field requires stating one.
+
+---
+
 ## Functions and Expressions
 
 ```ebnf
 FunctionDecl ::= Ident Param* '=' Expr
 Param        ::= Ident
 
-Expr         ::= OrExpr
+Expr         ::= OrExpr ( '$' Expr )?
 OrExpr       ::= AndExpr ( '||' AndExpr )*
 AndExpr      ::= NotExpr ( '&&' NotExpr )*
 NotExpr      ::= 'not' NotExpr | CmpExpr
@@ -222,7 +276,8 @@ CmpOp        ::= '==' | '/=' | '<' | '<=' | '>' | '>=' | IsOp
 IsOp         ::= 'is' 'not'?
 
 AddExpr      ::= MulExpr ( ( '+' | '-' ) MulExpr )*
-MulExpr      ::= Atom ( ( '*' | '/' ) Atom )*
+MulExpr      ::= InfixExpr ( ( '*' | '/' ) InfixExpr )*
+InfixExpr    ::= Atom ( '`' QName '`' Atom )*
 
 Atom         ::= Literal
                | FieldPath
@@ -263,6 +318,29 @@ exactly one parse.
 **Operator spelling** follows Haskell throughout: `==`, `/=`, `&&`, `||`, `not`, `True`,
 `False`. There are no `!=`, `and`, or `or` tokens.
 
+**Backtick infix.** Any named function may be written infix by enclosing it in backticks, as
+in Haskell, with Haskell's default fixity for the form: `infixl 9`, tighter than every
+operator and looser than juxtaposition.
+
+```
+attempt `matches` user.password
+(f x) `matches` y == z          -- parses as ((f x) `matches` y) == z
+```
+
+This is what makes two-argument predicates read as the assertions they are rather than as
+function calls, which matters most where a functor is being read for review rather than
+written.
+
+**`$` application.** `$` is low-precedence right-associative application, `infixr 0`, exactly
+as in Haskell — looser than `||`, so everything to its right is one argument. Its practical
+effect is an opening parenthesis that closes at the end of the expression:
+
+```
+not $ isDisposableDomain e || isBlockedDomain e
+-- equivalent to
+not (isDisposableDomain e || isBlockedDomain e)
+```
+
 **Lexing.** Several operators share a prefix; maximal munch applies in every case:
 
 | Prefix | Tokens |
@@ -273,6 +351,9 @@ exactly one parse.
 | `:` | `:`, `:>` |
 | `>` | `>`, `>=`, `><` |
 | `<` | `<`, `<=` |
+
+`$` and `` ` `` share a prefix with nothing and are single-character tokens. `` ` `` is
+valid only in matched pairs enclosing a `QName`.
 
 The `\|` / `\|\|` pair deserves attention: `\|` is heavily loaded already (sum types, unions,
 outer-join guards) and `\|\|` is boolean or. Munch resolves it, but a missing space in
@@ -368,7 +449,7 @@ HistoryOpt   ::= 'since' StringLit
 
 ```ebnf
 AdminCommand ::= ServerCmd | ShardCmd | ConnectorCmd | TokenCmd
-               | MatViewCmd | TxnCmd | DrCmd
+               | MatViewCmd | TxnCmd | IntegrityCmd | DrCmd
 
 ServerCmd    ::= 'show' 'servers' ( 'for' 'shard' QName )?
                | 'elevate' 'secondary' Host 'to' 'primary' 'for' 'shard' QName
@@ -398,6 +479,18 @@ MatViewCmd   ::= 'show' 'materialized' 'views' ( 'shard' QName )?
 
 TxnCmd       ::= 'show' 'transactions' ( 'shard' QName )? ( 'since' 'seq' NumLit )? ( 'limit' NumLit )?
                | 'show' 'transaction' Ident
+
+IntegrityCmd ::= 'show' 'violations' ( 'for' ValidationRef )? ( 'shard' QName )? ( 'limit' NumLit )?
+```
+
+`IntegrityCmd` is the only integrity command with its own syntax, and it exists only as a
+convenience for the degraded-server case. Waiving a violation, acknowledging one, and raising
+one by hand are ordinary mutations against `system.integrity.violations` — it is a table, and
+the self-hosting principle says system concerns that can be expressed as tables should be:
+
+```
+system.integrity.violations where id == "05KG..." { state = Waived "legacy import, TICKET-4471" }
+system.integrity.violations { subject_table = ..., subject = ..., origin = Forced, ... }
 ```
 
 ---
@@ -419,24 +512,38 @@ DrCmd        ::= 'force' 'elect' 'primary' Host 'for' 'shard' QName
 ## Reserved Words
 
 ```
-add       as        assert    asc       at        avg       by        connector
-conflict  count     DataCode  deep      delete    delete!   demote    deprecate
-describe  desc      drop      elect     elevate   else      export    extend
-External  False     for       force     from      group     if        import
-in        into      is        issue     key       lag       let       limit
-materialized  max   merge     migrate   min       not       order     pause
-primary   prune     replay    replication  refresh  removing  resolve  resume
-revoke    scoped    secondary seq       servers   set       shard     shards
-show      shrink    since     split     sum       sync      table     tertiary
-then      to        token     tokens    transaction  transactions     trait
-True      type      ui        unique    using     verify    via       view
-views     visibility  where   with
+acknowledge  add    always    as        assert    asc       at        avg
+by        connector conflict  count     DataCode  deep      delete    delete!
+demote    deprecate describe  desc      drop      elect     elevate   else
+enforce   export    extend    External  False     flag      for       force
+forward   from      group     if        import    in        indexed   into
+is        issue     key       lag       let       limit     materialized
+max       merge     migrate   min       monitor   not       order     pause
+primary   prune     repair    replay    replication  refresh  removing  resolve
+resume    revoke    scoped    secondary seq       servers   set       shard
+shards    show      shrink    since     split     sum       sync      table
+tertiary  then      to        token     tokens    transaction  transactions
+trait     True      type      ui        unique    using     verify    via
+view      views     violations  visibility  waive  where    with
 ```
 
 `and` and `or` are **not** reserved — boolean conjunction and disjunction are the operators
 `&&` and `||`. (In Haskell `and` and `or` are list functions, not operators; reserving the
 words here would have misled.) `not` is a reserved prefix operator, as in Haskell.
 
-Type and trait names (`Text`, `Int`, `Null`, `NotFound`, `Reference`, `UserData`,
-`LogData`, `Configuration`, …) are ordinary identifiers resolved through the namespace tree,
-not reserved words.
+Two words that were considered and deliberately **not** reserved:
+
+- **`write`**, as in an `enforce … on write` spelling of the grandfathering mode. `write` is
+  a likely field name in any permissions table, including DataCode's own. The mode is spelled
+  `forward` instead — one word, symmetric with `always`, no collision.
+- **`open`**, as a modifier marking an extensible `Reference` table. `open` is a likely
+  boolean field name. Extensibility is a marker trait (`Extensible`) instead, which needs no
+  keyword at all and composes through the existing trait list.
+
+`matches` is an ordinary function, not a keyword. `acknowledge`, `flag`, and `waive` are
+reserved against future admin syntax but currently have no production — those operations are
+ordinary mutations against `system.integrity.violations`.
+
+Type and trait names (`Text`, `Int`, `Null`, `NotFound`, `Doc`, `Reference`, `UserData`,
+`LogData`, `Configuration`, `Component`, `Extensible`, `DocKeys`, …) are ordinary identifiers
+resolved through the namespace tree, not reserved words.

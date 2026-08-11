@@ -49,6 +49,100 @@ Server tokens:
   Localhost daemon caches its token after startup auth handshake
 ```
 
+## Credential Storage
+
+Passwords are stored as a `Hashed` type. Hashing is not a validation predicate and is not
+something the login code does — it is the field's type, which is what makes it impossible
+to get wrong:
+
+```
+type Password : Hashed Text using system.crypto.password_v2
+  where
+    minLen 12
+    \p -> not $ isBreached p
+
+table system.auth.users : Configuration {
+  username : Username unique,
+  password : Password,
+  status   : Active | Locked | Suspended = Active
+}
+```
+
+The `where` predicates run on the plaintext, which is the only stage that sees it; the
+digest is produced afterwards and is all that reaches the transaction log. That ordering is
+fixed by the type, not by convention — see
+[schema/functors.md](schema/functors.md#order-of-operations-for-a-field-write).
+
+Because `Password` is `Hashed`, it is `Secret`, and four things follow automatically
+([schema/types.md](schema/types.md#secret-types)):
+
+- `users.password` reads as `Sealed`, never as bytes, for every token.
+- `==` against it is a compile-time error. Verification goes through `matches`.
+- Its validation predicates may only be `a -> Bool`, so no error payload can carry the
+  plaintext into the append-only log, where nothing could subsequently remove it.
+- `unique` on it is a compile-time error — per-row salts mean it would never fire.
+
+**Note on policy content.** The mechanism supports composition rules ("must contain a
+symbol") because some environments are required to have them. The recommended default policy
+does not include them: NIST SP 800-63B moved to length plus breach-list checking, which is
+what the example above uses.
+
+## Login
+
+```
+authenticate name attempt =
+  let u = system.auth.users where username == name
+  in if attempt `matches` u.password && u.status is Active
+       then issueSession u
+       else Left AuthFailed
+```
+
+`matches` hashes its right-hand argument under the policy recorded on the stored value and
+compares in constant time. It applies to a single resolved row:
+``users where attempt `matches` password`` is a scan of every row against a per-row salt, and
+is rejected at compile time.
+
+## Password Policy Rotation
+
+Rotating the hash algorithm or tightening the password rules is repointing `Password` at a
+new row in `system.crypto.hash_policies` — a schema commit against a populated field, which
+by the rule in [integrity.md](integrity.md#mode-is-mandatory-on-a-populated-field) must state
+an enforcement mode. It is `enforce forward`: existing credentials keep working, and every row
+under the superseded policy becomes a reportable violation.
+
+Two of the three checks are **derivable** — the stored value records which policy produced it,
+so "hashed under a superseded policy" is a query. The third is not. Whether a stored password
+satisfies a *new length or content rule* cannot be determined from a digest. That fact is
+only observable at login, in the moment the plaintext exists.
+
+### Re-Validation at Login
+
+When `matches` succeeds, the runtime re-evaluates the field's `where` predicates against the
+supplied plaintext and:
+
+1. **Re-hashes** under the current policy if the stored policy id differs, and
+2. **Opens or closes an observational violation** according to whether the predicates now
+   hold ([integrity.md](integrity.md#two-classes-of-nonconformance)).
+
+This is the only place a validation functor legitimately runs outside a commit, and it is
+justified by the fact that this is the only moment its input exists. Everywhere else,
+re-validation is a query.
+
+### The Failure Mode That Must Not Happen
+
+The re-hash in step 1 is a write, and a write is subject to the field's enforcement mode. If
+that mode were `enforce always`, the write would be rejected by the very predicates the user
+has just failed — and the login would fail for someone whose password worked yesterday and
+who has been given no way to know anything changed. Tightening a password policy would lock
+out precisely the population it was meant to reach.
+
+> **A failed post-login re-validation must never fail the login.**
+
+The mandated behaviour: keep the existing digest, record the violation, complete the login,
+and flag the account for a forced change at the next opportunity. `enforce forward` is what
+makes this the default rather than a special case — the old value is grandfathered, so
+nothing about the existing row is rejected.
+
 ## Access Control Functors
 
 Access control is not a separate ACL system — it is not even a separate functor kind. It is

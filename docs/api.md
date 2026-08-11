@@ -189,6 +189,18 @@ table system.logs.http_requests : LogData {
 }
 ```
 
+`error` is a rendered diagnostic, and this table is append-only and always written — which
+makes it the highest-risk sink in the system for a value that should never have been
+persisted. A rejected commit names the **path** that refused it, never the value that failed
+(see [schema/README.md](schema/README.md#addressing-validations)), and a validation functor
+attached to a `Secret` type has no channel to return a value at all
+([schema/types.md](schema/types.md#secret-types)). The runtime erases error payloads
+originating from `Secret` types as a backstop.
+
+`DataId` values appearing in `path` are the 20-character Crockford base32 rendering; component
+rows append dot-separated ordinals (`05KG3N0000ZQ8V4T1H7C.7`). See
+[transaction-graph.md](transaction-graph.md#rendering).
+
 Key properties:
 
 - **Always written** — a failed, rejected, or errored transaction still produces a log row

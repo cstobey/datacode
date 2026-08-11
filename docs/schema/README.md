@@ -7,20 +7,22 @@ than restating it.
 
 | Document | Covers |
 |---|---|
-| [types.md](types.md) | Primitives, domain types, sum and product types, absence types, `is` |
+| [types.md](types.md) | Primitives, domain types, sum and product types, absence types, `is`, `Secret`, `Hashed` |
 | [tables.md](tables.md) | Table bodies, field declarations, defaults, `unique`, ordering, foreign keys, sub-tables |
-| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits |
+| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Extensible` |
 | [constraints.md](constraints.md) | `assert`, path equivalence, access control |
+| [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill |
 | [evolution.md](evolution.md) | Redeclaration, rename, deprecate, prune, split, merge, ADT extension, visibility |
 | [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, views, mutation |
 | [functions.md](functions.md) | Scope, Haskell functions, auto-wrapping, imports |
-| [functors.md](functors.md) | The four functor kinds |
+| [functors.md](functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [railroad.md](railroad.md) | Full EBNF grammar + railroad diagram rendering |
 
 Related documents outside this directory: [../namespaces.md](../namespaces.md) (namespace
 tree), [../transaction-graph.md](../transaction-graph.md) (versioning, branches, identifiers),
 [../storage.md](../storage.md) (physical layout), [../api.md](../api.md) (HTTP surface),
-[../events.md](../events.md) (event scheduler), [../auth.md](../auth.md) (tokens).
+[../events.md](../events.md) (event scheduler), [../auth.md](../auth.md) (tokens),
+[../integrity.md](../integrity.md) (nonconformance and enforcement modes).
 
 ## Design Philosophy
 
@@ -128,10 +130,10 @@ No second `Null` root is needed — absence types are admissible in the tail of 
 
 ### Clause order
 
-Field declarations take up to four trailing clauses, in this order:
+Field declarations take up to five trailing clauses, in this order:
 
 ```
-field ( ":" | ":>" ) Type [ rename from Old | from Source ] [ unique ] [ = Default ] [ where Predicate ]
+field ( ":" | ":>" ) Type [ rename from Old | from Source ] [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
 ```
 
 `where` is last because it is the only clause with an open-ended expression on its right.
@@ -145,6 +147,29 @@ Because a bare `=` therefore cannot appear at bracket depth 0 inside a predicate
 
 Operator spelling follows Haskell throughout: `==`, `/=`, `&&`, `||`, `not`, `True`,
 `False`. There are no `!=`, `and`, or `or` tokens.
+
+### Backticks and `$`
+
+Two Haskell conveniences, with Haskell's semantics and Haskell's fixities.
+
+**Any named function may be written infix in backticks** (`infixl 9` — tighter than every
+operator, looser than juxtaposition). This matters most for two-argument predicates, which
+read as the assertions they are rather than as function calls:
+
+```
+attempt `matches` user.password
+user.id `canRead` subject_table
+```
+
+**`$` is low-precedence right-associative application** (`infixr 0`). Its practical effect is
+an opening parenthesis that closes at the end of the expression, which keeps `where` blocks
+free of trailing parenthesis stacks:
+
+```
+where
+  isValidEmail
+  \e -> not $ isDisposableDomain e || isBlockedDomain e
+```
 
 ### The `where` clause
 

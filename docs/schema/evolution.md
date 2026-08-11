@@ -51,6 +51,28 @@ A predicate inherited from a trait is addressed at its trait path and cannot be 
 redeclaring the table — change the trait, or rename the field away from it with
 `from A.name`.
 
+### Adding a Predicate to a Populated Field
+
+Existing rows were committed under a schema node where the new predicate did not apply, and
+the append-only guarantee means they cannot be retroactively rejected. **The transaction that
+adds the predicate must state an enforcement mode**, or it is refused:
+
+```
+table app.auth.User {
+  username : Username where minLen 12
+}
+
+enforce app.auth.User.username / minLen12 forward
+```
+
+The system computes the blast radius before the commit — how many existing rows the new
+predicate would mark — and reports it, because the choice between rejecting those rows'
+next write and grandfathering them is only sensible to make with that number in hand. Full
+treatment in [../integrity.md](../integrity.md#mode-is-mandatory-on-a-populated-field).
+
+Relaxing or removing a predicate needs no mode: nothing that conformed before can stop
+conforming.
+
 ## Keeping Old Names
 
 If the redeclaration uses a *different* name, both old and new stay visible. Deprecate the
@@ -97,6 +119,37 @@ extend Customer.status with Archived
 
 shrink Customer.status removing Archived migrate (\_ -> Closed)
 ```
+
+### Variant Tags Are Permanent
+
+Variants are stored as 2-byte tags assigned monotonically in declaration order. **A tag is
+never reused and never renumbered.** `extend` appends; `shrink` tombstones the tag and leaves
+the numbering of every other variant untouched.
+
+This is not an implementation detail to be optimized later. Renumbering would silently change
+the meaning of every historical row that carries the old tag, which is precisely the class of
+retroactive rewrite the transaction graph exists to prevent.
+
+The same applies to `Reference` tables, whose rows *are* variants — see
+[traits.md](traits.md#reference-tables-are-code).
+
+### Automatic Extension
+
+A `Reference` table carrying the `Extensible` marker trait may be extended by an automated
+process rather than by a schema author:
+
+```
+table app.commerce.OrderStatus : Reference, Extensible { name : Text unique }
+```
+
+When a connector meets a code value the table does not have, it issues the `extend`
+transaction itself and records which connector and token did it. Without the trait, the
+unknown value is recorded as a violation instead. Both surface in the same review queue, so
+"a code appeared on its own" and "a row broke a rule" are one thing to watch rather than two.
+
+Extension is opt-in because every extension is a schema commit replicated to every server;
+an unthrottled source inventing codes is schema churn across the whole cluster. `Extensible`
+tables are rate-limited per connector.
 
 ## Schema Visibility
 

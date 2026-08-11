@@ -24,18 +24,22 @@ start of the next declaration instead — see below.
 Every table has two automatic virtual columns:
 
 - `created_at` — timestamp extracted from the row's `DataId`
-- `updated_at` — timestamp of the most recent `RowId` that mutated the row
+- `updated_at` — timestamp of the most recent `PhysicalLocator` that mutated the row
 
-`RowId` (the physical row identifier) is internal only and not exposed in the schema DSL.
-See [../transaction-graph.md](../transaction-graph.md).
+`PhysicalLocator` (the physical address of one row version) is internal only and not exposed
+in the schema DSL. See [../transaction-graph.md](../transaction-graph.md).
+
+A table carrying the `Component` trait has no `DataId` of its own; its rows are identified by
+the parent's identifier plus an `Ordinal`, and `created_at` is inherited from the parent. See
+[traits.md](traits.md#component).
 
 ## Field Declarations
 
-A field declaration is a name, a type token, a type, and up to four trailing clauses in a
+A field declaration is a name, a type token, a type, and up to five trailing clauses in a
 fixed order:
 
 ```
-field ( ":" | ":>" ) Type [ rename from Old | from Source ] [ unique ] [ = Default ] [ where Predicate ]
+field ( ":" | ":>" ) Type [ rename from Old | from Source ] [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
 ```
 
 ```
@@ -50,6 +54,10 @@ table app.commerce.Order {
 
 The default precedes `where` so that an `=` inside the predicate is never mistaken for a
 field default.
+
+`indexed` sits beside `unique` because both are storage hints rather than parts of the
+field's meaning. It is currently valid only on a `Doc` field, where it requests the shredded
+form — see [documents.md](documents.md#storage-bytes-first-shredded-second).
 
 ### Validation Blocks
 
@@ -197,6 +205,27 @@ table app.commerce.Customer {
 
 To place the sub-table in a different namespace, use a fully-qualified name in the inline
 definition.
+
+### Component Sub-Tables
+
+A sub-table that has no independent existence — it is created with its parent, lives in the
+parent's shard, and is destroyed with it — declares the `Component` trait. Its rows are then
+identified relative to the parent by an `Ordinal` rather than getting a `DataId` of their
+own, and the reference back to the parent costs no bytes at all:
+
+```
+table app.log.Request : LogData {
+  received_at : Timestamp,
+  headers    :> RequestHeader : Component {
+    name  : Text,
+    value : Text
+  }
+}
+```
+
+`Component` is a replication trait, so it occupies the same slot as `UserData` or `LogData`
+and cannot be combined with one. Full treatment, including the invariants that make the
+compact identifier sound, is in [traits.md](traits.md#component).
 
 ## Constraints and Access Control
 

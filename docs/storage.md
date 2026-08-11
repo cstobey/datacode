@@ -14,9 +14,9 @@ message:
 [4-byte big-endian length][Cap'n Proto TxNode bytes...]
 ```
 
-Each `TxNode` carries: its own `RowId`, schema version reference, timestamp, server ID,
-parent RowId list, and the list of mutations (inserts/deletes). Benchmark: encode ~0.15µs/tx,
-decode ~0.10µs/tx at 10 mutations/tx.
+Each `TxNode` carries: its own `PhysicalLocator`, schema version reference, timestamp, server
+ID, parent locator list, and the list of mutations (inserts/deletes). Benchmark: encode
+~0.15µs/tx, decode ~0.10µs/tx at 10 mutations/tx.
 
 With Cap'n Proto + mmap, the bytes on disk **are** the runtime representation — field access
 is pointer arithmetic, not deserialization. This is the Mnesia analogy: the disk format
@@ -26,17 +26,42 @@ evolves with the schema, not with the data.
 
 | Database | Key | Value | Purpose |
 |---|---|---|---|
-| `log_index` | 14-byte RowId | 12-byte `{offset: Word64, length: Word32}` | Random access to any row version in O(1) |
-| `head_index` | 12-byte DataId | 14-byte RowId | Resolve logical row to current physical version |
+| `log_index` | 14-byte PhysicalLocator | 12-byte `{offset: Word64, length: Word32}` | Random access to any row version in O(1) |
+| `head_index` | 12-byte DataId (+ ordinals) | 14-byte PhysicalLocator | Resolve logical row to current physical version |
 
 ## Full Zero-Copy Read Path
 
 ```
-DataId → head_index → RowId
+DataId → head_index → PhysicalLocator
        → log_index  → (file_offset, length)
        → mmap[offset:length] → Cap'n Proto message
        → field access via pointer arithmetic (no copy)
 ```
+
+## Component Subtrees Are One Range Scan
+
+`head_index` keys are variable-length: a `DataId` for an ordinary row, and a `DataId`
+followed by one 4-byte `Ordinal` per nesting level for a component row (see
+[transaction-graph.md](transaction-graph.md#component-ordinals)).
+
+Because LMDB sorts keys as bytes and every descendant shares its parent's byte prefix, a
+parent's entire component subtree is a **single contiguous range scan** returning nodes in
+document order — no scatter-gather, no per-node lookup, and no stored parent pointers to
+follow. This is the property the document type is built on, and it is why a shredded document
+of 200 nodes costs one seek to read rather than 200.
+
+## Shredded Documents
+
+A `Doc` field stores the received bytes in the row, and nothing else. When the field is
+declared `indexed`, the shredded node tree is a **materialized view** over those bytes: pegged
+to a commit node, computed in the background, rebuildable at any schema node, and droppable
+without data loss.
+
+The bytes stay authoritative rather than becoming a cache of the shredded form, for a reason
+that has nothing to do with storage: webhook signature verification is an HMAC over the body
+exactly as received, and no re-serialization of a shredded tree can reproduce key order,
+duplicate keys, and number formatting reliably enough to verify against. See
+[schema/documents.md](schema/documents.md).
 
 LMDB properties that make this viable: memory-mapped (reads touch OS page cache, not a
 copy), MVCC (readers never block writers), crash-safe by default (copy-on-write B-tree +

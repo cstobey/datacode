@@ -29,6 +29,55 @@ row is the commit), and the side effect runs later under the event scheduler.
 | Path equivalence — access control | `assert access { user.<path> == <path> }` | [constraints.md](constraints.md) |
 | Event | `assert event { <FunctorRef> }` *(tentative)* | [../events.md](../events.md) |
 
+## Order of Operations for a Field Write
+
+Functors are attached at different granularities and must run in a fixed order, because a
+type may apply a storage transform that later stages must not see behind.
+
+1. **Coerce** the supplied value to the field's declared type.
+2. **Validate** — run the field's `where` predicates, in address order, against the *input*
+   value. For a `Hashed` field this is the plaintext, and it is the only stage that sees it.
+3. **Decide** — on failure, the attachment's enforcement mode decides whether the transaction
+   is rejected or the value is accepted and recorded as a violation (below).
+4. **Transform** — apply the type's storage transform: hash the value, intern a document key,
+   resolve a `Reference` name to its variant tag. Only now.
+5. **Encode** into the transaction's mutation list. Nothing that the transform removed can
+   reach the log, because the log is written from this point forward.
+6. **Resolve foreign keys** and check `unique` constraints across the row.
+7. **Evaluate path equivalences** — `assert` blocks, both varieties, across the affected
+   subgraph.
+8. **Fire event functors**, which insert queue rows and cannot abort anything.
+
+Step 2 before step 4 is the substantive constraint. Validating after the transform would mean
+validating a digest, which is meaningless, and steps 4 and 5 in that order are what make
+"the plaintext never enters the transaction log" a structural property rather than a
+convention. See [types.md](types.md#hashed-types).
+
+## Enforcement Modes
+
+A functor's *attachment* to a field or table carries an enforcement mode, which determines
+what step 3 above does and what happens to rows that already violate:
+
+| Mode | Violating write | Rows that already violate |
+|---|---|---|
+| `enforce always` | reject | recorded |
+| `enforce forward` | reject | recorded, otherwise untouched |
+| `monitor` | accept | recorded |
+| `repair into <queue>` | accept | recorded and enqueued for remediation |
+
+The mode is declared by a separate statement addressed at the validation, not by a clause
+inside the `where` block, and stating one is **mandatory** when a predicate is added to a
+field that already has rows. Full treatment, including the violations table and why the flag
+cannot live on the row, is in [../integrity.md](../integrity.md).
+
+## Signature Restrictions on `Secret` Types
+
+A validation functor attached to a field whose type is `Secret` — which every `Hashed` type
+is — admits only the `a -> Bool` signature. `a -> Either Error a` and `a -> Maybe b` are
+rejected at schema commit, because their failure channels can carry the value itself out into
+an error payload and thence into the append-only log. See
+[types.md](types.md#secret-types).
+
 ## Path Equivalence and Its Two Varieties
 
 Data constraints and access control are the same functor. Both assert that two paths through

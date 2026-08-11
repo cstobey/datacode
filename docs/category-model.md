@@ -58,6 +58,37 @@ Schedule a deferred effect rather than enforcing an invariant. An event functor 
 - This is why "no external calls inside a transaction" is a structural consequence of the model, not merely an operational policy
 - Surface syntax is not yet settled — see OQ-030
 
+## Reified Failure
+
+The event functor's design move — an external side effect cannot be a morphism in the schema
+category, so it is reified as data (a queue row) that later processing consumes — applies a
+second time, to a different problem.
+
+A validation functor rejects. Rejection is total and synchronous: the transaction does not
+happen. But a rule can be introduced *after* data exists, and the data cannot then be
+retroactively rejected without mutating history, which the transaction graph forbids. The
+category has no morphism for "this row that already exists should not have".
+
+So the failure is reified the same way the side effect is: a **violation** is a row that
+records the triple `(subject, violated functor, schema node)`. What cannot be an arrow becomes
+an object.
+
+Three properties follow, and none of them is an added feature:
+
+- **Validity is a relation, not a predicate on rows.** A row is conforming *at a schema
+  node*. The same row is conforming at one node and not at another with no contradiction,
+  because the functors attached at those nodes differ. This is the same relativity that makes
+  historical queries work at all.
+- **Repair and revision are the same operation, applied to different sides.** A violation is
+  discharged either by changing the subject or by changing the rule — and changing the rule
+  on a branch is an ordinary schema commit. Sometimes the data is right.
+- **Enforcement mode is a property of the attachment, not of the functor.** The functor is
+  the same object whether it rejects, records, or enqueues a repair; what changes is what the
+  runtime does with the `Left`. Keeping the mode out of the functor is what lets it stay
+  transparent and analyzable.
+
+The operational treatment is in [integrity.md](integrity.md).
+
 ## Path Equivalence (David Spivak Model)
 
 A schema is a **finitely presented category** where:

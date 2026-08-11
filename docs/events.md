@@ -28,13 +28,13 @@ Applications define their own queue tables for outbound side effects:
 table app.events.email_queue {
   recipient : Email,
   template  : EmailTemplate,
-  payload   : JsonObject,
+  payload   : Doc,
   assert event { system.connectors.email.SendFunctor }
 }
 
 table app.events.webhook_queue {
   destination : URL,
-  body        : JsonObject,
+  body        : Doc,
   assert event { system.connectors.http.PostFunctor }
 }
 ```
@@ -47,6 +47,26 @@ input.
 and this form expresses no trigger condition, queue binding, or retry policy. The semantics
 described in this document are settled; the surface syntax is outstanding work. See
 [schema/functors.md](schema/functors.md#event-functor).
+
+## Repair Queues
+
+The `repair` enforcement mode binds a validation to a queue table, so that a row which
+violates it is not merely recorded but handed to an automated remediation functor:
+
+```
+repair app.commerce.Order.total / isRoundedToCents into app.events.repair_queue
+```
+
+This is what makes "fix the data problems, or at least monitor them" one mechanism rather
+than two: `repair` is `monitor` plus an enqueue, and the scheduler's existing retry policy,
+backoff, and observability apply unchanged. A repair functor that cannot fix a row leaves the
+violation open, which is the correct outcome — it becomes an operator's problem rather than
+disappearing.
+
+The `into <queue>` binding shares the open surface-syntax question as the rest of the event
+functor (OQ-030); the semantics are the same as any other queue.
+
+See [integrity.md](integrity.md) for the other three modes.
 
 ## System Queue Tables
 

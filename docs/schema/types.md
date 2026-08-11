@@ -15,7 +15,13 @@ Standard scalar types:
 | `Bool` | Boolean |
 | `Date` | Calendar date |
 | `Timestamp` | Point in time |
+| `Bytes` | Opaque byte string |
 | `DataId` | 12-byte globally unique identifier (see [../transaction-graph.md](../transaction-graph.md)) |
+| `Doc` | Tree-shaped data of unknown shape (see [documents.md](documents.md)) |
+
+`DataId` is written without a role in the DSL — the phantom role that distinguishes a
+transaction, row, and shard identifier in the implementation is inferred from position and is
+not part of the surface syntax.
 
 ## Domain Types
 
@@ -103,6 +109,9 @@ Built-in absence types (all extend `Null`):
 | `Redacted` | Present but access-controlled away |
 | `Pending` | Not yet computed or arrived |
 | `Deleted` | Tombstoned in history |
+| `Sealed` | Present but one-way — a `Secret` value that cannot be read back |
+| `JsonNull` | An explicit `null` received in a document |
+| `NoKey` | This node is identified by position, not by name (see [documents.md](documents.md)) |
 
 Custom absence types:
 
@@ -136,6 +145,112 @@ customer :> Customer | MissingCustomer    -- reference absence, `:>`
 
 Only the head of the alternation decides the token. See the head rule in
 [README.md](README.md#-versus-).
+
+## Secret Types
+
+A type may be marked **`Secret`**. This is a property of the type, not a functor and not an
+access rule: it says that values of this type must not be readable back, must not appear in
+diagnostics, and must not reach the transaction log in their original form.
+
+Marking a type `Secret` has four effects, all enforced at schema commit:
+
+| Effect | Rule |
+|---|---|
+| Reads | The field resolves to `Sealed`, a `Null`-derived absence type. Never to the stored bytes. |
+| Predicates | Only `a -> Bool` is admitted. `a -> Either Error a` and `a -> Maybe b` are rejected. |
+| Comparison | `==` and `/=` against a `Secret` field are compile-time errors. |
+| Diagnostics | Any error payload produced while handling the value is erased and replaced by the failing predicate's address. |
+
+The predicate restriction is the substantive one. A validation functor with signature
+`a -> Either Error a` can carry a value out in its `Error`, and an author writing
+`\p -> Left (Error ("rejected: " <> p))` would put a credential into the append-only log,
+where nothing can subsequently remove it. Restricting the signature removes the channel
+rather than policing its use. Failures are reported by address, which is the reporting
+mechanism the language already uses (see
+[README.md](README.md#addressing-validations)), so nothing is lost.
+
+Erasing error payloads at the runtime boundary is a backstop for anything that slips past
+the signature restriction, not the primary mechanism.
+
+The `==` restriction exists because comparing secrets directly is both a timing side channel
+and an invitation to compare stored digests instead of verifying inputs. Comparison goes
+through `matches`, below.
+
+## Hashed Types
+
+`Hashed a` is a `Secret` type constructor: it accepts an `a`, validates it, and stores a
+one-way digest of it.
+
+```
+type Password : Hashed Text using system.crypto.password_v2
+  where
+    minLen 12
+    \p -> not (isBreached p)
+```
+
+The `where` predicates run on the **input** — the plaintext — because that is the only thing
+worth validating. The digest is produced afterwards, and nothing downstream of the transform
+ever sees the input again. The full ordering is in
+[functors.md](functors.md#order-of-operations-for-a-field-write).
+
+Hashing is not written as a predicate at the end of a `where` block, even though that is
+where it belongs in the pipeline. A validation functor is `a -> Either Error a`: same type in,
+same type out. Hashing is one-way and changes the field's type, so expressing it as a
+predicate would make it look composable with predicates when it is not. Making it the type is
+also what puts it in control of the Cap'n Proto encoding, which is how "the plaintext never
+enters the mutation list" becomes structural rather than a rule someone has to remember.
+
+### Policies
+
+`using` names a row in `system.crypto.hash_policies`, a `Reference` table — so a policy is
+schema, replicated to every server, and versioned in the schema graph:
+
+```
+table system.crypto.hash_policies : Reference {
+  name        : Text unique,
+  algorithm   : Argon2id | Scrypt | Bcrypt,
+  memory_kib  : Int,
+  iterations  : Int,
+  parallelism : Int,
+  salt_bytes  : Int
+}
+```
+
+Algorithm parameters are operational and change as hardware does. Keeping them in a table
+rather than in the type declaration means rotating them does not require redeclaring every
+type that uses them, and means the current policy is queryable.
+
+### Rotation
+
+Changing the policy is repointing the type at a new policy row — a schema commit against a
+populated field, which by the rule in [../integrity.md](../integrity.md#mode-is-mandatory-on-a-populated-field)
+must declare an enforcement mode. The mode is `enforce forward`: existing digests keep
+working, and every row hashed under the superseded policy becomes a reportable violation.
+
+That is the whole rotation mechanism. It is the same machinery as any other tightened rule,
+not a special path for credentials. See [../auth.md](../auth.md#password-policy-rotation) for
+the login-time half.
+
+### Comparison
+
+```
+attempt `matches` user.password
+```
+
+`matches : Hashed a -> a -> Bool` hashes its right-hand argument under the stored policy and
+compares in constant time. It is the only way to test a `Hashed` value.
+
+Two restrictions:
+
+- **`matches` is not a row filter.** ``User where attempt `matches` password`` is a scan of
+  every row against a per-row salt, and is rejected at compile time. It applies to a single
+  resolved row.
+- **`unique` on a `Hashed` field is a compile-time error.** Per-row salts mean two identical
+  inputs produce different digests, so the constraint would silently never fire — a lie the
+  schema would keep telling forever.
+
+`Hashed` is one-way. Reversible encryption at rest is a different type with different key
+management and is not currently specified.
 
 ## The `is` Operator
 

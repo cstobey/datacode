@@ -66,6 +66,12 @@ Materialized views are maintained independently per server but can be computed c
 - This is particularly useful for tertiary servers dedicated to analytical workloads
 - View computations are pegged to a stable commit node so they can proceed without blocking ongoing transactions
 
+Integrity reporting uses this path. Violations are written to the shard holding the subject
+row — a single global violations table would be a cluster-wide write hotspot and would break
+the `UserData` shard-local invariant — so "show me everything nonconforming" is a distributed
+query merged from every participating shard. The report names which shards contributed, so a
+partial result is never mistaken for a clean one. See [integrity.md](integrity.md).
+
 ## Commit Protocol (Simplified)
 
 ```

@@ -96,6 +96,34 @@ activeOrders >< Customer { customer.name, total }
 `let` is local only. Top-level bindings are global and committed to the schema — see
 [functions.md](functions.md).
 
+## Document Paths
+
+A path into a `Doc indexed` field reads like any other path and resolves through the shredded
+node tree:
+
+```
+app.log.Request where body.event_type == "charge.succeeded"
+app.log.Request { received_at, body.data.object.amount as amount }
+```
+
+The result type is the sum of every type that path has ever held, plus `NotFound` for
+documents lacking it — the same discipline as any other sum type, with no implicit coercion.
+
+A path into a `Doc` that is *not* `indexed` is a compile-time error rather than a slow query:
+the bytes are opaque by construction, and the error names `indexed` as the fix. See
+[documents.md](documents.md).
+
+## Restrictions on `matches`
+
+``User where attempt `matches` password`` is rejected at compile time. Each stored digest
+carries its own salt, so the expression is a full scan that hashes the attempt once per row.
+`matches` applies to a single resolved row, after a `unique` field has narrowed the query:
+
+```
+let u = system.auth.users where username == name
+in  attempt `matches` u.password
+```
+
 ## Historical Queries
 
 Pin a query to a historical schema version. The token may be a graph node hash prefix, a

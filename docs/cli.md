@@ -170,6 +170,33 @@ show transaction <txn-id>
 
 See [transaction-graph.md](transaction-graph.md).
 
+### Integrity
+
+```
+show violations
+show violations for app.auth.User.username / minLen12 limit 50
+show violations shard user.commerce
+```
+
+This is the only integrity command with dedicated syntax, and it exists for the degraded
+case where the query engine is all that is working. Everything else — waiving a violation,
+acknowledging one, raising one by hand — is an ordinary mutation against
+`system.integrity.violations`, because it is an ordinary table:
+
+```
+system.integrity.violations where id == "05KG..." { state = Waived "legacy import, TICKET-4471" }
+```
+
+Enforcement modes are schema statements, not admin commands, so they are typed at the REPL
+like any other declaration and are staged until `:commit`:
+
+```
+enforce app.auth.User.username / minLen12 forward
+monitor app.commerce.Order.billingMatch
+```
+
+See [integrity.md](integrity.md).
+
 ## Disaster Recovery Commands
 
 These commands are explicitly designed for DR scenarios where the IDE may be unavailable:

@@ -109,6 +109,34 @@ A structured form for defining and editing functors. Not a raw code editor — e
 
 Advanced users can toggle to a raw DSL text editor for the expression. The IDE previews the functor's effect on sample data before saving.
 
+### Integrity Panel
+
+The review queue for nonconforming data, and the reason the mechanism is worth building —
+detection without a place to look at the results is just a slower failure.
+
+- **Grouped by functor**, worst first: which rule is broken, by how many rows, since when.
+  This reads a materialized view grouped by `functor`, so the panel loads at view-read cost
+  rather than re-aggregating per visit
+  (see [integrity.md](integrity.md#attachment-to-the-functor-is-logical-not-physical)).
+- **Drill into a functor** to see affected rows, the schema node under which each violates,
+  and whether the finding is `Derived`, `Observed`, or `Forced`.
+- **Waive, acknowledge, or raise** a violation — ordinary mutations against
+  `system.integrity.violations`, so the panel is a view over a table rather than a special
+  API.
+- **Blast-radius preview** when editing a validation in the functor editor: before commit,
+  the panel reports how many existing rows a proposed predicate would mark, which is what the
+  mandatory-mode rule requires the author to see.
+
+**Unified with the connector conflict queue.** A conflict is two systems disagreeing; a
+violation is one system sending data that is invalid here. Both are "something is wrong with
+the data and a person needs to decide" — an operator should not have to check two places to
+find out what needs attention.
+
+Because violations live in the shard holding the subject row, the panel's queries are
+distributed and merged (see
+[distribution.md](distribution.md#materialized-view-distribution)), and the panel reports
+which shards contributed so partial results are never mistaken for clean ones.
+
 ### Connector Management
 
 A dedicated panel (separate from the ER diagram) for managing connectors:
