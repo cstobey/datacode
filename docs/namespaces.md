@@ -6,9 +6,9 @@ DataCode organizes tables, views, types, and functors into a **tree of namespace
 
 A fully-qualified name in DataCode looks like:
 ```
-system.auth.users
-app.commerce.orders
-connectors.mariadb.production.orders
+system.auth.User
+app.commerce.Order
+connectors.mariadb.production.Order
 ```
 
 Namespaces are:
@@ -47,8 +47,8 @@ Namespaces are:
 │
 └── app/                 -- application-defined namespaces (user-managed)
     ├── commerce/
-    │   ├── orders       -- may be a view over connectors.mariadb.production.orders
-    │   └── customers
+    │   ├── Order        -- may be a view over connectors.mariadb.production.Order
+    │   └── Customer
     └── reporting/
 ```
 
@@ -59,13 +59,17 @@ Namespaces are declared in the schema DSL (see [schema/](schema/)). Any name wit
 ```
 namespace app.commerce
 
-table orders {
-  customer_id :> app.commerce.customers,   -- DataId primary key is implicit
-  total       : Amount
+table Order {
+  customer  :> app.commerce.Customer,   -- DataId primary key is implicit
+  order_num : Int,
+  total     : Amount,
+  unique orderRef { customer, order_num }
 }
 ```
 
-A table's fully-qualified name is `app.commerce.orders`. Within the same namespace, tables can refer to each other by short name.
+A table's fully-qualified name is `app.commerce.Order` — lowercase namespace segments,
+capitalized table name. Within the same namespace, tables can refer to each other by short
+name. See [schema/README.md](schema/README.md#capitalization).
 
 ## Relationship to Shards
 
@@ -82,10 +86,10 @@ These namespaces are:
 - **Hidden by default** in the IDE (see ide.md)
 - **Referenceable** in user-defined namespaces via views:
   ```
-  -- app.commerce.orders is a refined view of the connector shadow schema
-  view app.commerce.orders {
-    customer :> app.commerce.customers,
-    total     : Amount,      -- coerced from connectors.mariadb.production.orders.total_cents / 100
+  -- app.commerce.Order is a refined view of the connector shadow schema
+  view app.commerce.Order {
+    customer :> app.commerce.Customer,
+    total     : Amount,      -- coerced from connectors.mariadb.production.Order.total_cents / 100
     status    : OrderStatus  -- coerced from String to ADT
   }
   ```
@@ -116,7 +120,7 @@ Access control functors can be applied at the namespace level, not just the tabl
 ## Backwards Compatibility
 
 Because all namespace and schema changes are recorded in the schema transaction graph:
-- A table moved from `app.orders` to `app.commerce.orders` creates a new graph node; the old path `app.orders` remains queryable against the historical graph
+- A table moved from `app.Order` to `app.commerce.Order` creates a new graph node; the old path `app.Order` remains queryable against the historical graph
 - A renamed table keeps its old name accessible in the history
 - External systems with hard-coded paths continue to work by pinning to a historical schema graph node
 

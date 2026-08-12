@@ -58,11 +58,11 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 
 ### OQ-028: Route Conflict Resolution ✓ ANSWERED
 
-- **Custom routes shadow auto-generated at the same path.** The most useful behavior — registering a custom route at `/records/app.commerce.orders/{id}` clearly intends to override the generated handler.
+- **Custom routes shadow auto-generated at the same path.** The most useful behavior — registering a custom route at `/records/app.commerce.Order/{id}` clearly intends to override the generated handler.
 - **Reserved `raw/` prefix**: `/v{N}/raw/<table-path>` is always auto-generated; custom routes starting with `raw/` are rejected at insert time. This guarantees the auto-generated handler is always reachable.
 - **Path validation**: custom routes under `/records/` must reference an existing table/view; phantom overrides are rejected at insert time.
 - **Version semantics**: custom routes are schema objects in the transaction graph — no routing-mode flag on branches or tags needed. A version token resolves to a schema node, and the routes at that node (generated + any custom overrides) follow naturally.
-- **Version ref uniqueness**: branches and tags share `system.version_refs` with a `VersionRef` ADT (`Branch DataId | Tag DataId`). The `Tag` variant's immutability is enforced by a validation functor. No discriminator column — the type encodes the rule.
+- **Version ref uniqueness**: branches and tags share `system.VersionRef` with a `VersionRef` ADT (`Branch DataId | Tag DataId`). The `Tag` variant's immutability is enforced by a validation functor. No discriminator column — the type encodes the rule.
 
 ### OQ-029: Route Trie vs. Dispatch Table Implementation ✓ ANSWERED
 **Answer**: Hand-rolled route trie. See `spikes/route-trie/output.txt`.
@@ -100,25 +100,50 @@ Key decisions:
 - **Scope**: top-level = global (stored in schema); `let` = local inside function bodies; REPL = transaction model (`:commit`/`:rollback`)
 - **Equality**: `=` is binding only (field default, function definition, sum-type declaration, `let`, row construction and update), `==` is comparison, `is` is constructor match ignoring payload. Follows Haskell. Resolves the earlier doubling where `=` also meant exact value equality.
 - **Operator spelling** follows Haskell: `==`, `/=`, `&&`, `||`, `not`, `True`, `False`. No `!=`, `and`, or `or` (OQ-031).
+- **Candidate keys are mandatory** on every table not carrying `LogData`, `Component`, or `Keyless`; `DataId` does not satisfy the rule, since counting the surrogate would make it vacuous. Default-on with a `Keyless` waiver rather than opt-in, matching enforcement modes where the strict setting is the default and weakening it is an explicit recorded act — and the opposite polarity from `Extensible`, because extensibility is a capability you choose while keylessness is a defect you admit. The exemption is not "logs are special": *occurrences have no identity beyond their occurrence, entities do*, which is why queue tables carry `LogData` too. Replaces the previous state where `unique` existed but nothing required it, leaving "default ordering: unique key ascending" undefined on keyless tables.
+- **A key on a shard-local table must be rooted** — its FK chain must reach the shard root, transitively is fine, and FKs to `Reference`/`Configuration` do not participate. Consequence: **the key declaration is also the sharding declaration.** A `UserData` table whose key contains no same-family FK *is* a shard root; one whose key does is a dependent. No separate keyword, and it cannot drift, because adding an FK changes nothing unless it is put in the key. Where a key reaches two roots, the first FK decides — the same head rule that governs `:>`. The root table's own key is cluster-wide, but that index is the shard directory the router already needs, so it costs nothing; every other key is checked within one shard. Requires shards to be **row-rooted** (each `Customer` row roots a shard), which `shardOf :: DataId 'Row -> Maybe (DataId 'Shard)` and `split shard … at key` already implied but no document stated. See `transaction-graph.md`.
+- **Continuous time**: `Behavior a ≅ Moment -> a` as a field type, for values that change with no write — accruing interest, countdowns, decaying limits. Nothing is stored; the value is computed from the row at the moment of observation. Exactly one parameter, always `Moment`, because two behaviors compose pointwise only over a shared domain and the scheduler can solve a crossing only over a domain it knows. `Moment` is distinct from `Timestamp` (stored, in a row) and is deliberately not called `CurrentTime`, since historical queries sample the past and the scheduler samples the future. `unique`, `indexed`, `order by`, and `where` are all rejected on a behavior, and behaviors are read-only. Reuse is via traits, not via a behavior-carrying type, because a behavior closes over sibling fields and only a trait can require them. A behavior is **not** a fifth functor kind — the four kinds each enforce something and a behavior is a projection.
+- **Units are validation, not algebra.** `Duration`'s canonical unit is the millisecond; conversions are stdlib functions (`days`, `hours`, …) written at the use site, so `rate * days (t - opened_at)` says what `rate` means without a dimensional type system. Domain types narrow value sets; arithmetic operates on the underlying primitive. Dimensional typing was rejected as too large an addition for the benefit, and because it collides with functor transparency and the GADT DSL's ceiling (OQ-001).
+- **Retention and rollups**: `aggregate <Name> = <query>` declares what to compute; `retain <Table> as <Name>` declares a chain of resolutions and how long each is kept. A chain never reshapes, which is why the aggregate is named once on the header — a differing step is unrepresentable rather than rejected. Terminals are `forever` (keep) and `drop` (discard); `never` was rejected because in a construct full of durations it reads as "never delete". Ordered `where`/`otherwise` branches partition a table, first match wins, as in a Haskell guard — one block rather than N statements, because order is load-bearing and separate statements have no reliable order. Chain aggregates must declare an associative merge with an identity (`count`/`sum`/`min`/`max` do; `avg` is silently rewritten to `(sum, count)`; `percentile` cannot and is rejected past one step) — phrased as a rule about merges rather than a whitelist so sketch types drop in later. `bucket_start` is injected into every generated level and `grain` is a virtual column, so `RequestRollup where grain == hour` selects a level with no new query syntax; the aggregate's plain name is the union view over all levels, making transparent querying the default and reaching into one level the marked case. **Pruning `LogData` is only ever a consequence of a chain** — there is no manual prune, and a table with no chain is never pruned, which is what closes OQ-032 structurally. A rollup is two appends (aggregate rows, then a prune node), never a rewrite of the transaction being summarized. Rollup levels are consequently real tables, not materialized views: a materialized view is recomputable from its source by definition, and here the source is gone.
+- **View keys are derived, never declared.** A `unique` declaration in a view body is rejected. Every view has a key — a table is a set of tuples, so at worst the whole tuple is one — which makes *existence* the wrong question and **meaningful** (a proper subset identifying an entity) versus **degenerate** (all attributes) the right one. Propagation: `where` preserves; projection preserves iff every key column survives, else degenerates; `group` yields the group columns exactly, and exactly rather than approximately because DataCode's `group` nests instead of aggregating away; a `:>` join yields the referencing side's key alone and is lossless, with FK fields substituting to the referent's key so the key survives the FK column being projected away; a non-key join yields the union; a union of relations needs a discriminator that may not exist; an outer join degenerates when a key column comes from the outer side, for the same reason a declared key may not contain a `Null`-derived variant. Degeneracy is a **warning, not an error** — reporting views legitimately have no entity identity — but never silent, because a view claiming an identity it lacks would be trusted by merge reconciliation. Two things depend on the answer: a meaningful key admits **incremental refresh** (upsert by key) where a degenerate one admits only full recomputation; and an incrementally-maintainable view is a **candidate to replace its sources** — the general form of a retention chain superseding its raw table — while a degenerate one pins them, so `deprecate` on a source with a degraded dependent view is rejected until the view is altered or deprecated.
+- **Capitalization** follows Haskell: types, traits, tables, views, and sum-type variants are `UpperCamelCase` and singular (a table is a type — `table T : Trait` uses the same `:` that `type A : B` does, and a row is an `Order`, not an `Orders`); fields are `lower_snake_case`; functions, predicates, and constraint names are `lowerCamelCase`; namespace segments are `lowercase`. The field/function split is deliberate — a field names stored data and reads as a column, a function is code and reads as Haskell. Capitalization is style checked by the linter, not grammar: `Ident` admits either case everywhere and position decides what a name is.
 - **Guiding principle**: where a choice is otherwise balanced, pick the spelling a Haskell reader would expect. DataCode's operators may carry narrower meanings than Haskell's — `where` constrains rather than binds — but the shape should be familiar.
-- **Open**: event functor syntax (OQ-030); migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`); ACL token field access — what `user` exposes beyond `user.id` (`auth.md`)
+- **Open**: migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`); ACL token field access — what `user` exposes beyond `user.id` (`auth.md`)
 
-### OQ-030: Event Functor Syntax
-**Question**: How is an event functor declared on a table?
+### OQ-030: Event Functor Syntax ✓ ANSWERED
+**Answer**: `on <condition> emit <queue> { <payload> }` on the producing table, and
+`handler <FunctorRef>` on the queue table. Replaces the `assert event { <FunctorRef> }`
+placeholder. See `events.md` and `schema/functors.md`.
 
-The placeholder in the docs is `assert event { <FunctorRef> }`, which is wrong on three counts:
-- An event registration is not an assertion. It declares a deferred side effect, not an invariant. Overloading `assert` conflates the two.
-- It carries no **trigger condition** — the functor currently fires on every insert or update, with no way to say "only when `status` becomes `Shipped`".
-- It carries no **queue binding or retry policy**. Those live in `system.events.queues`, disconnected from the table declaration that produces the work.
+Each of the three defects in the placeholder is addressed by a different part of the answer:
 
-**Constraints on any answer**:
-- Must produce an `EventRef` (a queue-table row insert), not `Either Error a` — the commit cannot be aborted by an event functor
-- Must be encodable in the GADT DSL (see OQ-001); this is the one functor kind the dynamic-loading spike did not validate
-- The queue table is an ordinary DataCode table, so the binding is an FK-like reference to it
+- **Not an assertion** → `on … emit` is its own statement. `assert` states an invariant that
+  can abort a commit; an event registration declares a deferred effect that can abort nothing.
+  The name `event` is no longer special to `assert`.
+- **No trigger condition** → the `on` expression, with one uniform rule: **an event fires on a
+  `False` → `True` transition of its condition, never on the condition merely being true.**
+  For stored fields the transition is observed across the write; for a `Behavior` it is
+  solved for. This is why no `becomes` keyword was needed — transition semantics are the
+  default, and a keyword restating the default is not worth reserving.
+- **No queue binding or retry policy** → `emit` names the queue. Retry policy stays in
+  `system.events.Queue` deliberately: it is an operational property of the destination that
+  changes over time, and tuning it should not require redeclaring a table. Same separation as
+  enforcement modes.
 
-**Notes**: The semantics are settled and documented in `events.md`; only the surface syntax is open. Candidate directions include a distinct `on <condition> emit <queue> { ... }` clause in the table body, or a queue-side declaration that names its source rather than a table-side declaration that names its queue.
+It also splits producer from consumer, which the placeholder conflated: `on … emit` is the
+producing table's declaration, `handler` is the queue's.
 
-**Also blocked on this**: the `repair <ValidationRef> into <queue>` enforcement mode (`integrity.md`) binds a validation to a queue table. Its `into` clause is a placeholder in the same way `assert event` is, and should be settled by the same answer rather than independently.
+Three keywords added: `on`, `emit`, `handler`. Queue tables carry `LogData` — a queue item is
+an occurrence, and two identical enqueues are two distinct work items.
+
+**`repair … into <queue>` is settled with it.** `into` names an ordinary queue table, the same
+binding `emit` makes. The two keep different spellings because the statements have different
+shapes: `emit` takes a payload literal, while a repair's payload is fixed — it is the
+violating row.
+
+**Not answered here**: behavior-triggered conditions require the scheduler to *solve* for a
+crossing moment rather than observe a transition, which is new machinery. See OQ-034. Event
+functors over stored fields are implementable as specified; over behaviors they are not yet.
 
 ### OQ-031: Record Literals and Operator Spelling ✓ ANSWERED
 **Answer**: Both resolved in favour of Haskell spelling.
@@ -147,28 +172,34 @@ Consequence for parsing: a brace block in query position is a projection when it
 
 New lexing note: `|` and `||` share a prefix, and `|` is already heavily loaded (sum types, unions, outer-join guards). Maximal munch resolves it, but a missing space turns a type alternation into a boolean expression. See `schema/railroad.md`.
 
-### OQ-032: Retention of Observational Violations
-**Question**: How long are violations kept, and what protects the ones that cannot be rebuilt?
+### OQ-032: Retention of Observational Violations ✓ ANSWERED
+**Answer**: Retention is declared by **predicate**, not by age alone, using the ordered branch
+form of `retain` (`schema/aggregates.md`). See `integrity.md`.
 
-`system.integrity.violations` carries the `LogData` trait, so it is prunable and server-local
-— correct for the volume, since a single bad ingest can produce violations at data rate.
+```
+retain system.integrity.Violation
+  where origin is Derived && state is Repaired
+    for 90 days
+    , drop
+  otherwise
+    forever
+```
 
-But the two classes of violation are not equally recoverable (`integrity.md`). A `Derived`
-violation is a materialized view over a query and can be recomputed at any time from the
-transaction graph. An `Observed` one cannot: its witness was transient — a password plaintext
-present only during a login — and pruning it destroys the only record that the finding was
-ever made. `Forced` violations, raised by an operator, have the same property.
+`Derived` violations are queries over the transaction graph and recomputable; once `Repaired`,
+the repair is visible in the subject row's own history, so dropping a closed one loses nothing.
+`Observed` (transient witness), `Forced` (operator judgement, not re-derivable), and anything
+`Waived` (the waiver and its reason are the audit trail) all fall to `otherwise forever`.
 
-**Options**: retain `Observed` and `Forced` rows indefinitely while pruning `Derived` ones on
-the ordinary log schedule (simple, but makes a `LogData` table partly non-prunable, which the
-shard model does not currently express); promote them to a separate `Configuration`-trait
-table at write time (clean separation, but splits one concept across two tables and two
-shards); or summarize before pruning, as analytical metrics already do, accepting that
-per-row detail is lost.
+**The constraint is met structurally rather than by policy.** "Prune the log shard" can no
+longer destroy audit evidence because it is no longer an operation: log data is discarded only
+as a consequence of a declared `retain` chain, and a `LogData` table with no chain is never
+pruned. Silence means keep.
 
-**Constraint**: whatever is chosen must not make "prune the log shard" an operation that can
-silently destroy audit evidence, since that is the operation most likely to be run under
-pressure.
+This also replaced the framing in the question. `LogData` was described as "prunable" in a way
+that read as "pruned on a schedule"; it means *may be discarded if a policy says so*. None of
+the three options considered was taken — the table is not split, nothing is promoted to
+`Configuration`, and no per-row detail is summarized away — because a predicate branch
+expresses the actual rule directly.
 
 ### OQ-033: Document Key Interning Cap
 **Question**: What is the default key-cardinality cap for a `Doc indexed` field, and how is a
@@ -187,6 +218,55 @@ fail, which is exactly the outcome `monitor` mode exists to avoid.
 **Notes**: should be tunable per field and overridable per connector, in the same spirit as
 OQ-009's rendering thresholds. Validate against real webhook payloads (Stripe, GitHub) and
 real application log context before fixing a number.
+
+### OQ-034: Behavior-Triggered Event Scheduling
+**Question**: How does the scheduler handle an `on` condition whose subject is a `Behavior`?
+
+A condition over stored fields is decided at commit and costs the scheduler nothing. A
+condition over a behavior has no write to observe, so the scheduler must compute *when* the
+condition will first hold and arrange to wake then (`events.md`). Three sub-questions, all
+open:
+
+**Solving.** The crossing moment must be derivable in closed form, which is what restricts
+behaviors to an analyzable class (constant, linear, piecewise-linear, exponential decay are
+the obvious candidates). The class, the solver per class, and the encoding of both in the
+GADT DSL are unspecified. Note this compounds OQ-001: the event functor is the one kind the
+dynamic-loading spike never validated, and a crossing solver is strictly harder than the
+`EventRef` production that spike would have tested.
+
+**Re-solving on write.** A behavior closes over stored fields, so writing the row changes the
+function and moves the crossing. Every pending wake-up derived from a behavior on that row
+must be recomputed at commit — and an item already enqueued may have been enqueued for a
+crossing that no longer happens. Whether such an item is withdrawn, or dispatched with its
+condition re-checked at fire time, is undecided.
+
+**Missed crossings.** If a server is down across a crossing moment, the event can fire late or
+be skipped. "The trial expired" wants to fire late; "the rate-limit window opened" may not.
+The policy, and whether it belongs per queue or per trigger, is undecided.
+
+**Constraint**: whatever is chosen must not reintroduce polling, since eliminating the
+hand-rolled `scheduled_at ≤ now` timer is most of the point of solving for crossings at all.
+
+**Aggregate encoding belongs here too.** A retention chain (`schema/aggregates.md`) needs the
+same kind of machinery from the other direction: an aggregate admissible in a multi-step chain
+must declare an associative merge with an identity, and that merge has to be encodable in the
+GADT DSL alongside the crossing solver. Open with it:
+
+- How a merge is declared and checked. `count`/`sum`/`min`/`max` are obvious; the rule is
+  written as "must declare a merge" specifically so a mergeable sketch type (t-digest for
+  percentiles, HyperLogLog for distinct counts) can be added later without changing it. What
+  that type looks like is unspecified.
+- `avg` is rewritten to `(sum, count)` and divided on read. Whether that rewrite is a general
+  mechanism (an aggregate declaring a different stored form from its read form) or a
+  one-off is undecided; a general mechanism is what a sketch type would need.
+- Whether the closed-form solver for behavior crossings and the fold for aggregates share a
+  representation. Both are "compute something in closed form over a restricted function
+  class", and building them twice would be a mistake worth avoiding deliberately rather than
+  by accident.
+
+**Blocks**: `on` conditions over behaviors; mergeable sketch types, and therefore `percentile`
+in a chain of more than one step. Conditions over stored fields and chains built from
+`count`/`sum`/`min`/`max`/`avg` are unaffected and implementable as specified.
 
 ### OQ-006: Failure Detection and Primary Elevation
 **Question**: How does the cluster detect a failed primary and who initiates elevation of a secondary?
@@ -281,5 +361,5 @@ real application log context before fixing a number.
 
 ### OQ-025: Connector Schema Change Propagation
 **Question**: When an external schema changes (new column added to MariaDB table), how does DataCode notify users whose application schema (`app.*`) references that connector table?
-**Notes**: The shadow schema is updated automatically. But if `app.commerce.orders` is a view over the connector table and a new field appears in the connector, does it automatically appear in the view, or must the user explicitly add it?
+**Notes**: The shadow schema is updated automatically. But if `app.commerce.Order` is a view over the connector table and a new field appears in the connector, does it automatically appear in the view, or must the user explicitly add it?
 **Action**: Design the schema change notification and propagation rules; likely a configurable policy per view.

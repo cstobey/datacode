@@ -19,6 +19,12 @@ Kinds 1–3 are synchronous and transactional: they run as part of the commit an
 it. Kind 4 is asynchronous and decoupled: the commit always succeeds (inserting the queue
 row is the commit), and the side effect runs later under the event scheduler.
 
+**A [behavior](types.md#behaviors) is not a fifth kind.** Each kind above enforces something —
+validation rejects, foreign keys resolve, path equivalence asserts, events enqueue. A behavior
+does none of them; it is a projection, and specifically the field-scoped computed type that
+`:` already creates, whose inhabitants are functions of `Moment`. It becomes relevant to
+functors only as the subject of an event condition.
+
 ## Surface Syntax Mapping
 
 | Kind | Written as | Documented in |
@@ -27,7 +33,7 @@ row is the commit), and the side effect runs later under the event scheduler.
 | Foreign key | `:>` field declaration | [tables.md](tables.md) |
 | Path equivalence — data constraint | `assert <name> { <path> == <path> }` | [constraints.md](constraints.md) |
 | Path equivalence — access control | `assert access { user.<path> == <path> }` | [constraints.md](constraints.md) |
-| Event | `assert event { <FunctorRef> }` *(tentative)* | [../events.md](../events.md) |
+| Event | `on <condition> emit <queue> { <payload> }` | [../events.md](../events.md) |
 
 ## Order of Operations for a Field Write
 
@@ -46,7 +52,10 @@ type may apply a storage transform that later stages must not see behind.
 6. **Resolve foreign keys** and check `unique` constraints across the row.
 7. **Evaluate path equivalences** — `assert` blocks, both varieties, across the affected
    subgraph.
-8. **Fire event functors**, which insert queue rows and cannot abort anything.
+8. **Fire event functors** whose condition transitioned from `False` to `True` across this
+   write, and re-solve any behavior-triggered condition on the row, since writing the row
+   changes the function the crossing was solved from. Both insert queue rows and can abort
+   nothing.
 
 Step 2 before step 4 is the substantive constraint. Validating after the transform would mean
 validating a digest, which is meaningless, and steps 4 and 5 in that order are what make
@@ -96,11 +105,14 @@ refer to**, and that difference is what produces the differing runtime behaviour
 
 ```
 table Order {
-  customer  :> Customer
-  bill_addr :> Address
+  customer  :> Customer,
+  bill_addr :> Address,
+  order_num : Int,
+
+  unique orderRef { customer, order_num },
 
   -- Data constraint: two FK paths must reach the same address
-  assert billingMatch { customer.billing_address == bill_addr }
+  assert billingMatch { customer.billing_address == bill_addr },
 
   -- Access control: the requesting user must be reachable from this row
   assert access { user.id == customer.user_id }
@@ -122,23 +134,36 @@ is a data constraint.
 
 ## Event Functor
 
-**Syntax is not yet settled.** The `assert event { <FunctorRef> }` form shown throughout the
-docs is a placeholder — it reuses `assert` for something that is not an assertion, and it
-does not express retry policy, queue binding, or the trigger condition. Defining the real
-syntax is outstanding work.
+An event functor is registered on the producing table with `on … emit`, and the queue that
+receives the work item declares its own processor with `handler`:
 
-The semantics are settled. An event functor, when attached to a table, fires whenever a
-matching row is inserted or updated. It does not execute the side effect itself — it writes
-a work item into a designated DataCode queue table. This keeps the commit path fast and
-ensures external side effects are:
+```
+on status is Shipped emit app.events.EmailQueue { recipient = customer.email, ... }
+```
+
+**The condition fires on a `False` → `True` transition, never on merely being true.** For a
+condition over stored fields the transition is observed across the write. For a condition over
+a [behavior](types.md#behaviors) there is no write to observe, so the scheduler solves for the
+moment the condition becomes true and wakes then — which is why behaviors are restricted to a
+closed-form-solvable class. See
+[../events.md](../events.md#behavior-triggered-scheduling) for what remains open there.
+
+Retry policy is deliberately not part of the registration: `max_attempts` and `backoff_base`
+are rows in `system.events.Queue`, because retry is an operational property of the
+destination rather than of the trigger, and tuning it should not require redeclaring a table.
+This is the same separation used for enforcement modes.
+
+An event functor, when attached to a table, does not execute the side effect itself — it
+writes a work item into a designated DataCode queue table. This keeps the commit path fast
+and ensures external side effects are:
 
 - **Durable** — the queue row survives a server crash
 - **Observable** — queue depth, failure rates, and retry counts are queryable
 - **Retryable** — the scheduler owns the retry policy; the functor just writes the payload
 - **Rate-limited** — the scheduler applies volume-based backoff before dispatching
 
-The queue table is a normal DataCode table (`app.events.email_queue`,
-`app.events.webhook_queue`, etc.) — inspectable in the IDE, filterable, and audited in the
+The queue table is a normal DataCode table (`app.events.EmailQueue`,
+`app.events.WebhookQueue`, etc.) — inspectable in the IDE, filterable, and audited in the
 transaction log. See [../events.md](../events.md).
 
 ## Transparency

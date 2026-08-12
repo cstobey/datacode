@@ -47,7 +47,7 @@ even when no tag or branch name has been declared.
 permitted — creating a divergent commit requires naming the branch first. The `main` branch
 cannot be deleted.
 
-**Tag attachment**: Tags are rows in `system.version_refs`, inserted as part of a
+**Tag attachment**: Tags are rows in `system.VersionRef`, inserted as part of a
 transaction. A tag, once written, is immutable — it permanently identifies the schema at a
 specific point in time. Semantic names (`v1.2.0`, `stable`) are the expected primary UX; the
 hash prefix exists as the canonical fallback.
@@ -62,7 +62,7 @@ data VersionRef
 ```
 
 ```
-table system.version_refs {
+table system.VersionRef {
   name : Text unique,   -- unique across all branches and tags
   ref  : VersionRef     -- Branch DataId | Tag DataId
 }
@@ -133,12 +133,63 @@ special node in the transaction graph so the history of which data lived in whic
 always recoverable. The replication mechanics of a split are in
 [distribution.md](distribution.md).
 
+### Shard Roots
+
+A shard is rooted at a **row**, not at a table. `DataId 'Shard` is defined above as the
+`DataId 'Row` of the shard's root row, and `shardOf` is partial for exactly that reason — it
+returns `Just` only for a root row. A name like `user.commerce` designates the shard
+*family*: which tables participate. The concrete shards within it are one per root row.
+
+This is what makes `UserData` mean what its cardinality column says. Each `Customer` row roots
+a shard holding that customer's orders, lines, and addresses; a split redistributes customers
+across servers, which is why `split shard … at key` takes a key (see
+[schema/railroad.md](schema/railroad.md#administration)).
+
+**Which table roots a shard is declared by its candidate key, not by a separate keyword.** A
+`UserData` table whose key contains no foreign key to another table in the same family is a
+root; one whose key does contain such a foreign key is a dependent, rooted transitively
+through it. Since keys are mandatory
+([schema/tables.md](schema/tables.md#candidate-keys-are-mandatory)) and must reach the root,
+one declaration does both jobs, and it cannot drift out of agreement with itself — adding a
+foreign key to a table changes nothing unless it is put in the key.
+
+The asymmetry that follows is worth stating, because it inverts the obvious expectation:
+
+| | Root table's key | Every other key in the shard |
+|---|---|---|
+| Scope | Cluster-wide | Within the one shard |
+| Cost | None extra — this index *is* the shard directory (`username → DataId → shard`), which is the lookup that routes a request to the right server | None — the shard primary linearizes its own writes |
+
+So the one key that must be globally unique is also the one the system already needs a global
+index for. Every other uniqueness check is local, and no candidate key requires the
+cross-shard lock that a distributed transaction would (see OQ-027).
+
+`Component` is the degenerate case of the same rule: the parent supplies placement and the
+`Ordinal` supplies uniqueness within it, which is why component tables need no declared key at
+all.
+
 ## Pruning
 
-`LogData` shards and old materialized views may be pruned. Pruning is also recorded in the
-transaction graph as a special node, so the system always knows that historical data before
-a certain point has been discarded. Analytical summary metrics are computed before pruning
-to preserve aggregate history.
+`LogData` shards and old materialized views may be pruned. Pruning is recorded in the
+transaction graph as a special node, so the system always knows that historical data before a
+certain point has been discarded.
+
+**Pruning log data is never a manual act.** It happens only as the consequence of a `retain`
+chain declared on the table, and a `LogData` table with no such chain is never pruned at all
+(see [schema/aggregates.md](schema/aggregates.md#pruning-is-only-ever-a-consequence)). This is
+what turns "analytical summary metrics are computed before pruning to preserve aggregate
+history" from an intention into a checked property: the summary is the next step of the chain,
+and the prune node cannot be written before it exists.
+
+A rollup is **two appends, never a rewrite**: one transaction writing the aggregate rows, then
+a prune node covering the source range. The transaction being summarized is not edited to hold
+the summary in place of its rows — transaction nodes are immutable, and rewriting one is the
+history mutation this entire structure exists to prevent. The history therefore remains
+readable as "these rows existed, then were summarized, then were discarded, and when."
+
+It follows that rollup levels are ordinary tables with their own log entries, not materialized
+views. A materialized view is recomputable from its source by definition; once the source is
+pruned that no longer holds.
 
 ## Globally Unique Identifiers
 
@@ -295,7 +346,7 @@ sort of encoded locators produces the same ordering as Haskell's derived `Ord` i
 server knows its own shards.
 
 `ShardIndex` is therefore a **server-local interning** of `DataId 'Shard`, with the mapping
-held in `system.shards.index`. The general rule, which applies beyond this case:
+held in `system.shards.Index`. The general rule, which applies beyond this case:
 
 > Logical identifiers are wide and global. Physical identifiers are narrow and local.
 

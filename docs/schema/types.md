@@ -14,7 +14,9 @@ Standard scalar types:
 | `Decimal` | Arbitrary-precision decimal |
 | `Bool` | Boolean |
 | `Date` | Calendar date |
-| `Timestamp` | Point in time |
+| `Timestamp` | A stored point in time |
+| `Duration` | Signed elapsed time; canonical unit is the millisecond |
+| `Moment` | A point in the observation continuum — the parameter of a `Behavior` |
 | `Bytes` | Opaque byte string |
 | `DataId` | 12-byte globally unique identifier (see [../transaction-graph.md](../transaction-graph.md)) |
 | `Doc` | Tree-shaped data of unknown shape (see [documents.md](documents.md)) |
@@ -96,6 +98,113 @@ for and-types used outside a named record.
 Note that an inline sub-table is *not* a product type — it creates a sibling table and an
 FK reference to it. See [tables.md](tables.md).
 
+## Behaviors
+
+A **behavior** is a value that varies continuously with time. It denotes a function from a
+moment to a value:
+
+```
+Behavior a  ≅  Moment -> a
+```
+
+Behaviors express quantities that change without anything being written: accruing interest, a
+depreciating asset, a trial countdown, a decaying rate limit. Nothing is stored — the value is
+computed from the row's stored fields at the moment it is observed.
+
+```
+table app.billing.Loan : UserData {
+  customer  :> Customer,
+  account   : AccountNumber,
+  principal : Amount,
+  rate      : Rate,
+  opened_at : Timestamp,
+
+  unique loanRef { customer, account },
+
+  balance : Behavior Amount = \t -> principal * (1 + rate * days (t - opened_at))
+}
+```
+
+The `=` clause on a behavior field is its **definition**, not a default. A behavior has no
+stored value for a default to stand in for, so the clause is mandatory.
+
+### One Parameter, One Domain
+
+A behavior takes exactly one parameter and its type is always `Moment`. The other inputs —
+`principal`, `rate`, `opened_at` — are not parameters. They are fields of the row, already
+typed by the schema, and the behavior closes over them.
+
+This is not a simplification. Two behaviors can be combined pointwise only if they share a
+domain, and the event scheduler can solve for a crossing only over a domain it knows. A
+behavior with a domain of its own would just be a function.
+
+### `Moment` Is Not `Timestamp`
+
+`Timestamp` is a stored point in time — `opened_at` is a value sitting in a row. `Moment` is
+the point of observation and is never stored. Keeping them distinct prevents the one mistake
+that would make a behavior meaningless: closing over "now" instead of taking it as a
+parameter. A stored `Timestamp` cannot be passed where a `Moment` is expected.
+
+`Moment` also ranges over the past and the future, which is why it is not called
+`CurrentTime`. A historical query samples a behavior at a past moment; the scheduler
+evaluates one at future moments to find when a condition *will* become true. Neither is now.
+
+| Expression | Result |
+|---|---|
+| `Moment - Moment` | `Duration` |
+| `Moment - Timestamp` | `Duration` |
+| `Timestamp - Timestamp` | `Duration` |
+| `Timestamp + Duration` | `Timestamp` |
+| `Moment + Duration` | `Moment` |
+
+`Moment` resolves to millisecond resolution on observation, matching `DataId`. The
+*denotation* must not depend on that: a behavior meaningful only at millisecond boundaries is
+a discrete signal and belongs in a stored field.
+
+### Units
+
+`Duration`'s canonical unit is the millisecond. Conversions are ordinary standard-library
+functions, not a dimensional type system:
+
+```
+days, hours, minutes, seconds, millis :: Duration -> Decimal
+```
+
+Write the conversion at the use site — `rate * days (t - opened_at)` — rather than folding a
+factor into the expression. `rate` then means "per day" because `days` is visible beside it,
+and the factor is written once in the standard library instead of once per behavior.
+
+Domain types carry validation, not dimensional algebra: `type Rate : Decimal` narrows the
+value set, but arithmetic operates on `Decimal` and the result widens back to it. Canonical
+`Duration` is what keeps that safe — every conversion pivots through one unit, so there is
+exactly one place a factor can be wrong.
+
+### Restrictions
+
+A behavior's value changes with no write, which rules out everything that assumes a stored
+value is current:
+
+| Rejected on a behavior field | Reason |
+|---|---|
+| `unique` | The constraint would hold at some moments and not others. Same reasoning as `unique` on a `Hashed` field: a constraint that cannot fire is a lie the schema keeps telling. |
+| `indexed` | An index would be stale the moment it was written |
+| `order by` | Undefined without a stated moment |
+| `where` | The predicate would have to hold at every moment, which is undecidable in general. Constrain the stored fields the behavior closes over instead. |
+
+Behaviors are **read-only**. Having no stored bytes, they are rejected in row construction and
+row update literals, exactly as `created_at` and `updated_at` are.
+
+A behavior must be **total for every moment at or after the row's `created_at`**. The
+scheduler evaluates behaviors at future moments to solve for crossings, and a partial function
+has no crossing to find.
+
+Behaviors are addressed by field path like any other computed field type
+(`app.billing.Loan.balance`), so they appear in `:describe`, error messages, and evolution
+diffs the same way everything else does.
+
+A behavior shared across tables belongs in a trait, which supplies both the formula and the
+fields it closes over — see [traits.md](traits.md#behaviors-in-traits).
+
 ## Absence Types
 
 There is no `NULL`. Absent values are expressed as typed ADTs that extend the `Null` base
@@ -112,6 +221,7 @@ Built-in absence types (all extend `Null`):
 | `Sealed` | Present but one-way — a `Secret` value that cannot be read back |
 | `JsonNull` | An explicit `null` received in a document |
 | `NoKey` | This node is identified by position, not by name (see [documents.md](documents.md)) |
+| `NotRetained` | The retention policy did not cover this bucket (see [aggregates.md](aggregates.md)) |
 
 Custom absence types:
 
@@ -182,7 +292,7 @@ through `matches`, below.
 one-way digest of it.
 
 ```
-type Password : Hashed Text using system.crypto.password_v2
+type Password : Hashed Text using system.crypto.HashPolicy.password_v2
   where
     minLen 12
     \p -> not (isBreached p)
@@ -202,11 +312,11 @@ enters the mutation list" becomes structural rather than a rule someone has to r
 
 ### Policies
 
-`using` names a row in `system.crypto.hash_policies`, a `Reference` table — so a policy is
+`using` names a row in `system.crypto.HashPolicy`, a `Reference` table — so a policy is
 schema, replicated to every server, and versioned in the schema graph:
 
 ```
-table system.crypto.hash_policies : Reference {
+table system.crypto.HashPolicy : Reference {
   name        : Text unique,
   algorithm   : Argon2id | Scrypt | Bcrypt,
   memory_kib  : Int,

@@ -56,12 +56,12 @@ something the login code does — it is the field's type, which is what makes it
 to get wrong:
 
 ```
-type Password : Hashed Text using system.crypto.password_v2
+type Password : Hashed Text using system.crypto.HashPolicy.password_v2
   where
     minLen 12
     \p -> not $ isBreached p
 
-table system.auth.users : Configuration {
+table system.auth.User : Configuration {
   username : Username unique,
   password : Password,
   status   : Active | Locked | Suspended = Active
@@ -91,7 +91,7 @@ what the example above uses.
 
 ```
 authenticate name attempt =
-  let u = system.auth.users where username == name
+  let u = system.auth.User where username == name
   in if attempt `matches` u.password && u.status is Active
        then issueSession u
        else Left AuthFailed
@@ -105,7 +105,7 @@ is rejected at compile time.
 ## Password Policy Rotation
 
 Rotating the hash algorithm or tightening the password rules is repointing `Password` at a
-new row in `system.crypto.hash_policies` — a schema commit against a populated field, which
+new row in `system.crypto.HashPolicy` — a schema commit against a populated field, which
 by the rule in [integrity.md](integrity.md#mode-is-mandatory-on-a-populated-field) must state
 an enforcement mode. It is `enforce forward`: existing credentials keep working, and every row
 under the superseded policy becomes a reportable violation.

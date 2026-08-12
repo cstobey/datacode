@@ -105,7 +105,7 @@ A structured form for defining and editing functors. Not a raw code editor — e
 - **Foreign key**: source table/field + target table/field + optional resolver config
 - **Path equivalence — data constraint**: two path selectors through the schema graph + description
 - **Path equivalence — access control**: token type selector + path condition builder. Same underlying functor as the data-constraint variety; the form differs only in that the left term is a token path
-- **Event**: queue table selector + handler functor selector + trigger condition. Blocked on the event functor surface syntax, which is not yet defined
+- **Event**: producing table + trigger condition + queue selector + payload builder, corresponding to `on <condition> emit <queue> { <payload> }`. The queue's own `handler` is edited on the queue table, not here — the two ends are separate declarations. A trigger over a `Behavior` should show the solved crossing moment as a preview; that half is blocked on OQ-034
 
 Advanced users can toggle to a raw DSL text editor for the expression. The IDE previews the functor's effect on sample data before saving.
 
@@ -121,7 +121,7 @@ detection without a place to look at the results is just a slower failure.
 - **Drill into a functor** to see affected rows, the schema node under which each violates,
   and whether the finding is `Derived`, `Observed`, or `Forced`.
 - **Waive, acknowledge, or raise** a violation — ordinary mutations against
-  `system.integrity.violations`, so the panel is a view over a table rather than a special
+  `system.integrity.Violation`, so the panel is a view over a table rather than a special
   API.
 - **Blast-radius preview** when editing a validation in the functor editor: before commit,
   the panel reports how many existing rows a proposed predicate would mark, which is what the

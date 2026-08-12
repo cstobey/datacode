@@ -48,7 +48,7 @@ The distinction determines whether any state has to be stored at all.
 | Storage | None required — it is a query | Must be written when observed |
 
 **Derivable nonconformance needs no state.** The authoritative definition is a query over the
-transaction graph, evaluated at a chosen schema node. `system.integrity.violations` is a
+transaction graph, evaluated at a chosen schema node. `system.integrity.Violation` is a
 **materialized view** over that query — pegged to a commit node, computed in the background,
 refreshable, and droppable without losing anything. This is the existing materialization
 machinery (see [storage.md](storage.md#materialized-views)), not a new mechanism, and it
@@ -82,8 +82,9 @@ is the correct mode for anything a user cannot be expected to know has changed �
 rule cannot retroactively rename people who are already logging in with the old name.
 
 `monitor` never rejects. `repair` is `monitor` plus an event-functor enqueue, so
-"fix it" and "watch it" are one mechanism rather than two. The queue binding is written in
-the provisional form below and will change with the event functor syntax (OQ-030).
+"fix it" and "watch it" are one mechanism rather than two. `into` names an ordinary queue
+table — the same binding `on … emit` makes, keeping a different spelling only because a
+repair's payload is fixed (it is the violating row) where `emit`'s is a literal.
 
 ### Ingestion Must Not Enforce
 
@@ -96,6 +97,38 @@ Connector-sourced tables therefore default every `app.*`-layer rule to `monitor`
 external data becomes a reportable violation instead of an outage. See
 [connectors.md](connectors.md#nonconforming-external-data).
 
+### Connector Tables Without a Source Key
+
+Enforcement mode covers what happens to *data* under a rule. It does not reach a rule that
+must exist at declaration time, and the mandatory candidate key
+([schema/tables.md](schema/tables.md#candidate-keys-are-mandatory)) is one of those: a shadow
+table over a MariaDB table with no primary key cannot declare a key at all, and no mode fixes
+that.
+
+So the requirement applies to tables a schema author declares. A generated connector shadow
+table carries [`Keyless`](schema/traits.md#keyless) automatically when the source has none —
+and the connector writes a violation recording why:
+
+```
+system.integrity.Violation {
+  subject_table = connectors.mariadb.production.LegacyAudit,
+  subject       = <the shadow table's schema node>,
+  functor       = system.schema.candidateKey,
+  origin        = Forced,
+  state         = Open
+}
+```
+
+`Forced` is exactly right here: it is how something is marked suspect when the reason is not
+expressible as a functor, and it is never closed by a view refresh. The effect is that "this
+table has no natural key" lands in the same review queue as everything else instead of being
+a waiver granted silently at schema generation time. An operator can waive it with a reason,
+and the waiver is itself in the audit trail.
+
+A **view** an author writes over a keyless connector table is an authored table and is not
+exempt. If the underlying rows cannot be identified, that is a fact worth being made to
+confront at declaration time rather than discovering during a merge.
+
 ## Declaring a Mode
 
 Mode is declared by a **statement addressed at the validation**, not by a clause inside the
@@ -105,7 +138,7 @@ Mode is declared by a **statement addressed at the validation**, not by a clause
 enforce app.auth.User.username / minLen12  always
 enforce app.auth.User.username / minLen12  forward
 monitor app.auth.User.username / minLen12
-repair  app.commerce.Order.total / isRoundedToCents into app.events.repair_queue
+repair  app.commerce.Order.total / isRoundedToCents into app.events.RepairQueue
 ```
 
 The address form is the one already established for validations
@@ -127,7 +160,7 @@ Three reasons the mode is a separate statement rather than a clause on the predi
 3. `where` blocks stay pure predicate lists, which is the Haskell shape they are meant to
    have.
 
-Mode statements are ordinary schema objects: rows in `system.integrity.modes`, committed to
+Mode statements are ordinary schema objects: rows in `system.integrity.Mode`, committed to
 the schema graph, versioned, and queryable like anything else.
 
 ### Mode Is Mandatory on a Populated Field
@@ -159,8 +192,8 @@ grandfather.
 ## The Violations Table
 
 ```
-table system.integrity.violations : LogData {
-  subject_table :> system.schema.tables,
+table system.integrity.Violation : LogData {
+  subject_table :> system.schema.Table,
   subject       : DataId,
   functor       : FunctorRef,
   schema_node   : DataId,
@@ -215,7 +248,7 @@ relative to a parent and stored in its subtree — and that is unavailable here 
   table, and a violation's subject may be a row in any table at all — the same polymorphism
   that forces `subject` to be a bare `DataId`.
 
-So `system.integrity.violations` is an ordinary `LogData` table sharded with its subject, and
+So `system.integrity.Violation` is an ordinary `LogData` table sharded with its subject, and
 the functor attachment is an FK. The per-functor report is a **materialized view grouped by
 `functor`** — computed in the background, pegged to a commit node, and cheap to read
 repeatedly, which is what a dashboard actually needs. The grouping cost is paid once per
@@ -251,24 +284,24 @@ show violations shard user.commerce
 ```
 
 Everything else is an ordinary query or mutation, because
-`system.integrity.violations` is an ordinary table and the
+`system.integrity.Violation` is an ordinary table and the
 [self-hosting principle](schema/README.md#self-hosting-principle) says system concerns that
 can be expressed as tables should be:
 
 ```
 -- What is open, worst first
-system.integrity.violations
+system.integrity.Violation
   where state is Open
   group functor
   { functor, violations.subject count as affected }
   order by affected desc
 
 -- Waive one, with a reason
-system.integrity.violations where id == "05KG3N0000ZQ8V4T1H7C"
+system.integrity.Violation where id == "05KG3N0000ZQ8V4T1H7C"
   { state = Waived "legacy import, tracked in TICKET-4471" }
 
 -- Raise one by hand against a row that passes every automated rule
-system.integrity.violations {
+system.integrity.Violation {
   subject_table = app.auth.User,
   subject       = "05KG3N0001BB2M9X4E",
   functor       = app.auth.User.manualReview,
@@ -302,9 +335,42 @@ row, reported out of band; it is not a change to the row's value or its type.
 **Not a blocker for reads.** No mode causes a read to fail or a field to disappear. Access
 control is the only thing that changes what a read returns.
 
-## Open Points
+## Retention
 
-- Retention: violations carry the `LogData` trait and are prunable, but an `Observed`
-  violation cannot be reconstructed after pruning. See OQ-032.
-- The `repair into <queue>` binding is provisional pending the event functor syntax
-  (OQ-030).
+`system.integrity.Violation` carries `LogData`, so it is prunable — but the two classes of
+violation are not equally recoverable, and a single age-based policy would destroy the ones
+that matter most. Retention is therefore declared **by predicate**, using the ordered branch
+form in [schema/aggregates.md](schema/aggregates.md#branches):
+
+```
+retain system.integrity.Violation
+  where origin is Derived && state is Repaired
+    for 90 days
+    , drop
+  otherwise
+    forever
+```
+
+A `Derived` violation is a query over the transaction graph, recomputable at any time, and
+once it is `Repaired` the repair is visible in the subject row's own history — so discarding a
+closed one loses nothing that cannot be recovered.
+
+Everything else falls to `otherwise forever`:
+
+- **`Observed`** violations have no reconstructable witness. The plaintext that failed the
+  policy existed only during a login attempt.
+- **`Forced`** violations were raised by an operator for a reason not expressible as a functor,
+  so nothing can re-derive them.
+- **`Waived`** violations carry the waiver and its reason, which is itself part of the audit
+  trail. `Waived "legacy import, tracked in TICKET-4471"` is precisely the record someone
+  wants two years later, and pruning it destroys the evidence that a decision was made.
+
+This satisfies the constraint that made retention an open question: pruning the log shard can
+no longer silently destroy audit evidence, because it is not a manual operation at all. Log
+data is discarded only by a declared chain, and a `LogData` table with no chain is never
+pruned. See
+[schema/aggregates.md](schema/aggregates.md#pruning-is-only-ever-a-consequence).
+
+A useful consequence in the other direction: once a violation is resolved and pruned, the
+transaction records that only existed to carry it can be compacted too, by the ordinary
+maintenance path rather than a special case.

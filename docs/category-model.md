@@ -89,6 +89,43 @@ Three properties follow, and none of them is an added feature:
 
 The operational treatment is in [integrity.md](integrity.md).
 
+## Denotative Time
+
+DataCode is a **denotative, continuous-time** system in Conal Elliott's sense: every construct
+has a meaning as a mathematical function, independent of how it is evaluated, and time is a
+continuum that computations are parameterised over rather than a clock they consult.
+
+Three prohibitions that were adopted for unrelated reasons turn out to be exactly the
+discipline this requires, which is why it fits rather than being retrofitted:
+
+| Existing rule | What it buys |
+|---|---|
+| `a -> IO b` rejected at schema commit | No functor can read the clock. Time can only arrive as a parameter — the whole denotative discipline, already enforced. |
+| Append-only, no in-place update, idempotent records | A row's history *is* `Event a ≅ [(Time, a)]`. Not an analogy; it is the storage format. |
+| Views are queries pegged to a commit node | Materialisation is already sample-at-a-point, not cached mutable state. |
+
+The two FRP primitives are therefore already present. `Event a` is the transaction log
+filtered to a subject. `Behavior a ≅ Moment -> a` is what a query's `at` clause has always
+computed for stored fields — the value of a row at a chosen point — generalised so that a
+field may vary between writes as well as at them. See
+[schema/types.md](schema/types.md#behaviors).
+
+What the framing adds is not expressiveness but *closure*. A stored field changes only when
+something writes it, so "when does this become true?" has been answerable only by polling. A
+behavior is a function, so the question has a solution rather than a search, and the event
+scheduler can ask it directly. That is what makes an external event functor a declaration on
+the table it belongs to instead of a queue row someone remembered to insert
+([events.md](events.md#triggering-an-event)).
+
+The restriction to a closed-form-solvable class of behaviors follows from the same place. An
+arbitrary `Moment -> a` can be sampled but not solved, and a scheduler that can only sample is
+a poller. The class is a constraint on the *category*, not a performance concession: it is
+what keeps "when does this condition first hold?" a morphism rather than a procedure.
+
+A behavior is not a functor of any of the four kinds. It enforces nothing, rejects nothing,
+and enqueues nothing — it is a projection, and specifically the field-scoped computed type
+that a field declaration already creates.
+
 ## Path Equivalence (David Spivak Model)
 
 A schema is a **finitely presented category** where:

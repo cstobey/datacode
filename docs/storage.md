@@ -110,7 +110,34 @@ Materialized views are pegged to **specific commit nodes** in the transaction gr
 - Large analytical queries can be distributed across neighbouring servers
 - The computation of a materialized view can be shared between neighbours (distribute the work, merge the results)
 
+### Refresh Is Incremental Only If the View Has a Meaningful Key
+
+A view's candidate key is derived from its sources rather than declared
+([schema/queries.md](schema/queries.md#view-keys-are-computed-never-declared)), and which kind
+of key it derives decides how the view can be maintained:
+
+| Derived key | Refresh |
+|---|---|
+| Meaningful — a proper subset identifying an entity | **Incremental.** The key says which row a recomputed one replaces, so a refresh upserts only what changed. |
+| Degenerate — all attributes | **Full only.** Nothing identifies a row across recomputations, so the extent is rebuilt. |
+
+This is the same idempotence property that lets a retention rollup play catch-up without
+duplicating buckets ([schema/aggregates.md](schema/aggregates.md#what-gets-generated)) — a
+keyed derived table can be recomputed for any window and merged, an unkeyed one cannot.
+
+It also decides whether a view can outlive its sources. An incrementally-maintainable view has
+an existence independent of its sources' full extent and is a candidate to replace them, which
+is what a rollup level does when it supersedes the raw table. A degenerate view can only be
+rebuilt by rescanning, so it pins its sources in place and `deprecate` on them is rejected
+until the view is altered or deprecated.
+
 Views are just table definitions — the distinction between a "live" table and a
 "materialized view" is a storage hint, not a schema-level distinction. See
 [schema/queries.md](schema/queries.md) for the syntax and
 [distribution.md](distribution.md) for the cooperative computation protocol.
+
+**Retention rollups are not materialized views**, despite being computed in the background the
+same way. A materialized view is recomputable from its source by definition, and a rollup's
+source is pruned as soon as the rollup exists. Rollup levels are therefore real tables with
+their own entries in the append-only log. See
+[schema/aggregates.md](schema/aggregates.md#a-rollup-is-two-appends-not-a-rewrite).

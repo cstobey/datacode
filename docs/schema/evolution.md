@@ -91,6 +91,33 @@ deprecate Customer.phone    -- hide a single field
 prune Customer              -- permanently remove data (only valid once no live references remain)
 ```
 
+`prune` removes schema objects and orphaned branches. It does **not** remove log rows: a
+`LogData` table is discarded only by a `retain` chain, and one with no chain is never pruned
+at all. See [aggregates.md](aggregates.md#pruning-is-only-ever-a-consequence).
+
+### A Degenerate Dependent View Blocks Deprecation
+
+Whether a view can survive its sources being retired depends on the key the system derives for
+it ([queries.md](queries.md#view-keys-are-computed-never-declared)):
+
+- A view with a **meaningful** key can be maintained incrementally, so it has an existence
+  independent of its sources' full extent. It is a **candidate to replace them** — the general
+  form of what a retention chain does when an aggregate supersedes the raw table it summarizes.
+- A view with a **degenerate** key can only ever be rebuilt by rescanning. Deprecating its
+  source would strand it with no way to refresh or reconcile.
+
+So `deprecate` on a table with a degraded dependent view is rejected:
+
+```
+datacode[app.commerce]> deprecate app.commerce.Order
+error: app.commerce.OrderSummary depends on app.commerce.Order and has a degenerate key,
+       so it cannot be maintained without rescanning it.
+       Project `customer` and `order_num` into the view, or deprecate the view first.
+```
+
+Alter the view to carry its sources' key columns, or deprecate the view first. A degenerate
+key is not merely untidy — it pins the schema.
+
 ## Table Split and Merge
 
 ```

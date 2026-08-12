@@ -77,8 +77,33 @@ Both are covered in [README.md](README.md#backticks-and-) and specified in
 Standard library always available (no import needed): `Data.Text`, `Data.Time`,
 `Data.Maybe`, `Data.List`, `Data.Map`, `Text.Regex.TDFA`, standard numeric packages.
 
+### Time Is a Parameter, Never a Read
+
+`Data.Time`'s pure functions are available; its clock functions are not, because
+`getCurrentTime :: IO UTCTime` is an `a -> IO b` and is rejected by the rule above. That
+rejection is doing more work than it appears to:
+
+- A validation functor that reads the clock is not replayable, and the transaction graph
+  guarantees that applying a transaction twice produces the same state.
+- A materialized view that reads the clock cannot be recomputed, and derivable nonconformance
+  depends on recomputation being exact (see [../integrity.md](../integrity.md)).
+- A [behavior](types.md#behaviors) that read the clock would not be a function of time at all.
+
+So a computation that needs the current time takes it as a parameter. Queries supply it as
+the sample moment ([queries.md](queries.md#every-query-has-a-sample-moment)); behaviors take
+it as their `Moment` argument.
+
+`Duration` conversions are ordinary stdlib functions:
+
+```
+days, hours, minutes, seconds, millis :: Duration -> Decimal
+```
+
+Write them at the use site — `rate * days (t - opened_at)` — so the unit a rate is expressed
+in is visible next to the rate.
+
 Extra packages require `import` at the schema file level. The allowed package list is
-managed by admins in `system.config.allowed_packages`.
+managed by admins in `system.config.AllowedPackage`.
 
 ## Trait Functions
 

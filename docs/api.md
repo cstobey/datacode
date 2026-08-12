@@ -15,7 +15,7 @@ Every route — auto-generated and custom — is prefixed with the schema versio
 was registered:
 
 ```
-/v{N}/records/app.commerce.orders      -- auto-generated CRUD at version N
+/v{N}/records/app.commerce.Order      -- auto-generated CRUD at version N
 /v{N}/api/orders/{id}/ship             -- custom endpoint at version N
 ```
 
@@ -38,10 +38,10 @@ interchangeable in URL paths. See [transaction-graph.md](transaction-graph.md).
 The auto-generated API is driven by a system table — one row per exposed table or view:
 
 ```
-table system.api.generated_routes {
-  table_ref   : TableRef,     -- which table or view to expose
-  methods     : [HttpMethod], -- which HTTP methods to expose (default: all)
-  format_ref  : FormatRef,    -- which format functor to use
+table system.api.GeneratedRoute : Configuration {
+  table_ref   : TableRef unique,  -- which table or view to expose; one row each
+  methods     : [HttpMethod],     -- which HTTP methods to expose (default: all)
+  format_ref  : FormatRef,        -- which format functor to use
   enabled     : Bool
 }
 ```
@@ -50,8 +50,8 @@ The response format is determined by a second system table of **format functors*
 pluggable representations of the same underlying data:
 
 ```
-table system.api.format_functors {
-  name        : Text,        -- e.g. "json-flat", "graphql", "csv"
+table system.api.FormatFunctor : Configuration {
+  name        : Text unique, -- e.g. "json-flat", "graphql", "csv"
   functor_ref : FunctorRef   -- functor that transforms query results into the wire format
 }
 ```
@@ -66,8 +66,8 @@ User-defined endpoints are rows in a system table. Each row defines a URL templa
 functor to invoke per HTTP method:
 
 ```
-table system.api.custom_routes {
-  route_template : Text,            -- e.g. "/orders/{id}/ship"
+table system.api.CustomRoute : Configuration {
+  route_template : Text unique,     -- e.g. "/orders/{id}/ship"
   get_functor    : FunctorRef | NotAllowed,
   post_functor   : FunctorRef | NotAllowed,
   put_functor    : FunctorRef | NotAllowed,
@@ -79,6 +79,10 @@ table system.api.custom_routes {
 `NotAllowed` means that HTTP method returns 405 on that route. A route with only
 `post_functor` set is a write-only endpoint.
 
+`route_template` is the table's candidate key, which is also what makes exact-path conflicts a
+schema validation error at insert time rather than a bespoke check — the trie's handler slot
+can only hold one handler, and the key says so (see OQ-028 and OQ-029).
+
 Each referenced functor is an **API functor**: it receives the extracted path parameters and
 request body (if present), performs reads and/or writes within a single transaction, and
 returns a response value. Authentication and authorization apply automatically (see below).
@@ -87,13 +91,13 @@ There is no separate API functor type — field types are referenced directly fr
 schema everywhere they are used. Auto-generated routes are fully typed by the table
 definition.
 
-Inserting or updating a row in `system.api.custom_routes` takes effect immediately — the
+Inserting or updating a row in `system.api.CustomRoute` takes effect immediately — the
 WAI dispatch table is updated as part of committing the transaction, with no server restart.
 
 ## Route Conflict Resolution
 
 Custom routes shadow auto-generated routes at the same path. If a custom route is registered
-at `/records/app.commerce.orders/{id}`, it handles all requests to that path — the
+at `/records/app.commerce.Order/{id}`, it handles all requests to that path — the
 auto-generated handler is bypassed for that schema version. Removing the custom route
 restores auto-generated behavior.
 
@@ -102,8 +106,8 @@ handler. Custom routes whose template starts with `raw/` are rejected at insert 
 guarantees auto-generated CRUD is always reachable regardless of custom route registrations:
 
 ```
-GET /v{N}/records/app.commerce.orders/{id}  -- custom handler if registered; auto-generated otherwise
-GET /v{N}/raw/app.commerce.orders/{id}      -- always auto-generated
+GET /v{N}/records/app.commerce.Order/{id}  -- custom handler if registered; auto-generated otherwise
+GET /v{N}/raw/app.commerce.Order/{id}      -- always auto-generated
 ```
 
 **Path validation**: A custom route registered under the `/records/` prefix must reference a
@@ -142,7 +146,7 @@ unauthenticated DataCode endpoint.
 
 **Authorization** is automatic and derived from the access control functors on the tables
 the API functor accesses. No per-route permission declaration exists: if the functor reads
-`app.commerce.orders`, the same access control functors apply as if the caller had queried
+`app.commerce.Order`, the same access control functors apply as if the caller had queried
 that table directly. A custom functor that reads multiple tables must satisfy the access
 control functors on all of them.
 
@@ -168,13 +172,13 @@ Haskell route tables are incompatible with runtime registration).
 
 ## HTTP Request Logging
 
-Every HTTP request to any DataCode endpoint is logged to `system.logs.http_requests` — a
+Every HTTP request to any DataCode endpoint is logged to `system.logs.HttpRequest` — a
 per-server `LogData`-type shard. This write is **independent of the main transaction**: it
 succeeds whether the transaction commits, is rejected, or errors. It is the only write that
 DataCode guarantees on every request path.
 
 ```
-table system.logs.http_requests : LogData {
+table system.logs.HttpRequest : LogData {
   server_id     : ServerId,
   received_at   : Timestamp,
   method        : HttpMethod,

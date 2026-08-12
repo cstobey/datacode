@@ -7,11 +7,12 @@ than restating it.
 
 | Document | Covers |
 |---|---|
-| [types.md](types.md) | Primitives, domain types, sum and product types, absence types, `is`, `Secret`, `Hashed` |
-| [tables.md](tables.md) | Table bodies, field declarations, defaults, `unique`, ordering, foreign keys, sub-tables |
-| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Extensible` |
+| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, absence types, `is`, `Secret`, `Hashed` |
+| [tables.md](tables.md) | Table bodies, field declarations, defaults, candidate keys, ordering, foreign keys, sub-tables |
+| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
 | [constraints.md](constraints.md) | `assert`, path equivalence, access control |
 | [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill |
+| [aggregates.md](aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
 | [evolution.md](evolution.md) | Redeclaration, rename, deprecate, prune, split, merge, ADT extension, visibility |
 | [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, views, mutation |
 | [functions.md](functions.md) | Scope, Haskell functions, auto-wrapping, imports |
@@ -41,14 +42,14 @@ DataCode schemas are closer to TutorialD than SQL. The core shift:
 
 Every system concern that can be expressed as a table, should be. This includes:
 
-- **API route registrations** — rows in `system.api.generated_routes` and `system.api.custom_routes`
+- **API route registrations** — rows in `system.api.GeneratedRoute` and `system.api.CustomRoute`
 - **Connector configurations** — rows in `system.connectors.*`
-- **Event queues** — rows in `system.events.items` (and user-defined queue tables in `app.*`)
+- **Event queues** — rows in `system.events.Item` (and user-defined queue tables in `app.*`)
 - **Scheduler state** — rows in `system.events.*`
 - **Auth tokens and sessions** — rows in `system.auth.*`
-- **Schema version promotions** — rows in `system.branches` and `system.tags`
+- **Schema version promotions** — rows in `system.VersionRef` (branches and tags share one table; the `VersionRef` ADT encodes which)
 - **Operational metrics and logs** — rows in `system.logs.*` (logs shard, prunable)
-- **HTTP request logs** — rows in `system.logs.http_requests` (per-server log shard)
+- **HTTP request logs** — rows in `system.logs.HttpRequest` (per-server log shard)
 
 The practical consequences:
 
@@ -61,9 +62,9 @@ The practical consequences:
 
 Every table belongs to a namespace. Namespaces are dot-separated hierarchical paths:
 
-- `app.commerce.orders` — user-defined application schema
-- `connectors.mariadb.production.orders` — auto-generated connector shadow schema
-- `system.auth.users` — DataCode self-management tables
+- `app.commerce.Order` — user-defined application schema
+- `connectors.mariadb.production.Order` — auto-generated connector shadow schema
+- `system.auth.User` — DataCode self-management tables
 
 Namespaces are created implicitly when a table is first defined in them — no explicit
 creation syntax. Full namespace documentation: [../namespaces.md](../namespaces.md).
@@ -82,8 +83,33 @@ functors between the layers.
 
 ## Notation Conventions
 
-Three conventions recur throughout the language. They are defined once here and assumed
+These conventions recur throughout the language. They are defined once here and assumed
 everywhere else.
+
+### Capitalization
+
+Follows Haskell: the things that name a *kind* are capitalized, the things that name an
+*instance or a member* are not.
+
+| Kind of name | Form | Examples |
+|---|---|---|
+| Type, trait, table, view | `UpperCamelCase`, **singular** | `Email`, `Amount`, `Active`, `UserData`, `Order`, `Customer` |
+| Sum-type variant | `UpperCamelCase` | `Shipped`, `NotGiven`, `Argon2id` |
+| Field | `lower_snake_case` | `order_num`, `placed_at`, `billing_address` |
+| Function, predicate, constraint name | `lowerCamelCase` | `isValidEmail`, `matches`, `orderRef`, `billingMatch` |
+| Namespace segment | `lowercase` | `app`, `commerce`, `system`, `auth` |
+
+So a fully-qualified name reads `app.commerce.Order` — lowercase path, capitalized table.
+
+**Tables are capitalized because they are types.** `table T : Trait` uses the same `:` that
+`type A : B` does, `:>` resolves to a row *of* that table, and a table is an object in the
+schema category exactly as a type is. Singular follows from the same place: a row is an
+`Order`, not an `Orders`.
+
+**Fields are `snake_case` while functions are `camelCase`**, and the split is deliberate
+rather than an accident of drift. A field names stored data and reads as a column; a function
+is code and reads as Haskell. `total : Amount where isRoundedToCents` puts both conventions in
+one line, and each looks like what it is.
 
 ### `:` versus `:>`
 

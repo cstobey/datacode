@@ -92,24 +92,22 @@ Fully-qualified names work the same way:
 assert app.commerce.Order.billingMatch { customer.billing_address == bill_addr }
 ```
 
-## Event Assertions — Syntax TBD
+## Events Are Not Assertions
 
-`assert event` links a queue table to the connector functor that processes it:
+An event registration declares a deferred side effect, not an invariant, so it is not written
+with `assert`. It has its own statement:
 
 ```
-table app.events.email_queue {
-  recipient : Email,
-  template  : EmailTemplate,
-  payload   : Doc,
-  assert event { system.connectors.email.SendFunctor }
-}
+on status is Shipped emit app.events.EmailQueue { recipient = customer.email, ... }
 ```
 
-**This form is a placeholder.** An event registration is not an assertion — it declares a
-deferred side effect, not an invariant — and this syntax carries no trigger condition, queue
-binding, or retry policy. The event functor is a real and settled part of the model; only
-its surface syntax is outstanding. See [../events.md](../events.md) and
-[functors.md](functors.md#event-functor).
+`assert` states something that must always hold and can abort a commit. `on … emit` states
+something that should happen once a condition starts holding, and can never abort anything —
+inserting the queue row *is* the commit. Conflating them was the defect in the earlier
+`assert event` placeholder, which this replaces. See [../events.md](../events.md#triggering-an-event).
+
+The name `event` is consequently no longer special to `assert`. An `assert` named `event` is
+an ordinary data constraint like any other non-`access` name.
 
 ## Implementation
 

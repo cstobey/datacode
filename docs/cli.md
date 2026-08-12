@@ -157,8 +157,8 @@ See [auth.md](auth.md).
 
 ```
 show materialized views shard user.commerce
-refresh view app.reporting.monthly_summary at "schema-txn-abc123"
-drop materialized view app.reporting.monthly_summary
+refresh view app.reporting.MonthlySummary at "schema-txn-abc123"
+drop materialized view app.reporting.MonthlySummary
 ```
 
 ### Transaction Log Inspection
@@ -181,10 +181,10 @@ show violations shard user.commerce
 This is the only integrity command with dedicated syntax, and it exists for the degraded
 case where the query engine is all that is working. Everything else — waiving a violation,
 acknowledging one, raising one by hand — is an ordinary mutation against
-`system.integrity.violations`, because it is an ordinary table:
+`system.integrity.Violation`, because it is an ordinary table:
 
 ```
-system.integrity.violations where id == "05KG..." { state = Waived "legacy import, TICKET-4471" }
+system.integrity.Violation where id == "05KG..." { state = Waived "legacy import, TICKET-4471" }
 ```
 
 Enforcement modes are schema statements, not admin commands, so they are typed at the REPL
@@ -266,8 +266,10 @@ table app.commerce.Customer : UserData {
 
 table app.commerce.Order : UserData {
   customer  :> Customer,
+  order_num : Int,
   total     : Amount,
   status    : Pending | Processing | Shipped | Cancelled = Pending,
+  unique orderRef { customer, order_num },
   order by placed_at desc,
 
   assert access { user.id == customer.user_id }

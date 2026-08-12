@@ -57,6 +57,14 @@ When a shard's data volume crosses a threshold, it splits:
 3. New child shards begin accepting writes; parent shard becomes read-only at the split point
 4. All servers that had the parent shard receive notification and begin syncing the child shards
 
+The partition function ranges over **shard root rows**, and the key it partitions on is the
+root table's candidate key — which is why that key is mandatory and why every other key in the
+shard must reach the root through its foreign-key chain. A dependent row's placement is
+therefore decided by the same split that placed its root, and no split can separate a row from
+the root it is keyed against. See
+[transaction-graph.md](transaction-graph.md#shard-roots) and
+[schema/tables.md](schema/tables.md#keys-must-be-rooted).
+
 ## Materialized View Distribution
 
 Materialized views are maintained independently per server but can be computed cooperatively:

@@ -29,7 +29,7 @@ references and `where` for validation:
 
 ```
 trait Owned {
-  owner :> system.auth.users,
+  owner :> system.auth.User,
   claimed_at : Timestamp | Pending
 }
 ```
@@ -42,7 +42,7 @@ here is a list of traits, never types or tables.
 
 ```
 table app.commerce.Customer : Active, UserData {
-  email : Email,
+  email : Email unique,
   name  : Text
 }
 
@@ -104,6 +104,12 @@ extending one of these.
 | `LogData` | Server-local, prunable | Very high |
 | `Component` | Wherever the parent is | Bounded by the parent |
 
+`LogData` means **prunable, not pruned**. A `LogData` table is discarded only by a `retain`
+chain, and one with no `retain` statement is never discarded at all — silence means keep,
+because "prune the log shard" is the operation most likely to be run under pressure. It is
+also the trait that exempts a table from needing a candidate key, and the two facts have the
+same root: its rows are occurrences. See [aggregates.md](aggregates.md).
+
 Built-in replication traits are regular traits — user-defined traits can extend them
 freely:
 
@@ -113,7 +119,7 @@ trait Catalog : Reference {
 }
 
 table app.commerce.Product : Catalog, Active {
-  name  : Text,
+  name  : Text unique,
   price : Amount
 }
 -- Product replicates to all servers (inherits Reference via Catalog)
@@ -138,6 +144,7 @@ The existing "one replication base trait per hierarchy" rule therefore applies u
 
 ```
 table app.commerce.Customer : UserData {
+  email   : Email unique,
   address :> Address {           -- inline sub-table, as always
     street : Text,
     city   : Text,
@@ -178,6 +185,37 @@ moving one, not changing one.
 Nesting is permitted and appends another ordinal per level. Because every descendant shares
 the parent's byte prefix, an entire component subtree is one contiguous LMDB range scan; this
 is what makes [documents.md](documents.md) practical.
+
+## `Keyless`
+
+`Keyless` is a marker trait — no fields, no functions — that waives the mandatory candidate
+key (see [tables.md](tables.md#candidate-keys-are-mandatory)):
+
+```
+table app.staging.Import : UserData, Keyless {
+  received_at : Timestamp,
+  payload     : Doc
+}
+```
+
+It is not a replication trait and occupies no slot; it composes with whichever one the table
+already carries.
+
+The polarity is deliberate. A rule you have to remember to opt into is absent from exactly
+the table that most needed it, so the key requirement is on by default and `Keyless` is the
+waiver. This is the same shape as enforcement modes, where `enforce always` is the default
+and weakening it is an explicit, recorded act ([../integrity.md](../integrity.md)) — and it
+is the opposite polarity from `Extensible` below, because extensibility is a capability you
+choose and keylessness is a defect you are admitting.
+
+`Keyless` is written on a table whose rows genuinely have no natural identity. It is not for
+a table whose key is merely inconvenient to work out; a table that has a key and does not
+declare it silently loses merge reconciliation, upsert-by-key, and a defined default
+ordering.
+
+Connector shadow tables carry `Keyless` automatically when the external source has no primary
+key, and the connector records why — see
+[../integrity.md](../integrity.md#connector-tables-without-a-source-key).
 
 ## `Reference` Tables Are Code
 
@@ -241,6 +279,40 @@ trait DocKeys : Reference, Extensible {
 
 Key tables are generated per field. See
 [documents.md](documents.md#keys-are-interned-per-field).
+
+## Behaviors in Traits
+
+A [behavior](types.md#behaviors) closes over the row's stored fields, so a reusable behavior
+has to be able to *require* those fields. That is what a trait already does, which is why
+behaviors are shared through traits rather than through a behavior-carrying type:
+
+```
+trait Accruing {
+  principal : Amount,
+  rate      : Rate,
+  opened_at : Timestamp,
+
+  balance : Behavior Amount = \t -> principal * (1 + rate * days (t - opened_at))
+}
+
+table app.billing.Loan       : Accruing, UserData { customer :> Customer, ... }
+table app.billing.CreditLine : Accruing, UserData { customer :> Customer, ... }
+```
+
+A type cannot do this. `type AccruedBalance : Amount` has no way to name `principal` on a
+table it has never seen — it would have to demand those fields, and demanding fields is a
+trait. Compound interest is therefore written once and extended, and no new mechanism is
+needed for it.
+
+A behavior is **not** a fifth functor kind. The four kinds each enforce something: validation
+rejects, foreign keys resolve, path equivalence asserts, events enqueue. A behavior does none
+of them — it is a projection, and specifically it is the field-scoped computed type that `:`
+already creates at `<namespace>.<table>.<field>`, whose inhabitants happen to be functions of
+`Moment`. See [functors.md](functors.md).
+
+Behaviors merge across multiple inheritance the same way fields do: two traits defining the
+same behavior name is a conflict the concrete table must resolve, by rename or by
+redeclaration.
 
 ## UI Template Hints
 
