@@ -256,6 +256,27 @@ That default is deliberate. `prune the log shard` is the operation most likely t
 under pressure, and it must not be able to silently destroy evidence that cannot be
 reconstructed. Silence means keep.
 
+### Retention Prunes Whole Segments
+
+A `LogData` shard is rooted at a `system.shards.LogSegment` row keyed by
+`{ server, period_start, branch }`
+([../transaction-graph.md](../transaction-graph.md#logdata-shard-roots)), where `branch` is the
+index of the matching `retain` branch. A branch predicate may reference only the aggregate's
+group fields and the time source, so the branch is decidable when the row is written, and no
+segment ever holds rows with two different expiries.
+
+An expiring step therefore usually covers a **whole sealed segment**, and pruning it is an
+unlink of that segment's extents plus one prune node — not a row scan. Row-level pruning
+remains the fallback for segments written before a branch was added or the period changed:
+routing is decided at write time and never revised, the same forward-only rule that governs
+every other retention edit above.
+
+**None of this is syntax.** There is no partition clause on `retain`. A `shard by <grain>`
+header clause was considered and rejected: the segment key already supplies the alignment it
+would have declared. The period and the size thresholds are `Configuration` rows, and a table
+with no `retain` statement is still partitioned — it is simply never pruned. *Silence means
+keep* must not be allowed to become *silence means one unbounded shard*.
+
 ### A Rollup Is Two Appends, Not a Rewrite
 
 Rolling up writes aggregate rows in a new transaction, then records a prune node covering the

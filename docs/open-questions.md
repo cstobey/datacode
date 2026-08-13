@@ -74,6 +74,73 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 - **Integration**: replace `IORef (Map String Application)` in the Servant `Raw` handler with `IORef (RouteTrie Application)`. Schema changes rebuild the trie and atomically swap the IORef — zero request interruption.
 - **Conflict resolution** (answers OQ-028 partially): exact-path conflicts are a schema validation error at insert time. The trie's `nodeHandler` slot can only hold one handler; inserting a duplicate pattern is rejected.
 
+### OQ-036: Erasure, PII Scrubbing, and Shard Quarantine
+**Question**: By what mechanism does data leave DataCode permanently, and what does the system
+look like afterwards?
+
+Every existing removal path is deliberately incapable of this. `delete` appends a tombstone and
+the row stays readable at earlier moments. `prune` removes schema objects and orphaned
+branches. `retain`/`drop` discards `LogData` only, never manually. Relocation preserves
+everything by construction. "No subsequent operation can remove it" is stated as a *hazard* in
+`integrity.md` about a plaintext credential reaching the log — which is the admission that the
+capability is missing rather than merely unbuilt.
+
+It is needed for three concrete cases: a subject-erasure request, a credential or key that
+reached the log, and PII an unvetted connector ingested. **This is placed before core code
+rather than during it** because one of the candidate mechanisms decides the on-disk log format,
+and retrofitting it is a rewrite.
+
+**Unit.** Shards are row-rooted, so "erase this customer" is already a natural unit — the shard
+that customer's row roots. Whether erasure is offered at field, row, or shard granularity, and
+whether the narrower ones are anything more than a shard-level operation with extra steps, is
+undecided. Field-level is the case a connector-ingested column wants; shard-level is the case a
+subject-erasure request wants.
+
+**Mechanism.** Two candidates, and they are not close in cost:
+
+- **Overwrite in place.** Zero the payload bytes in the log extent and rewrite the affected
+  `log_index` entries. Simple, but it is the one operation that mutates a written extent, and
+  every argument for the append-only log is an argument against admitting it.
+- **Crypto-shredding.** Encrypt each shard under its own key and destroy the key. The log stays
+  byte-immutable and erasure becomes a deletion in a key table, which is a thing the system
+  already knows how to do and to replicate. The cost is that it puts a cipher between mmap and
+  the Cap'n Proto message, and the zero-copy read path (`storage.md`) is a load-bearing claim
+  that would have to be re-argued or scoped to encrypted-shards-only.
+
+Crypto-shredding aligns suspiciously well with row-rooted shards — one key per shard root *is*
+one key per customer — which is the argument for taking it seriously despite the read-path
+cost.
+
+**Quarantine is the weaker sibling and may be the more common one.** Marking a shard
+unreadable and unreplicated pending review destroys nothing and is reversible, which is what an
+operator actually wants in the first hour of an incident. Whether it is a distinct mechanism or
+the mandatory first step of erasure is undecided; it is also cheap enough that it might be
+answerable ahead of the rest.
+
+**Open sub-questions beyond mechanism:**
+
+- **What a read returns afterwards.** It wants a `Null`-derived type, but `Redacted` is already
+  taken by access-control denial (OQ-005) and means "you may not see this", not "this no longer
+  exists". `Erased` is the obvious spelling.
+- **Replication.** An erasure must propagate and must not be optional — a tertiary that missed
+  it still holds the data. A prune node is already a recorded graph node, so there is a shape
+  to copy, but prune is advisory in a way this cannot be.
+- **Derived state.** Materialized views, `Doc indexed` shredded trees, LMDB indexes, and
+  `system.integrity.Violation.observed` all hold copies. Rollup levels are the hard case: the
+  source is pruned by the time the rollup exists, so the rollup is the only record and may
+  itself carry the PII.
+- **Exports and backups.** `export shard … to` (`cli.md`) writes bytes outside the system
+  entirely, and no in-system mechanism reaches them. Whether that is in scope or is documented
+  as an operator obligation needs deciding, not ignoring.
+- **Authorization and audit.** Erasure is the one act that destroys evidence, so the record
+  *that* it happened, who ordered it, and under what authority has to survive it — analogous to
+  a `Waived` violation carrying its reason.
+
+**Constraint**: whatever is chosen must not become a general edit primitive. It is the single
+exception to "nothing is destroyed", it must be recorded as a graph node the way a prune node
+is, and it must be impossible to reach from the query language — which is why `delete!` was
+withdrawn rather than given these semantics (OQ-005, `schema/queries.md`).
+
 ## Must Resolve During Core Development
 
 ### OQ-005: Schema DSL Syntax ✓ ANSWERED
@@ -107,6 +174,10 @@ Key decisions:
 - **Retention and rollups**: `aggregate <Name> = <query>` declares what to compute; `retain <Table> as <Name>` declares a chain of resolutions and how long each is kept. A chain never reshapes, which is why the aggregate is named once on the header — a differing step is unrepresentable rather than rejected. Terminals are `forever` (keep) and `drop` (discard); `never` was rejected because in a construct full of durations it reads as "never delete". Ordered `where`/`otherwise` branches partition a table, first match wins, as in a Haskell guard — one block rather than N statements, because order is load-bearing and separate statements have no reliable order. Chain aggregates must declare an associative merge with an identity (`count`/`sum`/`min`/`max` do; `avg` is silently rewritten to `(sum, count)`; `percentile` cannot and is rejected past one step) — phrased as a rule about merges rather than a whitelist so sketch types drop in later. `bucket_start` is injected into every generated level and `grain` is a virtual column, so `RequestRollup where grain == hour` selects a level with no new query syntax; the aggregate's plain name is the union view over all levels, making transparent querying the default and reaching into one level the marked case. **Pruning `LogData` is only ever a consequence of a chain** — there is no manual prune, and a table with no chain is never pruned, which is what closes OQ-032 structurally. A rollup is two appends (aggregate rows, then a prune node), never a rewrite of the transaction being summarized. Rollup levels are consequently real tables, not materialized views: a materialized view is recomputable from its source by definition, and here the source is gone.
 - **View keys are derived, never declared.** A `unique` declaration in a view body is rejected. Every view has a key — a table is a set of tuples, so at worst the whole tuple is one — which makes *existence* the wrong question and **meaningful** (a proper subset identifying an entity) versus **degenerate** (all attributes) the right one. Propagation: `where` preserves; projection preserves iff every key column survives, else degenerates; `group` yields the group columns exactly, and exactly rather than approximately because DataCode's `group` nests instead of aggregating away; a `:>` join yields the referencing side's key alone and is lossless, with FK fields substituting to the referent's key so the key survives the FK column being projected away; a non-key join yields the union; a union of relations needs a discriminator that may not exist; an outer join degenerates when a key column comes from the outer side, for the same reason a declared key may not contain a `Null`-derived variant. Degeneracy is a **warning, not an error** — reporting views legitimately have no entity identity — but never silent, because a view claiming an identity it lacks would be trusted by merge reconciliation. Two things depend on the answer: a meaningful key admits **incremental refresh** (upsert by key) where a degenerate one admits only full recomputation; and an incrementally-maintainable view is a **candidate to replace its sources** — the general form of a retention chain superseding its raw table — while a degenerate one pins them, so `deprecate` on a source with a degraded dependent view is rejected until the view is altered or deprecated.
 - **Capitalization** follows Haskell: types, traits, tables, views, and sum-type variants are `UpperCamelCase` and singular (a table is a type — `table T : Trait` uses the same `:` that `type A : B` does, and a row is an `Order`, not an `Orders`); fields are `lower_snake_case`; functions, predicates, and constraint names are `lowerCamelCase`; namespace segments are `lowercase`. The field/function split is deliberate — a field names stored data and reads as a column, a function is code and reads as Haskell. Capitalization is style checked by the linter, not grammar: `Ident` admits either case everywhere and position decides what a name is.
+- **Placement is separate from identity and needs only a total order.** A candidate key answers *which row is this*; placement answers *where does it go*. `DataId` is excluded from satisfying the candidate-key rule — counting the surrogate would make it vacuous — but it is monotone, total, and present on every row, so it is always a valid *placement* key. Consequence: **every shard can be split**, and a declared partition space only chooses where the cut falls. `LogData` therefore gets the root it was missing: a `system.shards.LogSegment` row keyed `{ server, period_start, branch }`, with all three components derivable or decidable at write time — server from bytes 6–7 of the row's own `DataId`, period from bytes 0–5, branch from the `retain` predicate, which may reference only group fields and the time source. Routing costs zero stored bytes, the log table itself stays keyless, the segment root carries the key instead, and retention aligns to segments so pruning becomes an unlink. A third layer is named to keep this safe: an **extent** is storage, a **shard** is authority, and `PhysicalLocator` already draws the line by carrying `plShard` but *not* the byte offset — so moving a row within its shard rewrites one `log_index` value and is invisible to the graph, while moving it across shards is a recorded split. Splitting a shard with one root row is thus possible but yields a **shard group** sharing a primary, because non-root uniqueness, `assert` evaluation, and `Ordinal` assignment are all defined as within-one-shard. **No syntax was added**: a `shard by <grain>` clause on `retain` was considered and rejected, since the segment key supplies the same alignment for free.
+- **Operational tuning is a row, not a trait.** A trait declares what a table *is*; a `Configuration` row declares how a deployment *treats* it. Extent size and segment period track hardware and must differ between staging and production without branching the schema, so they are rows in `system.shards.ExtentPolicy` keyed by table path, with `system.shards.ExtentOverride` keyed `{ table, server }` for per-server exceptions, resolved most-specific-first — two tables rather than one, because a `Null`-derived "all servers" variant in a key is rejected. Traits consequently take **no parameters**; where a declaration must name a policy the spelling is a reference to a policy row, as `Hashed Text using system.crypto.HashPolicy.password_v2` already does. Same separation as enforcement modes, queue retry policy, and retention.
+- **`system` is a namespace, not a replication class.** It had been listed as a fifth shard type in `transaction-graph.md` and as a table type in `namespaces.md`; both are corrected. Tables in `system` carry ordinary replication traits — `system.integrity.Violation` is `LogData`, `system.shards.Node` is `Configuration`. Namespace says whose a table is and who may see it; trait says how it propagates.
+- **There is one `delete`.** The `delete!` "hard delete" spelling is **withdrawn**. Its documented distinction from `delete` was not one — both left the record in the transaction graph and removed the row from the current state, which is the definition of a delete, so `delete!` was redundant syntax carrying a sigil that promised something it did not do. `delete` is an ordinary mutation: it appends a tombstone version, the row is absent at sample moments at or after it and present at any earlier `at`, the `DataId` is never reused, and writing a new version restores it. The operation `delete!` would have had to mean — destroying bytes already in the append-only log — is real and needed, but it is an administrative act on a shard rather than a row mutation, so it is not reachable from the query language at all. See OQ-036.
 - **Guiding principle**: where a choice is otherwise balanced, pick the spelling a Haskell reader would expect. DataCode's operators may carry narrower meanings than Haskell's — `where` constrains rather than binds — but the shape should be familiar.
 - **Open**: migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`); ACL token field access — what `user` exposes beyond `user.id` (`auth.md`)
 
@@ -268,15 +339,49 @@ GADT DSL alongside the crossing solver. Open with it:
 in a chain of more than one step. Conditions over stored fields and chains built from
 `count`/`sum`/`min`/`max`/`avg` are unaffected and implementable as specified.
 
+### OQ-035: Extent Size, Segment Period, and Shard-Group Formation
+**Question**: What are the default extent size and `LogData` segment period, and is a
+`UserData` shard group formed automatically or by an operator?
+
+The mechanism is settled (OQ-007, `transaction-graph.md`, `storage.md`); the numbers are not.
+
+- **Extent size**, and whether the threshold is expressed in bytes, rows, or extent count. Too
+  small and `log_index` grows for no benefit; too large and repartitioning moves more than it
+  needs to. Wants measurement against real write volume, like OQ-033.
+- **Segment period**, defaulting to day. It must divide sensibly into the retention grains in
+  use — a raw step of `for 6 hours` under a daily period cannot prune by segment — and a
+  low-volume server must not accumulate near-empty segments.
+- **Shard-group formation.** Sealing a log segment is automatic and splitting a `UserData`
+  shard is operator-initiated. A shard group sits between them: it adds sub-shards under one
+  existing primary without redistributing roots or moving authority. Whether that makes it
+  automatic like the first or proposed like the second is undecided.
+
+**Notes**: all three are `Configuration` rows with a per-server override, so a wrong default is
+tunable rather than fatal. Validate against real log volumes before fixing numbers.
+
 ### OQ-006: Failure Detection and Primary Elevation
 **Question**: How does the cluster detect a failed primary and who initiates elevation of a secondary?
 **Options**: Heartbeat with timeout, lease-based (primary must renew a lease), or external witness node.
 **Constraint**: Must not split-brain — two secondaries must not both believe they are primary.
 **Additional failure mode (from OQ-027)**: Cross-shard transactions take a distributed lock across all involved shard primaries and hold it until all operations complete. If any participating primary dies mid-lock, the recovery protocol must detect the partial lock and either complete or roll back the transaction. This is effectively a two-phase commit recovery problem — the failure detection mechanism chosen here must also handle lock-holder crash recovery, not just primary elevation for normal reads and writes.
 
-### OQ-007: Shard Split Trigger
-**Question**: Are shard splits automatic (threshold-triggered) or operator-initiated (with threshold warnings)?
-**Tradeoff**: Automatic splits are convenient but can cause disruption; manual splits are safer but require operator attention.
+### OQ-007: Shard Split Trigger ✓ ANSWERED
+**Answer**: Both, split by what the operation costs. Three thresholds, three behaviours:
+
+| Trigger | Action | Authority |
+|---|---|---|
+| An extent fills | Allocate the next; repartition in the background | Automatic and invisible — rewrites a `log_index` offset only, so no locator changes, no graph node, nothing replicates |
+| A `LogData` period closes or its segment exceeds the size threshold | Seal the segment, start a new one | Automatic — sealing moves no data |
+| A `UserData` shard exceeds the size threshold | Report; wait for `split shard … at key` | Operator — a split redistributes roots and moves write authority |
+
+The line is mechanical rather than a matter of taste: an operation that moves no data and
+writes no graph node can be automatic; one that moves authority cannot. It rests on
+`PhysicalLocator` carrying `plShard` but not the byte offset — see `transaction-graph.md` and
+`distribution.md`.
+
+Thresholds and the segment period are `Configuration` rows (`system.shards.ExtentPolicy`,
+`system.shards.ExtentOverride`), not syntax and not trait parameters. Their default values are
+OQ-035.
 
 ### OQ-008: Client Token Provisioning
 **Question**: How are client tokens issued and distributed to thick client deployments?
@@ -290,6 +395,7 @@ in a chain of more than one step. Conditions over stored fields and chains built
 ### OQ-010: PageRank Parameters for Schema Linearization
 **Question**: What are the damping factor, convergence criteria, and edge weighting rules for schema PageRank?
 **Notes**: Edge types (foreign key, path equivalence) may warrant different weights. Should be tunable.
+**Second consumer**: schema PageRank also breaks ties in `UserData` extent clustering — which dependent tables sit next to the root when they cannot all fit (`storage.md`). That imposes a requirement the IDE alone did not: the computation must be **deterministic**, because two servers computing it independently must reach the same layout. Convergence criteria expressed as "close enough" are therefore unacceptable without a fixed iteration count and a canonical tie-break.
 
 ## Can Defer to Post-MVP
 

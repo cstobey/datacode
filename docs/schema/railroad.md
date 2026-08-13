@@ -224,6 +224,9 @@ producer's business, `HandlerDecl` is the queue's. See [../events.md](../events.
 Constraints not expressible in the grammar:
 
 - `HandlerDecl` is valid only on a table carrying `LogData`; a queue holds occurrences.
+- A `TraitList` item is a bare `QName`: **traits take no arguments.** A trait is a declaration,
+  not a tuning knob, and operational values live in `Configuration` rows instead. See
+  [traits.md](traits.md#traits-are-not-configuration).
 - A `TableDecl` must declare a `UniqueDecl`, a `'unique'`-marked `FieldDecl`, or inherit one
   from a trait, unless it carries `LogData`, `Component`, or `Keyless`. See
   [tables.md](tables.md#candidate-keys-are-mandatory).
@@ -489,8 +492,12 @@ LetBinding   ::= 'let' Ident '=' Query
 Mutation     ::= Insert | Update | Delete
 Insert       ::= QName RecordLit
 Update       ::= Query RecordLit
-Delete       ::= ( 'delete' | 'delete!' ) Query
+Delete       ::= 'delete' Query
 ```
+
+`Delete` has one spelling. It appends a tombstone version like any other mutation, so the row
+remains readable at every earlier sample moment — see
+[queries.md](queries.md#delete-appends-a-version) for why the `delete!` variant was withdrawn.
 
 `JoinClause` takes a `TypeExpr` so that outer joins are written with the same `|`
 alternation as a nullable `:>` field: `Order >< Customer | MissingCustomer`.
@@ -617,7 +624,7 @@ DrCmd        ::= 'force' 'elect' 'primary' Host 'for' 'shard' QName
 ```
 acknowledge  add    aggregate always    as        assert    asc       at
 avg       by        connector conflict  count     DataCode  deep      delete
-delete!   demote    deprecate describe  desc      drop      elect     elevate
+demote    deprecate describe  desc      drop      elect     elevate
 else      emit      enforce   export    extend    External  False     flag
 for       force     forever   forward   from      group     handler   if
 import    in        indexed   into      is        issue     key       lag
@@ -635,7 +642,15 @@ view      views     violations  visibility        waive     where     with
 `&&` and `||`. (In Haskell `and` and `or` are list functions, not operators; reserving the
 words here would have misled.) `not` is a reserved prefix operator, as in Haskell.
 
-Two words that were considered and deliberately **not** reserved:
+Words that were considered and deliberately **not** reserved:
+
+- **`delete!`**, as a hard delete alongside the soft `delete`. This one was reserved and has
+  been **withdrawn**. The distinction it drew was not a distinction — both spellings left the
+  record in the transaction graph and removed the row from the current state, which is what a
+  delete is. The operation that would have earned the sigil is destroying bytes already in the
+  append-only log; that is [OQ-036](../open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine),
+  it is administrative rather than a row mutation, and it will not be spelled as a `delete`.
+
 
 - **`write`**, as in an `enforce … on write` spelling of the grandfathering mode. `write` is
   a likely field name in any permissions table, including DataCode's own. The mode is spelled

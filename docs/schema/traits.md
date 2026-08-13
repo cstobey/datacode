@@ -110,6 +110,13 @@ because "prune the log shard" is the operation most likely to be run under press
 also the trait that exempts a table from needing a candidate key, and the two facts have the
 same root: its rows are occurrences. See [aggregates.md](aggregates.md).
 
+**There is no `system` replication trait.** `system` is a namespace, and a table in it carries
+whichever of the above fits: `system.integrity.Violation` and the `system.events` queues carry
+`LogData`, `system.shards.Node` carries `Configuration`. The namespace says whose a table is
+and who may see it ([../namespaces.md](../namespaces.md)); the trait says how it propagates.
+Neither implies the other. `system` was previously listed as a fifth shard type in
+[../transaction-graph.md](../transaction-graph.md#data-shards), which is corrected there.
+
 Built-in replication traits are regular traits — user-defined traits can extend them
 freely:
 
@@ -130,6 +137,36 @@ error.
 
 See [../distribution.md](../distribution.md) for what each replication policy means
 operationally.
+
+## Traits Are Not Configuration
+
+A trait is part of a table's declaration, so changing one is a schema commit that replicates to
+every server. That makes it the wrong home for anything an operator tunes per deployment:
+
+> **A trait declares what a table *is*. A configuration row declares how a deployment *treats*
+> it.** If the value should be identical in every deployment and changing it deserves a schema
+> commit, it is a trait. Otherwise it is a row.
+
+Extent size and segment period fail that test — they track hardware, and staging and production
+must be able to differ without branching the schema. They are therefore rows in
+`system.shards.ExtentPolicy`, keyed by table path, with a per-server override in
+`system.shards.ExtentOverride` keyed by `{ table, server }`, resolved most-specific-first. Two
+tables rather than one key with an "all servers" variant, because a `Null`-derived variant in a
+key is rejected ([tables.md](tables.md#ineligible-key-fields)) and rightly so. This is the same
+separation that keeps enforcement modes ([../integrity.md](../integrity.md)), queue retry policy
+([../events.md](../events.md)), and retention ([aggregates.md](aggregates.md)) out of table
+bodies.
+
+**Traits take no parameters**, and `TraitList` admits a bare `QName` only. Where a declaration
+genuinely must name a policy, the established spelling is a reference to a policy row rather
+than a literal argument —
+
+```
+type Password : Hashed Text using system.crypto.HashPolicy.password_v2
+```
+
+— which keeps the values in a table where they can be changed, versioned, and access-controlled
+like anything else.
 
 ## `Component`
 

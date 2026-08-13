@@ -270,7 +270,11 @@ backstop. See [schema/types.md](schema/types.md#secret-types).
 
 The reason this matters more here than elsewhere: the transaction log is append-only. A
 plaintext credential that reaches it is there permanently, and no subsequent operation can
-remove it.
+remove it. That is a statement about the system as designed, not a permanent one — the
+mechanism by which anything leaves DataCode for good is
+[OQ-036](open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine).
+Until it is answered, keeping the value out of the log is the whole defence, which is why it is
+enforced by the type rather than by review.
 
 ## Reporting and Administration
 

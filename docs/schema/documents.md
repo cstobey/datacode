@@ -75,13 +75,19 @@ table app.log.RequestBodyNode : Component {
 
 table app.log.RequestBodyKey : DocKeys        -- interned keys; schema; 2-byte tag
 
-table app.log.RequestBodyKeyRaw : LogData {   -- spilled keys; data; shard-local
+table app.log.RequestBodyKeyRaw : LogData {   -- spilled keys; data; the owner's trait
   name : Text unique
 }
 ```
 
 They are generated with `internal` visibility, so they do not clutter the IDE or the
 namespace sidebar, and they are `:describe`-able like any other table.
+
+**The spill table inherits the owning table's replication trait** — `LogData` here because
+`app.log.Request` carries it, `UserData` where the field sits on a user table. Only the
+interned key table is fixed, at `DocKeys : Reference, Extensible`, because interning is a
+schema act rather than a data one. The node table is `Component`, which by definition places
+itself wherever its parent is.
 
 ### Nodes Are Components
 
@@ -135,7 +141,8 @@ object keys would grow a `Reference` table that replicates to **every server in 
 cluster** — one badly-behaved webhook becoming a cluster-wide problem.
 
 Each `Doc indexed` field therefore has a key-cardinality cap. Under the cap, a new key is
-interned. Over it, the key spills to `…KeyRaw` — an ordinary shard-local data table — and the
+interned. Over it, the key spills to `…KeyRaw` — an ordinary data table carrying the owning
+table's replication trait, so it never leaves the shard or the server the owner is on — and the
 overflow is reported through [../integrity.md](../integrity.md).
 
 Resolution is the ordinary left-to-right guard semantics of a fallback chain, identical to a
@@ -154,7 +161,7 @@ table rather than a bare `Text`: admitting `Text` into the tail of a `:>` would 
 |---|---|---|
 | Kind | Schema | Data |
 | Stored as | 2-byte variant tag | 12-byte `DataId` |
-| Replication | All servers | Shard-local |
+| Replication | All servers | The owning table's — shard-local under `UserData`, server-local under `LogData` |
 | Added by | Schema transaction | Ordinary insert |
 
 ## Querying

@@ -122,6 +122,20 @@ Note the `shard` keyword: `split shard <name> at key ...` is a physical operatio
 from the schema-level `split <table> into { ... }` in
 [schema/evolution.md](schema/evolution.md).
 
+`describe shard` reports the shard's extents and, for a `LogData` shard, the
+`system.shards.LogSegment` row that roots it. Splitting is not uniformly manual: an extent
+filling and a log segment sealing are automatic and invisible, and only a `UserData` split
+waits for `split shard … at key`
+(see [distribution.md](distribution.md#three-thresholds-three-behaviours)).
+
+There is no command for extent sizing or the segment period. Those are `Configuration` rows,
+so tuning them is an ordinary mutation, staged and committed like any other — the same
+self-hosting principle that keeps violation waivers out of the admin grammar:
+
+```
+system.shards.ExtentPolicy { table_path = "system.logs.HttpRequest", extent_size = 268435456 }
+```
+
 ### Connectors
 
 ```

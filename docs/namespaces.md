@@ -28,7 +28,7 @@ Namespaces are:
 │   ├── events/          -- queues, items, backoff_state, maintenance_queue
 │   ├── logs/            -- http_requests and other operational logs (per-server, prunable)
 │   ├── schema/          -- schema transaction graph metadata, branches, tags
-│   ├── shards/          -- shard topology and server roles
+│   ├── shards/          -- shard topology, server roles, log segments, extent policy
 │   └── telemetry/       -- view materialization stats, replication lag
 │
 ├── reference/           -- reference data shards (propagated everywhere)
@@ -73,7 +73,9 @@ name. See [schema/README.md](schema/README.md#capitalization).
 
 ## Relationship to Shards
 
-Namespaces are a logical organization; shards are a physical one. A namespace does not map one-to-one to a shard — the shard assignment is determined by table type (system, reference, configuration, user, logs) and data volume, not by namespace. The mapping between namespaces and shards is maintained in the system tables and is transparent to queries.
+Namespaces are a logical organization; shards are a physical one. A namespace does not map one-to-one to a shard — the shard assignment is determined by the table's replication trait (`Reference`, `Configuration`, `UserData`, `LogData`, `Component`) and data volume, not by namespace. The mapping between namespaces and shards is maintained in the system tables and is transparent to queries.
+
+`system` is **not** among those traits: it is a namespace, and a table in it carries whichever replication trait fits. `system.integrity.Violation` is `LogData`; `system.shards.Node` is `Configuration`. The namespace says whose a table is and who may see it; the trait says how it propagates. See [schema/traits.md](schema/traits.md#replication-traits).
 
 A namespace can span multiple shards. A shard can contain tables from multiple namespaces.
 

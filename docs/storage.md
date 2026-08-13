@@ -50,6 +50,50 @@ document order — no scatter-gather, no per-node lookup, and no stored parent p
 follow. This is the property the document type is built on, and it is why a shredded document
 of 200 nodes costs one seek to read rather than 200.
 
+## Extents and Clustering
+
+A shard's append-only log is written in **extents** — runs of the log allocated on one server
+and sized from `system.shards.ExtentPolicy`. An extent is a unit of storage, not of authority;
+the distinction and what rests on it are in
+[transaction-graph.md](transaction-graph.md#extents-are-not-shards). *Extent* rather than
+*page*, because LMDB has pages of its own at a lower level.
+
+### Relocation Rewrites Offsets, Not Locators
+
+`log_index` maps a 14-byte `PhysicalLocator` to `{offset, length}`. The offset is the
+**value**, so moving a row between extents of its own shard rewrites that value and touches
+nothing else: the locator is unchanged, `head_index` is unchanged, no new row version is
+created, and `updated_at` does not move. Relocation therefore appends nothing to the
+transaction graph and replicates nothing.
+
+This is what makes repartitioning a background task rather than a maintenance window. It runs
+under the event scheduler on `system.events.MaintenanceQueue` alongside compaction and view
+refresh, pegged to a stable commit node the way a materialized view computation is.
+
+### Clustering Order
+
+Rows are laid out within an extent in an order chosen per shard family:
+
+| Family | Order |
+|---|---|
+| `LogData` | time, which is `DataId` order |
+| `UserData` | containment — the root row, then its component subtrees, then dependents by foreign-key depth |
+
+`UserData`'s order matters more than it looks. "A shredded document of 200 nodes costs one
+seek" holds only because the log is clustered so that a component subtree is *physically*
+adjacent, not merely adjacent in `head_index` — a contiguous key range still yields 200
+locators, and they point somewhere. Any relocation that reorders rows without preserving
+containment adjacency invalidates that claim. Containment is therefore the constraint, and
+everything else is a tie-break inside it.
+
+**Schema PageRank breaks the ties** — which dependent tables sit next to the root when they
+cannot all fit. That score is computed over the *schema* graph ([ide.md](ide.md)), so the
+ordering is a function of the schema and is recomputed only on schema commit. A data-dependent
+ordering was rejected for three reasons: it relocates rows for reasons unrelated to any write,
+it produces layouts that differ between replicas computing it independently, and per-row
+importance is not what schema PageRank computes in the first place. The determinism
+requirement this places on the computation is noted in OQ-010.
+
 ## Shredded Documents
 
 A `Doc` field stores the received bytes in the row, and nothing else. When the field is

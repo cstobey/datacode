@@ -158,6 +158,13 @@ Two consequences worth stating plainly:
 - **Where a key reaches two distinct roots**, the *first* FK in the key declaration
   determines placement. This is the same head rule that governs `:>` alternations.
 
+This rule is about `UserData`, where the root's candidate key happens to serve two jobs at
+once. They are separable: identity asks *which row is this*, placement asks only for a **total
+order**, and `DataId` supplies one on every table including the keyless ones. A `LogData`
+table therefore has placement without having a key — it is rooted at a
+`system.shards.LogSegment` row instead, and its own rows stay keyless. See
+[../transaction-graph.md](../transaction-graph.md#placement-keys-are-not-identity-keys).
+
 The root table's own key is the one that is **not** shard-local — every user lives in a
 different shard, so `username unique` on the root is a cluster-wide constraint. That index is
 the shard directory (`username → DataId → shard`), which is the lookup that routes a request

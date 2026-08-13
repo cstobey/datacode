@@ -327,12 +327,26 @@ app.commerce.Order { customer = customerId, total = 99.99, status = Pending }
 -- Functional update (returns new version; all functors re-evaluated)
 Order where id == "uuid-..." { status = Shipped }
 
--- Soft delete (recorded in transaction log; data stays in graph)
+-- Delete (appends a tombstone version; the row's history stays readable)
 delete Order where id == "uuid-..."
-
--- Hard delete (removes from active state; record remains in transaction graph)
-delete! Order where id == "uuid-..."
 ```
+
+### Delete Appends a Version
+
+`delete` is an ordinary mutation and follows the same rule as every other one: it appends a
+tombstone version of the row rather than removing anything. The row is absent from any query
+whose sample moment is at or after the delete, and present in any query pinned earlier with
+`at`. The `DataId` is never reused, dependent history is untouched, and writing a new version
+brings the row back.
+
+**There is no second, harder delete.** A `delete!` spelling was reserved and has been removed.
+As specified it did nothing `delete` did not already do — both descriptions amounted to
+"removes it from the current state, keeps it in the graph" — and the only operation that would
+have justified the sigil is destroying bytes already written to the append-only log, which is
+unsolved. Scrubbing PII and quarantining a `UserData` shard are
+[OQ-036](../open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine);
+whatever answers it will not be spelled as a variant of `delete`, because it is an
+administrative act on a shard and not a row mutation.
 
 A brace block in query position is a **projection** when its items are bare paths and a
 **row update** when they are `field = value` bindings:

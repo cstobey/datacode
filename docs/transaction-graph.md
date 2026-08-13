@@ -106,7 +106,7 @@ table and is itself versioned.
 ## Data Shards
 
 A shard is a named slice of the schema containing related tables. A shard is identified by
-the `DataId` of its root row. Five shard types, each corresponding to a built-in replication
+the `DataId` of its root row. Four shard types, each corresponding to a built-in replication
 trait (see [schema/traits.md](schema/traits.md)):
 
 | Shard / Trait | Description | Cardinality | Replication |
@@ -114,12 +114,19 @@ trait (see [schema/traits.md](schema/traits.md)):
 | `Reference` | Code tables; treated as code, propagated everywhere | Low-medium | All servers |
 | `Configuration` | Tuning tables managed by operators | Medium | All servers |
 | `UserData` | Scales with user count | High | Shard-local |
-| `LogData` | Massive cardinality; prunable | Very high | Shard-local, time-bounded |
-| `system` | DataCode self-management tables | Low | All servers |
+| `LogData` | Massive cardinality; prunable | Very high | Server-local, time-bounded |
 
-A sixth replication trait, `Component`, does not name a shard type of its own — a component
+A fifth replication trait, `Component`, does not name a shard type of its own — a component
 table's rows live in whatever shard holds their parent. See
 [schema/traits.md](schema/traits.md).
+
+**`system` is a namespace, not a replication class.** It was previously listed as a fifth
+shard type here, which does not survive contact with the tables in it:
+`system.integrity.Violation` and every queue under `system.events` carry `LogData`, and
+`system.logs` is per-server and prunable ([namespaces.md](namespaces.md)). A table in the
+`system` namespace carries whichever replication trait fits it, exactly as an `app` table
+does. The namespace says whose a table is and who may see it; the trait says how it
+propagates. Neither implies the other.
 
 `LogData`-type shards are **server-local by default**: each server is authoritative for its
 own log data and does not replicate it to peers. This is a deliberate tradeoff — log volume
@@ -168,6 +175,156 @@ cross-shard lock that a distributed transaction would (see OQ-027).
 `Ordinal` supplies uniqueness within it, which is why component tables need no declared key at
 all.
 
+### Placement Keys Are Not Identity Keys
+
+A candidate key answers *which row is this*. Placement answers *where does it go*, and needs
+strictly less — a **total order over the rows of the shard family**. The two jobs read as one
+while `UserData` was the only case considered, because there the root's candidate key happens
+to serve both.
+
+> **A placement key needs only a total order. `DataId` is always one.**
+
+`DataId` is deliberately excluded from satisfying the candidate-key rule
+([schema/tables.md](schema/tables.md#candidate-keys-are-mandatory)) — counting the surrogate
+would make that rule vacuous. It is nonetheless monotone, total, and present on every row, so
+it is a perfectly good placement key. The consequence is worth stating plainly:
+
+> **Every shard can be split, always.** A declared partition space chooses *where* the cut
+> falls; it never decides *whether* a cut is possible.
+
+| Shard family | Placement order | Cut point |
+|---|---|---|
+| `UserData` root | the root table's candidate key | key range |
+| `UserData` dependent | inherited from its root through the FK chain | none — it follows its root |
+| `LogData` | the retention time source (`created_at`, or `using`) | segment boundary |
+| anything, last resort | `DataId` | any row boundary |
+
+Cutting at a `DataId` boundary never splits a component subtree, because every descendant
+shares the parent's byte prefix (see [Component Ordinals](#component-ordinals)). A
+row-boundary cut is a prefix-boundary cut.
+
+### `LogData` Shard Roots
+
+`LogData` declares no candidate key, so it has no root key to partition on. The root is
+supplied instead:
+
+```
+table system.shards.LogSegment : LogData {
+  server       :> system.shards.Node,
+  period_start : Timestamp,
+  branch       : Int,
+  unique segmentRef { server, period_start, branch }
+}
+```
+
+`system.shards.Node` is the server registry `show servers` reads — `Configuration`, one row per
+registered server, carrying the 2-byte node id assigned at registration (see
+[Globally Unique Identifiers](#globally-unique-identifiers)).
+
+One row per (server, period, retention branch); each roots the shard holding that segment's
+log rows. `LogData` exempts a table from *needing* a key and does not forbid one — the same
+point that lets a rollup level declare one
+([schema/aggregates.md](schema/aggregates.md#what-gets-generated)). The root row lives in the
+segment it roots and is pruned with it, exactly as a `Customer` row lives in the shard it
+roots.
+
+Four properties earn the shape:
+
+- **The log table stays keyless and the family still has a key.** A log row is an occurrence
+  with no identity beyond its occurrence; a segment is an entity and has one. The
+  root-key-is-the-shard-directory invariant above is restored without weakening the exemption.
+- **Routing costs zero stored bytes.** `server` is bytes 6–7 of the row's own `DataId` and
+  `period_start` is bytes 0–5 truncated to the period. A row's segment is computed from the
+  identifier it already carries — no lookup, no stored parent reference. `server` is a foreign
+  key to a `Configuration` table, which does not participate in placement rooting
+  ([schema/tables.md](schema/tables.md#keys-must-be-rooted)), so `LogSegment` is a root rather
+  than a dependent; and because the key contains the server id, its cluster-wide uniqueness
+  holds with no cluster-wide index.
+- **Locality where it is used.** The identifier is time-major then server, so a segment is a
+  strided set globally but a *contiguous range* on the server that wrote it — the only place
+  it is ever scanned, since `LogData` is server-local ([distribution.md](distribution.md)).
+- **Retention aligns to segments.** A closed segment is a whole retention unit, which turns
+  pruning into an unlink rather than a row scan (below).
+
+`period` is a `Configuration` value, not syntax — day by default. It has to be tunable,
+because a retention chain whose raw step is shorter than the period would not align, and
+because a low-volume server should not accumulate a million near-empty segments.
+
+`branch` is the index of the matching `retain` branch, or `0` where the table has no `retain`
+statement or an unbranched one. It belongs in the key because branch predicates may reference
+only group fields and the time source
+([schema/aggregates.md](schema/aggregates.md#branches)), so the branch is decidable when the
+row is written. Without it a segment could hold rows with two different expiries and would not
+be prunable as a unit.
+
+The current segment accepts writes; when its period closes it is **sealed** and a new one
+starts. Sealing moves no data, which is why it can be automatic where a `UserData` split
+cannot ([distribution.md](distribution.md#shard-splits)).
+
+### Extents Are Not Shards
+
+A **shard** is a unit of authority: one primary, two secondaries, one sequence space. An
+**extent** is a unit of storage: a run of the append-only log on one server, sized from
+`system.shards.ExtentPolicy`. A shard is made of extents. The distinction is load-bearing, and
+the `PhysicalLocator` already draws it:
+
+| Move | What changes | Cost |
+|---|---|---|
+| A row moves between extents of its own shard | the `log_index` *value* (`offset`, `length`) | Nothing. The locator is unchanged, so `head_index` is unchanged, `updated_at` is unchanged, no graph node is written, and nothing replicates |
+| A row moves to another shard | `plShard`, hence the locator, hence `head_index` | A logical event, recorded as a split node |
+
+The byte offset lives in the *value* of `log_index` and not in the locator
+([storage.md](storage.md)), which is what makes the first row of that table free. That is why
+background repartitioning can run continuously and automatically: below the shard boundary it
+is invisible to the graph and to every other server, exactly like the compaction it shares a
+queue with.
+
+The word is **extent** rather than *page* because LMDB has pages of its own, at a lower level
+and a different size.
+
+Sizing is a `Configuration` row, not syntax and not a trait parameter
+([schema/traits.md](schema/traits.md#traits-are-not-configuration)):
+
+```
+table system.shards.ExtentPolicy : Configuration {
+  table_path  : Text unique,        -- default for every server
+  extent_size : Int,                -- unit is OQ-035
+  period      : Duration = day      -- LogData segment period; ignored otherwise
+}
+
+table system.shards.ExtentOverride : Configuration {
+  table_path  : Text,
+  server     :> system.shards.Node,
+  extent_size : Int,
+  period      : Duration,
+  unique overrideRef { table_path, server }
+}
+```
+
+Two tables rather than one keyed by `{ table_path, server }` with an "all servers" variant,
+because a `Null`-derived variant in a key is rejected
+([schema/tables.md](schema/tables.md#ineligible-key-fields)). Resolution is
+most-specific-first. `table_path` rather than `table`, which is a reserved word — the same
+reason `system.integrity.Violation` spells it `subject_table`.
+
+### Splitting a Shard With One Root Row
+
+The partition function ranges over root rows, so a shard whose root set is a single row — one
+customer with a hundred million orders — has nothing to cut on. It splits by descending the
+placement chain to `DataId`, as any shard can. What that cannot do is move authority:
+
+> **The extents of one shard may spread across disks and volumes freely. Across *servers* only
+> if they share a primary.**
+
+Three things are defined as holding within one shard: non-root uniqueness checks, `assert`
+evaluation, and `Ordinal` assignment linearized by the shard primary. Sub-shards of one root
+therefore form a **shard group** with a single primary — splitting a whale splits storage and
+read capacity, never write authority.
+
+`LogData` needs no group. It has no candidate keys, no cross-row asserts, and nothing to
+linearize beyond the append itself, which is why its segments are independently placeable and
+a `UserData` whale's extents are not.
+
 ## Pruning
 
 `LogData` shards and old materialized views may be pruned. Pruning is recorded in the
@@ -190,6 +347,13 @@ readable as "these rows existed, then were summarized, then were discarded, and 
 It follows that rollup levels are ordinary tables with their own log entries, not materialized
 views. A materialized view is recomputable from its source by definition; once the source is
 pruned that no longer holds.
+
+Because a `LogData` shard is rooted at a segment whose key carries the retention branch, an
+expiring step usually covers a **whole sealed segment**. Pruning it is then an unlink of that
+segment's extents plus one prune node, rather than a row scan. Row-level pruning remains the
+fallback for a segment written before a branch was added or the period changed: routing is
+decided when a row is written and is never revised, which is the same forward-only rule that
+governs every other retention edit.
 
 ## Globally Unique Identifiers
 
@@ -334,6 +498,12 @@ occupy positions 1 through N.
 
 The LMDB `head_index` bridges the two: `DataId → current PhysicalLocator`. Following up
 through `log_index` yields the location on disk. See [storage.md](storage.md).
+
+**Relocation is not a version.** Moving a row between extents of its own shard rewrites the
+`log_index` value and nothing else — the locator is unchanged, so no new row version exists,
+`updated_at` does not move, and two servers cannot disagree about it. This is the property
+background repartitioning rests on, and it is why `plShard` being *inside* the locator while
+the byte offset is not is exactly what separates a free move from a recorded one.
 
 **Sort order confirmed by spike** (`spikes/storage/output.txt`): ByteString lexicographic
 sort of encoded locators produces the same ordering as Haskell's derived `Ord` instance.
