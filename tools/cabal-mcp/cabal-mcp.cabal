@@ -13,7 +13,9 @@ executable cabal-mcp
 
   build-depends:
     base       >= 4.18 && < 4.23,
-    mcp-server >= 0.1.0.20,
+    aeson      >= 2.0  && < 3,
+    containers >= 0.6  && < 0.9,
+    mcp-server >= 0.2.0.1 && < 0.3,
     text       >= 1.2  && < 3,
     process    >= 1.6  && < 2
 
