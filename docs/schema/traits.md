@@ -200,6 +200,12 @@ sequence are inherited through the containment link. The parent reference theref
 zero bytes, because the parent *is* the identifier prefix. See
 [../transaction-graph.md](../transaction-graph.md#component-ordinals).
 
+The inheritance shows up in the virtual columns: `created_at` and `origin_server` come from
+the parent, since a component has no identifier bytes of its own beyond its ordinal. In
+exchange it gains a fourth, **`ordinal`** — its position under that parent, at its own nesting
+level — which is how document order is stated in a query rather than merely received from a
+range scan. See [tables.md](tables.md#basic-syntax).
+
 **Locality.** A component is always in its parent's shard. Ordinal assignment is a
 read-modify-write against the parent's current maximum, which needs no coordination because
 the shard primary linearizes writes. This is the invariant that makes the compact identifier
@@ -342,7 +348,7 @@ trait. Compound interest is therefore written once and extended, and no new mech
 needed for it.
 
 A behavior is **not** a fifth functor kind. The four kinds each enforce something: validation
-rejects, foreign keys resolve, path equivalence asserts, events enqueue. A behavior does none
+rejects, foreign keys resolve, path constraints assert, events enqueue. A behavior does none
 of them — it is a projection, and specifically it is the field-scoped computed type that `:`
 already creates at `<namespace>.<table>.<field>`, whose inhabitants happen to be functions of
 `Moment`. See [functors.md](functors.md).

@@ -1,7 +1,7 @@
 # Functor Types
 
 This is the operational reference. For why there are four kinds and why access control is a
-variety of path equivalence rather than a kind of its own, see
+variety of path constraint rather than a kind of its own, see
 [../category-model.md](../category-model.md).
 
 DataCode has four functor kinds. All four are first-class schema objects — defined as rows
@@ -12,7 +12,7 @@ in system tables, referenced by `FunctorRef`, and encoded in the GADT DSL (confi
 |---|---|---|---|---|
 | 1 | **Validation** | `a → Either Error a` | On commit | Rejects invalid field values (range checks, format checks, domain invariants) |
 | 2 | **Foreign key** | `DataId → Either Error Row` | On commit | Referential integrity — resolves a DataId to a live row in the referenced table |
-| 3 | **Path equivalence** | `(a, a) → Either Error ()` | See below | Asserts that two schema-graph paths reach the same value. Comes in two varieties: data constraint and access control |
+| 3 | **Path constraint** | `Row → Either Error ()` | See below | Asserts something about what is reachable from a row through the schema graph. Comes in two varieties: data constraint and access constraint |
 | 4 | **Event** | `a → EventRef` | On commit | Schedules a deferred side effect — enqueues a work item in a DataCode queue table rather than executing immediately |
 
 Kinds 1–3 are synchronous and transactional: they run as part of the commit and can abort
@@ -20,7 +20,7 @@ it. Kind 4 is asynchronous and decoupled: the commit always succeeds (inserting 
 row is the commit), and the side effect runs later under the event scheduler.
 
 **A [behavior](types.md#behaviors) is not a fifth kind.** Each kind above enforces something —
-validation rejects, foreign keys resolve, path equivalence asserts, events enqueue. A behavior
+validation rejects, foreign keys resolve, path constraints assert, events enqueue. A behavior
 does none of them; it is a projection, and specifically the field-scoped computed type that
 `:` already creates, whose inhabitants are functions of `Moment`. It becomes relevant to
 functors only as the subject of an event condition.
@@ -31,8 +31,8 @@ functors only as the subject of an event condition.
 |---|---|---|
 | Validation | `where <predicate>` on a type or field | [types.md](types.md), [tables.md](tables.md) |
 | Foreign key | `:>` field declaration | [tables.md](tables.md) |
-| Path equivalence — data constraint | `assert <name> { <path> == <path> }` | [constraints.md](constraints.md) |
-| Path equivalence — access control | `assert access { user.<path> == <path> }` | [constraints.md](constraints.md) |
+| Path constraint — data | `assert <name> { … }`, body without `authed_user` | [constraints.md](constraints.md) |
+| Path constraint — access | `assert <name> { … }`, body with `authed_user` | [constraints.md](constraints.md) |
 | Event | `on <condition> emit <queue> { <payload> }` | [../events.md](../events.md) |
 
 ## Order of Operations for a Field Write
@@ -50,8 +50,10 @@ type may apply a storage transform that later stages must not see behind.
 5. **Encode** into the transaction's mutation list. Nothing that the transform removed can
    reach the log, because the log is written from this point forward.
 6. **Resolve foreign keys** and check `unique` constraints across the row.
-7. **Evaluate path equivalences** — `assert` blocks, both varieties, across the affected
-   subgraph.
+7. **Evaluate path constraints** — `assert` blocks, both varieties, across the affected
+   subgraph. Anchoring is what makes "the affected subgraph" a finite thing to name: every
+   assert is rooted at a row and reaches only along `:>` edges, so writing a row determines
+   which asserts on which other rows must be revisited by traversing those edges backwards.
 8. **Fire event functors** whose condition transitioned from `False` to `True` across this
    write, and re-solve any behavior-triggered condition on the row, since writing the row
    changes the function the crossing was solved from. Both insert queue rows and can abort
@@ -87,24 +89,23 @@ rejected at schema commit, because their failure channels can carry the value it
 an error payload and thence into the append-only log. See
 [types.md](types.md#secret-types).
 
-## Path Equivalence and Its Two Varieties
+## Path Constraints and Their Two Varieties
 
-Data constraints and access control are the same functor. Both assert that two paths through
-the schema graph resolve to the same value; both are written with `assert`; both compile to
-the same `(a, a) → Either Error ()` shape. The only difference is **what the two path terms
-refer to**, and that difference is what produces the differing runtime behaviour:
+Data constraints and access control are the same functor. Both assert something about what is
+reachable from a row through the schema graph; both are written with `assert`; both compile to
+the same `Row → Either Error ()` shape. The only difference is **whether the requesting token
+is one of the terms**, and that difference is what produces the differing runtime behaviour:
 
-| | Data constraint | Access control |
+| | Data constraint | Access constraint |
 |---|---|---|
-| Written | `assert <name> { p == q }` | `assert access { user.x == q }` |
-| Left term | a data path from the row | the requesting user token |
-| Right term | a data path from the row | a data path from the row |
+| Recognized by | body without `authed_user` | body mentioning `authed_user` |
 | Evaluated | on commit | on read **and** write |
 | On failure, write | reject the transaction | reject the transaction |
-| On failure, read | n/a — not evaluated on read | field resolves to `Redacted` |
+| On failure, read | n/a — not evaluated on read | row resolves to `Redacted` |
+| Skipped by `bypass access` | no | yes |
 
 ```
-table Order {
+table app.commerce.Order {
   customer  :> Customer,
   bill_addr :> Address,
   order_num : Int,
@@ -114,10 +115,22 @@ table Order {
   -- Data constraint: two FK paths must reach the same address
   assert billingMatch { customer.billing_address == bill_addr },
 
-  -- Access control: the requesting user must be reachable from this row
-  assert access { user.id == customer.user_id }
+  -- Access constraint: the requester must be reachable from this row
+  assert ownerAccess { authed_user == customer.user }
 }
 ```
+
+**The classification is structural.** An earlier draft made the assert *name* `access` select
+the variety; that made the set of rules an administrator bypasses depend on a naming
+convention, and it burned an identifier that was not even reserved. Scanning the body for
+`authed_user` is exact. See [constraints.md](constraints.md#the-variety-is-decided-by-the-body).
+
+The signature widened from `(a, a) → Either Error ()` at the same time. Equality of two paths
+is one shape an assert body can take; a query in assert position asserts its result is
+non-empty, and `not` of one asserts it is empty. Those cover presence and absence, which the
+equality-only shape could not express at all — every path in the schema graph is single-valued
+by construction, so there was nothing to quantify over. Equality is now the case where the
+body is an expression rather than a query.
 
 Because both varieties are the same object, the analyses that apply to one apply to the
 other: access rules can be checked statically for consistency and completeness the same way
@@ -125,12 +138,9 @@ data constraints can, and both render as edges in the IDE's ER diagram (see
 [../ide.md](../ide.md)).
 
 Redaction on read is where the two diverge operationally. A failed access assertion on a
-read does not abort — it resolves the field to `Redacted`, a built-in `Null`-derived absence
-type (see [types.md](types.md)). Absence is typed, so the client can distinguish "you may
-not see this" from "there is nothing here".
-
-The name `access` is what marks an assertion as the access-control variety. Any other name
-is a data constraint.
+read does not abort — the row resolves to `Redacted`, a built-in `Null`-derived absence type
+(see [types.md](types.md)). Absence is typed, so the client can distinguish "you may not see
+this" from "there is nothing here".
 
 ## Event Functor
 

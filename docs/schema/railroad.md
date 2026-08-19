@@ -129,14 +129,18 @@ RefToken     ::= ':' | ':>'
 SubTableTraits ::= ':' TraitList
 SubTableBody ::= '{' TableBody '}'
 SourceClause ::= 'rename' 'from' QName
-               | 'from' QName
 DefaultClause::= '=' Expr
 
 WhereClause  ::= 'where' ( Expr | PredicateBlock )
 PredicateBlock ::= Expr+       /* layout block: one predicate per line, indented */
-
-WildcardField ::= '*' 'from' QName
 ```
+
+`SourceClause` lost its bare `'from' QName` alternative, and `WildcardField
+::= '*' 'from' QName` is gone entirely. Both existed only to let a view body name the table a
+field or a wildcard was drawn from. A view is now a named `Query`, so its source is the query
+and the two field-level spellings had nothing left to do — `ProjItem`'s `User.*` is what
+replaced them. `rename from` stays: it is an evolution hint on a table field and never had
+anything to do with views.
 
 At most **one** `WhereClause` per declaration. Its body is a single predicate on the same
 line, or a `PredicateBlock` — an indented run of predicates delimited by the layout rule,
@@ -169,7 +173,7 @@ is no production for naming it — see [README.md](README.md#addressing-validati
 
 ```ebnf
 TableDecl    ::= 'table' QName ( ':' TraitList )? '{' TableBody '}'
-ViewDecl     ::= 'view'  QName ( ':' TraitList )? '{' TableBody '}'
+ViewDecl     ::= 'view'  QName ( ':' TraitList )? '=' Query
 TraitDecl    ::= 'trait' Ident ( ':' TraitList )? '{' TraitBody '}'
 
 TraitList    ::= QName ( ',' QName )*
@@ -178,13 +182,11 @@ TableBody    ::= ( BodyItem ( ',' BodyItem )* ','? )?
 TraitBody    ::= ( TraitItem ( ',' TraitItem )* ','? )?
 
 BodyItem     ::= FieldDecl
-               | WildcardField
                | UniqueDecl
                | AssertDecl
                | EventDecl
                | HandlerDecl
                | OrderByDecl
-               | WhereClause
                | FunctionDecl
 
 TraitItem    ::= FieldDecl | FunctionDecl | EventDecl | UiHint
@@ -193,7 +195,8 @@ OrderByDecl  ::= 'order' 'by' OrderTerm ( ',' OrderTerm )*
 OrderTerm    ::= FieldPath ( 'asc' | 'desc' )?
 
 UniqueDecl   ::= 'unique' Ident '{' FieldPath ( ',' FieldPath )* '}'
-AssertDecl   ::= 'assert' Ident '{' Expr '}'
+AssertDecl   ::= 'assert' Ident '{' AssertBody '}'
+AssertBody   ::= Expr | Query
 
 EventDecl    ::= 'on' Expr 'emit' QName RecordLit
 HandlerDecl  ::= 'handler' QName
@@ -202,13 +205,23 @@ UiHint       ::= 'ui' '{' HintPair ( ',' HintPair )* ','? '}'
 HintPair     ::= Ident '=' Literal
 ```
 
-A `WhereClause` standing alone as a `BodyItem` is a view-level row filter (see
-[queries.md](queries.md)); a `WhereClause` attached to a `FieldDecl` is a field validation.
-Position disambiguates: a `where` that begins its own comma-separated item is a filter.
+A `WhereClause` is only ever a field validation attached to a `FieldDecl`. It was previously
+also a `BodyItem`, standing alone as a view-level row filter; a view is now a named `Query`
+and carries its filter there, so the standalone form is gone and with it the rule that
+position disambiguated the two.
 
-`AssertDecl` covers both varieties of path-equivalence functor: the name `access` selects
-the access-control variety, any other name is a data constraint. No other name is special —
-`event` in particular is not, having been replaced by `EventDecl`.
+`AssertDecl` covers both varieties of path-constraint functor. **The variety is decided by
+the body, not by the name**: an `AssertBody` that mentions `authed_user` is an access
+constraint, and anything else is a data constraint. No name is special — `access` was
+previously a magic `Ident` selecting the access variety and no longer is, and `event` was
+replaced by `EventDecl` before that.
+
+A `Query` in `AssertBody` position — directly, or as an `Atom` under `not` — asserts that its
+result is **non-empty**. This is what expresses presence, and `not` of it expresses absence.
+The query must be rooted at `self` and every subsequent source must be reached by a
+`JoinClause` along a declared `:>` edge in either direction; an unanchored source is a
+compile-time error, because an `assert` that scans would scan on every read. See
+[constraints.md](constraints.md).
 
 `EventDecl` registers an event functor on the producing table. Its `Expr` is a condition that
 fires on a `False` → `True` transition, and its `RecordLit` is an ordinary row construction
@@ -230,11 +243,15 @@ Constraints not expressible in the grammar:
 - A `TableDecl` must declare a `UniqueDecl`, a `'unique'`-marked `FieldDecl`, or inherit one
   from a trait, unless it carries `LogData`, `Component`, or `Keyless`. See
   [tables.md](tables.md#candidate-keys-are-mandatory).
-- A `ViewDecl` must **not**. A view's candidate key is derived from its sources and the
-  operators applied to them, never written; a `UniqueDecl` in a view body is rejected. Every
-  view has one — at worst all of its attributes — and `:describe` reports it, marking the
-  all-attributes case as degenerate. See
+- A `ViewDecl` has no body in which to declare one, which is the grammar enforcing the rule
+  rather than a check: a view's candidate key is derived from its sources and the operators
+  applied to them, never written. Every view has one — at worst all of its attributes — and
+  `:describe` reports it, marking the all-attributes case as degenerate. See
   [queries.md](queries.md#view-keys-are-computed-never-declared).
+- A `ViewDecl`'s `assert`s are written standalone, since there is no body to hold them. A
+  view's field types come from its `Query`: a projected `FieldPath` keeps the source's type,
+  and a projected expression mints a computed type named by the view field's path. See
+  [queries.md](queries.md#view-field-types).
 - A `FieldPath` in a `UniqueDecl` may not name a field whose type is `Secret`, `Doc`,
   `Behavior`, or an alternation containing a `Null`-derived variant.
 
@@ -370,9 +387,11 @@ Param        ::= Ident
 Expr         ::= OrExpr ( '$' Expr )?
 OrExpr       ::= AndExpr ( '||' AndExpr )*
 AndExpr      ::= NotExpr ( '&&' NotExpr )*
-NotExpr      ::= 'not' NotExpr | CmpExpr
+NotExpr      ::= 'not' '$' Expr
+               | 'not' NotExpr
+               | CmpExpr
 CmpExpr      ::= AddExpr ( CmpOp AddExpr )?
-CmpOp        ::= '==' | '/=' | '<' | '<=' | '>' | '>=' | IsOp
+CmpOp        ::= '==' | '/=' | '<' | '<=' | '>' | '>=' | '=~' | IsOp
 IsOp         ::= 'is' 'not'?
 
 AddExpr      ::= MulExpr ( ( '+' | '-' ) MulExpr )*
@@ -387,6 +406,7 @@ Atom         ::= Literal
                | LetExpr
                | RecordLit
                | '(' Expr ')'
+               | '(' Query ')'
 
 FuncApp      ::= QName Atom+
 Lambda       ::= '\' Param+ '->' Expr
@@ -418,6 +438,27 @@ exactly one parse.
 **Operator spelling** follows Haskell throughout: `==`, `/=`, `&&`, `||`, `not`, `True`,
 `False`. There are no `!=`, `and`, or `or` tokens.
 
+**`=~` is regex match**, `Text -> Text -> Bool`, evaluated by `Text.Regex.TDFA`. It had been
+lexed and used since the first draft of [functions.md](functions.md) without appearing in any
+production; it is a `CmpOp`. Its **right operand is restricted by trait**: a `StringLit`, a
+`FieldPath` into a `Reference` table, or a `FieldPath` into a `Configuration` table. Anything
+else — a user-supplied value, a field of the row being matched — is a compile-time error
+naming the three. The two admissible table sources differ in one respect worth knowing:
+
+| RHS | Resolved | Malformed pattern |
+|---|---|---|
+| `StringLit` | compile time | rejected at schema commit |
+| `Reference` path | compile time — a `Reference` insert *is* a schema commit | rejected at schema commit |
+| `Configuration` path | runtime | runtime error on the affected rows |
+
+The compiled-pattern cache therefore keys on the `Configuration` row's version. TDFA is a DFA
+engine, so a pathological pattern costs no more than a linear scan — the restriction exists to
+keep patterns out of untrusted hands, not to bound backtracking.
+
+**A parenthesized `Atom` is a `Query` if it contains a `QueryClause`** and an `Expr`
+otherwise. The two cannot both apply: an `Expr` has no production admitting `where`, `><`,
+`group`, `order by`, `at`, `limit`, or a bare `Projection` at that position.
+
 **Backtick infix.** Any named function may be written infix by enclosing it in backticks, as
 in Haskell, with Haskell's default fixity for the form: `infixl 9`, tighter than every
 operator and looser than juxtaposition.
@@ -440,6 +481,12 @@ not $ isDisposableDomain e || isBlockedDomain e
 -- equivalent to
 not (isDisposableDomain e || isBlockedDomain e)
 ```
+
+`NotExpr` carries an explicit `'not' '$' Expr` alternative for this. `not` is a prefix
+operator here rather than a function, so `$` could not fall out of the operator table the way
+it does in Haskell — without the alternative, `not $ …` was written throughout
+[functions.md](functions.md) and [../auth.md](../auth.md) but parsed nowhere. Bare `not` still
+binds tightly: `not a || b` is `(not a) || b`.
 
 **Lexing.** Several operators share a prefix; maximal munch applies in every case:
 
@@ -478,13 +525,17 @@ QueryClause  ::= JoinClause
                | AtClause
                | LimitClause
 
-JoinClause   ::= '><' TypeExpr ( 'via' FieldPath )?
+JoinClause   ::= '><' JoinSource ( 'via' FieldPath )? ( 'as' Ident )?
+JoinSource   ::= TypeExpr
+               | '(' Query ')' ( '|' TypeExpr )*
 GroupClause  ::= 'group' FieldPath
 AtClause     ::= 'at' StringLit
 LimitClause  ::= 'limit' NumLit
 
 Projection   ::= '{' ProjItem ( ',' ProjItem )* '}'
 ProjItem     ::= FieldPath Aggregate? ( 'as' Ident )?
+               | Expr 'as' Ident
+               | ( QName '.' )? '*'
 Aggregate    ::= 'sum' | 'count' | 'min' | 'max' | 'avg'
 
 LetBinding   ::= 'let' Ident '=' Query
@@ -499,8 +550,39 @@ Delete       ::= 'delete' Query
 remains readable at every earlier sample moment — see
 [queries.md](queries.md#delete-appends-a-version) for why the `delete!` variant was withdrawn.
 
-`JoinClause` takes a `TypeExpr` so that outer joins are written with the same `|`
-alternation as a nullable `:>` field: `Order >< Customer | MissingCustomer`.
+`JoinClause`'s `JoinSource` is a `TypeExpr` so that outer joins are written with the same `|`
+alternation as a nullable `:>` field: `Order >< Customer | MissingCustomer`. The parenthesized
+`Query` alternative exists for one purpose: **an outer-joined source must carry its own filter
+inside the join term.**
+
+```
+-- WRONG: an account whose every suspension is lifted yields zero rows, not a
+-- NoSuspension row, so an absence test on this reports the opposite of the truth
+Account >< Suspension | NoSuspension where lifted is NotLifted
+
+-- RIGHT: filter before the guard
+Account >< (Suspension where lifted is NotLifted) | NoSuspension as suspension
+```
+
+A `WhereClause` at the outer level that references a field of an outer-joined source is
+consequently a **compile-time error**, and the diagnostic names the parenthesized form as the
+fix. This is SQL's `ON`-versus-`WHERE` trap, which is worth closing structurally here because
+the same expression appears inside `assert`, where the symptom is not missing rows but an
+inverted constraint.
+
+`JoinClause`'s `as` names the joined source in the result. It is **mandatory when a source
+joined against the reference direction is named anywhere in the query** — in a `where`, a
+`Projection`, or a variant test. Joining `Account` to the `Suspension` rows that reference it
+produces a column with no `:>` field to name it, and falling back to the bare table name
+would read as though the table itself were the value. A reverse join whose source is never
+named needs no `as`; in the forward direction the `:>` field already names the column and `as`
+is always optional.
+
+`ProjItem`'s three forms: a bare `FieldPath` keeps the source field's name and type; an `Expr`
+requires `as`, since a computed column has no name to inherit; and `*` copies every field of
+its source, qualified (`User.*`) to pick one side of a join. `*` binds at query time, so new
+source fields appear automatically, while a named field binds stably — see
+[queries.md](queries.md#the--selector-and-field-propagation).
 
 `AtClause`'s `StringLit` is a version token (graph node hash prefix, tag, or branch name) or
 an ISO-8601 moment; the two are told apart at resolution, not by the grammar. Where it is
@@ -558,7 +640,7 @@ HistoryOpt   ::= 'since' StringLit
 ## Administration
 
 ```ebnf
-AdminCommand ::= ServerCmd | ShardCmd | ConnectorCmd | TokenCmd
+AdminCommand ::= ServerCmd | ShardCmd | ConnectorCmd | TokenCmd | GrantCmd
                | MatViewCmd | TxnCmd | IntegrityCmd | DrCmd
 
 ServerCmd    ::= 'show' 'servers' ( 'for' 'shard' QName )?
@@ -582,6 +664,10 @@ TokenCmd     ::= 'show' 'tokens' ( 'type' TokenType )?
                | 'issue' 'client' 'token' 'for' StringLit 'scoped' 'to' QName
                | 'revoke' 'token' Ident
 TokenType    ::= 'server' | 'client' | 'user'
+
+GrantCmd     ::= 'show' 'grants' ( 'for' QName )?
+               | 'grant'  QName 'on' QName ( 'bypass' 'access' )?
+               | 'revoke' 'grant' QName 'on' QName
 
 MatViewCmd   ::= 'show' 'materialized' 'views' ( 'shard' QName )?
                | 'refresh' 'view' QName ( 'at' StringLit )?
@@ -623,20 +709,42 @@ DrCmd        ::= 'force' 'elect' 'primary' Host 'for' 'shard' QName
 
 ```
 acknowledge  add    aggregate always    as        assert    asc       at
-avg       by        connector conflict  count     DataCode  deep      delete
-demote    deprecate describe  desc      drop      elect     elevate
+avg       by        bypass    connector conflict  count     DataCode  deep
+delete    demote    deprecate describe  desc      drop      elect     elevate
 else      emit      enforce   export    extend    External  False     flag
-for       force     forever   forward   from      group     handler   if
-import    in        indexed   into      is        issue     key       lag
-let       limit     materialized        max       merge     migrate   min
-monitor   not       on        order     otherwise pause     primary   prune
-refresh   removing  repair    replay    replication         resolve   resume
-retain    revoke    scoped    secondary seq       servers   set       shard
-shards    show      shrink    since     split     sum       sync      table
-tertiary  then      to        token     tokens    transaction  transactions
-trait     True      type      ui        unique    using     verify    via
-view      views     violations  visibility        waive     where     with
+for       force     forever   forward   from      grant     grants    group
+handler   if        import    in        indexed   into      is        issue
+key       lag       let       limit     materialized        max       merge
+migrate   min       monitor   not       on        order     otherwise pause
+primary   prune     refresh   removing  repair    replay    replication
+resolve   resume    retain    revoke    scoped    secondary seq       servers
+set       shard     shards    show      shrink    since     split     sum
+sync      table     tertiary  then      to        token     tokens
+transaction  transactions     trait     True      type      ui        unique
+using     verify    via       view      views     violations  visibility
+waive     where     with
 ```
+
+### Contextual Bindings
+
+`self` and `authed_user` are **not** reserved words. They are bindings supplied by the
+context an expression is evaluated in, resolved through the same namespace lookup as any
+other identifier and shadowed by nothing, because no declaration may introduce a name that
+collides with a binding in scope.
+
+| Binding | Bound to | In scope |
+|---|---|---|
+| `self` | the row under evaluation | trait function bodies, `assert` bodies, `on … emit` conditions and payloads |
+| `authed_user` | the requesting user token's row | `assert` bodies |
+
+`self` has been used in trait function bodies since [traits.md](traits.md) was written without
+being listed anywhere; it is listed here now. `authed_user` replaces the earlier `user`, which
+read like a table name and would have collided with the likeliest field name in any
+permissions schema — including DataCode's own.
+
+**There is no `authed_client` binding.** Client tokens restrict access at the schema level and
+that restriction is configuration in `system.auth.*`, so admitting the client into an `assert`
+would put one decision in two places. See [../auth.md](../auth.md).
 
 `and` and `or` are **not** reserved — boolean conjunction and disjunction are the operators
 `&&` and `||`. (In Haskell `and` and `or` are list functions, not operators; reserving the
@@ -677,6 +785,16 @@ no other position.
 Duration unit names (`day`, `hour`, `month`, …) are **not** reserved. They are ordinary
 identifiers bound to `Duration` constants in the standard library, which is what lets
 `grain == hour` be an ordinary comparison rather than a special form.
+
+- **`access`**, as the assert name selecting the access-control variety. It was never a
+  reserved word — it was a magic `Ident` that the compiler treated specially, which is the
+  worst of both: no lexical status, but unusable as an ordinary constraint name. The variety
+  is now decided by whether the body mentions `authed_user`, which is the difference
+  [functors.md](functors.md) already said was the defining one. `access` is an ordinary
+  constraint name again.
+
+`grant`, `grants`, and `bypass` are the three added for `GrantCmd`. `revoke`, `on`, and
+`scoped` were already reserved by `TokenCmd`, which is the family this joins.
 
 `matches` is an ordinary function, not a keyword. `acknowledge`, `flag`, and `waive` are
 reserved against future admin syntax but currently have no production — those operations are

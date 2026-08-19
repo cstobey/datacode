@@ -210,16 +210,27 @@ supplied instead:
 
 ```
 table system.shards.LogSegment : LogData {
-  server       :> system.shards.Node,
   period_start : Timestamp,
   branch       : Int,
-  unique segmentRef { server, period_start, branch }
+  unique segmentRef { origin_server, period_start, branch }
 }
 ```
+
+`origin_server` is declared nowhere because it is a **virtual column** — bytes 6–7 of the
+segment row's own `DataId`, typed `:> system.shards.Node` ([Virtual
+Columns](#virtual-columns)). A segment is written by the server that owns it, so those bytes
+*are* the answer; a declared field would have been a stored copy of them, free to disagree.
+This is the general rule, and the key is where it earns out.
 
 `system.shards.Node` is the server registry `show servers` reads — `Configuration`, one row per
 registered server, carrying the 2-byte node id assigned at registration (see
 [Globally Unique Identifiers](#globally-unique-identifiers)).
+
+`period_start` *is* declared, and the asymmetry is the point: `period` is a `Configuration`
+value that may be retuned, and routing is decided when a row is written and never revised. A
+truncation under a mutable policy has to be pinned at write time or an operator changing
+`period` would retroactively re-route sealed segments. Bytes 6–7 cannot be retuned, so
+`origin_server` needs no pinning.
 
 One row per (server, period, retention branch); each roots the shard holding that segment's
 log rows. `LogData` exempts a table from *needing* a key and does not forbid one — the same
@@ -233,9 +244,9 @@ Four properties earn the shape:
 - **The log table stays keyless and the family still has a key.** A log row is an occurrence
   with no identity beyond its occurrence; a segment is an entity and has one. The
   root-key-is-the-shard-directory invariant above is restored without weakening the exemption.
-- **Routing costs zero stored bytes.** `server` is bytes 6–7 of the row's own `DataId` and
-  `period_start` is bytes 0–5 truncated to the period. A row's segment is computed from the
-  identifier it already carries — no lookup, no stored parent reference. `server` is a foreign
+- **Routing costs zero stored bytes.** A log row's server is bytes 6–7 of its own `DataId` and
+  its period is bytes 0–5 truncated — so a row's segment is computed from the identifier it
+  already carries, with no lookup and no stored parent reference. `origin_server` is a foreign
   key to a `Configuration` table, which does not participate in placement rooting
   ([schema/tables.md](schema/tables.md#keys-must-be-rooted)), so `LogSegment` is a root rather
   than a dependent; and because the key contains the server id, its cluster-wide uniqueness
@@ -525,15 +536,156 @@ string. Two servers may legitimately assign different indexes to the same shard.
 
 ## Virtual Columns
 
-Every table exposes two automatic virtual columns derived from these identifiers:
+`created_at` is not a special case. It is bytes 0–5, and the rule it belongs to is:
 
-- `created_at` — timestamp extracted from the row's `DataId` (millisecond resolution)
-- `updated_at` — timestamp of the most recent `PhysicalLocator` that mutated the row
+> **The virtual columns are projections of the row identifier.** The row already carries the
+> bytes; naming them costs nothing and refusing to name them only means the engine has
+> projections its users cannot write.
+
+| Source | Column | Type | On which tables |
+|---|---|---|---|
+| `DataId` bytes 0–5 | `created_at` | `Timestamp` | all |
+| `DataId` bytes 6–7 | `origin_server` | `:> system.shards.Node` | all |
+| `DataId` bytes 8–11 | — sequence, deliberately unexposed | | |
+| component id suffix | `ordinal` | `Int` | `Component` only |
+| head `PhysicalLocator` | `updated_at` | `Timestamp` | all |
+
+`updated_at` is the one that is not a projection of the identifier — it reads the row's
+current head. Everything above it is free in the strict sense: the bytes are in hand before
+any lookup happens.
 
 Because `updated_at` is derived from the newest version of the row, anything that writes to a
 row perturbs it. This is why nonconformance is recorded in separate rows that point *at* the
 subject rather than as a flag on the subject — see [integrity.md](integrity.md).
 
+### `origin_server`
+
+The server that issued the row's `DataId`. It surfaces as a **foreign key to
+`system.shards.Node`**, not as an `Int`, which is the whole of its value: as a bare 2-byte
+integer every "which server wrote this" query is a manual join against a magic number, and the
+number is meaningless outside the registry that defines it.
+
+It is the only virtual column that is a reference, and it resolves unusually — through `Node`'s
+candidate key on the node id, not through a `DataId`. The projected bytes *are* that key. Two
+consequences worth stating:
+
+- `system.shards.Node` rows are never pruned. They are `Configuration` and one per registered
+  server, so this costs nothing, but it is now an invariant rather than an accident: a retired
+  server's row is what makes its historical rows still readable. The alternative — an
+  alternation `origin_server :> system.shards.Node | RetiredServer` — buys nothing and puts an
+  absence case into every query for no gain.
+- Resolution needs no cluster round trip. `Node` is `Configuration` and therefore replicated to
+  every server ([schema/traits.md](schema/traits.md#replication-traits)), so the join is local
+  wherever the query runs.
+
+This is the projection `system.shards.LogSegment` already computes by hand — its `server` field
+is described above as bytes 6–7 of the row's own `DataId`, which is exactly this column under a
+different name.
+
+For a `Component` row, `origin_server` is inherited from the parent's `DataId`, as `created_at`
+is: a component has no identifier bytes of its own beyond its ordinal.
+
+### The Sequence Is Not Exposed
+
+Bytes 8–11 disambiguate identifiers issued within one millisecond by one server. That is their
+entire content. Naming them would invite code to read them as an ordering, and the ordering
+they carry is per-server and per-millisecond — two rows from different servers cannot be
+compared by it, and the clock-regression clamp above deliberately continues the counter across
+a held timestamp, so even locally it is a tiebreak rather than a time. `DataId` order already
+gives the total order anyone reaching for the sequence actually wants.
+
+### `ordinal`
+
+A `Component` row's position under its parent, assigned monotonically from 1 and never reused.
+It is the one part of a component's identity that is physically stored, and it is already
+user-visible in the rendered form (`05KG3N0000ZQ8V4T1H7C.7`), so the column publishes something
+the system was showing anyway.
+
+Naming it closes a real gap rather than adding a convenience: **without it there is no way to
+express document order in a query.** Component subtrees come back in document order because the
+range scan does ([storage.md](storage.md#component-subtrees-are-one-range-scan)), but "in the
+order the scan happens to return them" is not a sort a query can state, restate after a join,
+or reverse.
+
+`ordinal` is the row's position **at its own level**, not the full path. Nesting appends an
+ordinal per level, so a path is variable-length and is already spelled by the rendered
+identifier; a column whose type varies with nesting depth would be worse than the identifier it
+duplicates. Siblings under one parent are what `ordinal` orders, which is what a document
+traversal wants at each level.
+
 For a `Component` row, `created_at` is inherited from the parent's `DataId`: ordinals carry
 no time of their own. A component that must record its own creation time declares a
 `Timestamp` field.
+
+### Per-Field Timestamps
+
+Both columns are also meaningful **per field**, and both are computable without storing
+anything:
+
+- `Table.field.updated_at` — the timestamp of the newest version in which that field's value
+  differs from its predecessor. A backward walk of the row's version chain, comparing one
+  column.
+- `Table.field.created_at` — the version in which the field first held a value other than a
+  `Null`-derived one. For a field added by schema evolution this is the useful reading and the
+  only well-defined one: under [no NULL](schema/types.md) the field reads `NotGiven` from the
+  row's creation forward, so "first non-absent" is a real event and "when the column appeared"
+  is a property of the schema graph, not of the row.
+
+**These are never stored on the row.** Per-field timestamps would multiply row width by field
+count to hold something the log already contains — a second source of truth for a derivable
+fact. The walk is the definition; anything else is a cache of it.
+
+**The cache is a materialized view, not a rollup table.** The distinction is the one drawn in
+[aggregates.md](schema/aggregates.md#pruning-is-only-ever-a-consequence): a materialized view
+must be recomputable from its source. Here it always is, for two reasons that between them
+cover every table:
+
+- Compaction is lossless, so the version chain of a live row is complete back to its creation
+  ([storage.md](storage.md#compaction-is-lossless)).
+- `LogData` is the only thing pruning touches, and a log row is an occurrence that is never
+  updated — its every field's `updated_at` is the row's own `created_at`, with no chain to
+  walk. The case where history is discarded is the case where there is no history.
+
+#### Declaring and Proposing the Cache
+
+Which fields maintain a cache is a `Configuration` row, not syntax
+([schema/traits.md](schema/traits.md#traits-are-not-configuration)) — the set is expected to
+change with observed load, and a schema commit per tuning change would be the wrong grain:
+
+```
+table system.telemetry.FieldTimeCache : Configuration {
+  table_path : Text,
+  field      : Text,
+  unique fieldTimeRef { table_path, field }
+}
+```
+
+`table_path` rather than `table`, which is a reserved word — the same reason
+`system.integrity.Violation` spells it `subject_table`.
+
+A query may reference `Table.field.updated_at` whether or not a cache row exists; the cache
+decides cost, never capability. Uncached, the walk runs, and the reference is recorded:
+
+```
+table system.telemetry.FieldTimeRequest : LogData {
+  table_path : Text,
+  field      : Text,
+  versions_walked : Int
+}
+```
+
+**Observed usage proposes; it does not act.** A recurring request accumulates, and the
+maintenance queue raises a proposal to add the `FieldTimeCache` row — it does not add it. A
+query that silently caused a view to exist would write schema-adjacent state nobody authored,
+in a system whose posture is explicitly-named branches and no anonymous forks. Acceptance is
+an operator act (or a `Configuration` policy that auto-accepts above a threshold, off by
+default), and it is the same act either way: insert the row.
+
+The proposal rides `system.events.MaintenanceQueue` alongside compaction, repartitioning, and
+view refresh, and the request log carries a `retain` chain rolling to per-field request counts
+— the frequency, not the individual references, is what a proposal is argued from.
+
+The declaration path matters as much as the proposal path, because usage-driven discovery
+cannot cover a cold start: the first query pays the full walk, and if it is a scan rather than
+a point lookup it pays it per row. A field known in advance to be queried this way gets its
+cache row written up front, and the proposal mechanism exists for the ones nobody predicted.

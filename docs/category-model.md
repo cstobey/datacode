@@ -31,25 +31,28 @@ The primary set/relational connection between tables. Map objects in one table t
 - Carry provenance: the query result type retains the chain of functors that produced it
 - Written with the `:>` field token
 
-### 3. Path Equivalence Functors
-Enforce commutativity of diagrams in the schema graph. If two different paths through the schema should produce the same result, a path equivalence encodes that requirement:
+### 3. Path Constraint Functors
+Constrain what is reachable from a row through the schema graph. The original and still the central case is commutativity: if two different paths through the schema should produce the same result, a path equivalence encodes that requirement:
 - Based on David Spivak's formalism for database schemas as categories (see *Functorial Data Migration*)
 - Applied during mutation validation, not at query time
 - Written with `assert`
 
-This is a single functor kind with **two varieties**, distinguished only by what the two path terms refer to:
+Equivalence is not the only proposition worth asserting about a neighbourhood, and restricting the kind to it made two ordinary requirements inexpressible: that a linking row *exists* along some path, and that none does. Neither is an equality, and neither can be forced into one — every path in the schema graph is single-valued by construction, so an equality-only assert had nothing to quantify over. The kind is therefore **path constraint**, `Row → Either Error ()`, with three shapes: an equivalence between two paths, a rooted subquery asserted non-empty, and its negation. The comma-category framing is what makes the last two well-posed rather than ad hoc — presence is non-emptiness of the pullback of two paths over a shared object, which is a statement about the same diagram the equivalence case constrains.
 
-**Data constraint** — both terms are data paths from the row.
+This is a single functor kind with **two varieties**, distinguished only by whether the requesting token is one of the terms:
+
+**Data constraint** — every term is a data path from the row.
 - Example: `order.customer.billing_address` must equal `order.billing_address` at commit time
 - The primary mechanism for enforcing business rules that span tables
 
-**Access control** — one term is the requesting token, the other a data path.
+**Access constraint** — the requesting token is one of the terms.
 - Restricts which morphisms (paths through the schema) a given token can traverse
 - Composes with relational functors: you can only follow a foreign key if your token has the appropriate path traversal right
+- Recognized structurally, by the token binding appearing in the body — not by a name, so that the set of rules an administrator's grant exempts is exact rather than conventional
 
-The two are *structurally identical*, which is why they are one kind rather than two. That identity is the payoff of the categorical framing: authorization is not a bolt-on subsystem with its own semantics, it is the same commutative-diagram machinery pointed at the authentication context. Consequences follow for free — access rules can be statically analyzed for consistency (no contradictions, no gaps) before deployment by exactly the analysis that checks data constraints, and both render as edges in the same schema diagram.
+The two are *structurally identical* apart from that one term, which is why they are one kind rather than two. That identity is the payoff of the categorical framing: authorization is not a bolt-on subsystem with its own semantics, it is the same commutative-diagram machinery pointed at the authentication context. Consequences follow for free — access rules can be statically analyzed for consistency (no contradictions, no gaps) before deployment by exactly the analysis that checks data constraints, and both render as edges in the same schema diagram.
 
-Where they differ is only in evaluation timing, and that difference is derived rather than stipulated: a data constraint has nothing to check until a mutation is proposed, so it runs at commit; an access-control equivalence is meaningful on any traversal, so it runs on read as well. On a failed read the field resolves to `Redacted` rather than aborting — absence is typed, so "you may not see this" is expressible in the result rather than only as an error.
+Where they differ is only in evaluation timing, and that difference is derived rather than stipulated: a data constraint has nothing to check until a mutation is proposed, so it runs at commit; an access constraint is meaningful on any traversal, so it runs on read as well. On a failed read the row resolves to `Redacted` rather than aborting — absence is typed, so "you may not see this" is expressible in the result rather than only as an error.
 
 ### 4. Event Functors
 Schedule a deferred effect rather than enforcing an invariant. An event functor maps a committed row to an `EventRef` — a work item inserted into a queue table — instead of to `Either Error a`:
@@ -135,7 +138,9 @@ A schema is a **finitely presented category** where:
 
 A path equivalence asserts: for two paths `f ∘ g` and `h ∘ k` through the schema graph, the composed functors must produce the same result. This is the categorical analog of a referential integrity constraint, but far more general.
 
-For mutations, the system walks the affected subgraph and verifies that all declared equivalences still hold after the change. For access control, the system walks the same graph with the active tokens and prunes morphisms the token cannot traverse.
+It is also not the only proposition the presentation can carry. **Presence** asserts that the set of rows reached by a composition is inhabited, and **absence** that it is empty — neither is an equation, and both are needed constantly in practice. They are admitted as the other two shapes of the same kind, subject to one restriction that keeps them categorical rather than arbitrary: the composition must start at the row under evaluation and every step must be a declared morphism. A query free to start anywhere would be a predicate over the whole database, not a statement about this object's neighbourhood — and, less abstractly, would be a table scan on every read.
+
+For mutations, the system walks the affected subgraph and verifies that all declared constraints still hold after the change; the same rootedness restriction is what makes "the affected subgraph" finite and findable, by traversing the declared morphisms backwards from the written row. For access control, the system walks the same graph with the active tokens and prunes morphisms the token cannot traverse.
 
 ## Functor Composition and Transparency
 

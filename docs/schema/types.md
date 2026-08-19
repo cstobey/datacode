@@ -192,7 +192,8 @@ value is current:
 | `where` | The predicate would have to hold at every moment, which is undecidable in general. Constrain the stored fields the behavior closes over instead. |
 
 Behaviors are **read-only**. Having no stored bytes, they are rejected in row construction and
-row update literals, exactly as `created_at` and `updated_at` are.
+row update literals, exactly as the virtual columns are
+([tables.md](tables.md#basic-syntax)).
 
 A behavior must be **total for every moment at or after the row's `created_at`**. The
 scheduler evaluates behaviors at future moments to solve for crossings, and a partial function

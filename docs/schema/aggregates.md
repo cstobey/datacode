@@ -259,7 +259,7 @@ reconstructed. Silence means keep.
 ### Retention Prunes Whole Segments
 
 A `LogData` shard is rooted at a `system.shards.LogSegment` row keyed by
-`{ server, period_start, branch }`
+`{ origin_server, period_start, branch }`
 ([../transaction-graph.md](../transaction-graph.md#logdata-shard-roots)), where `branch` is the
 index of the matching `retain` branch. A branch predicate may reference only the aggregate's
 group fields and the time source, so the branch is decidable when the row is written, and no

@@ -35,18 +35,30 @@ All four functor kinds (see [schema/functors.md](schema/functors.md)):
 |---|---|
 | Validation | ✓ Validated |
 | Foreign key | ✓ Validated |
-| Path equivalence — data constraint | ✓ Validated |
-| Path equivalence — access control | ✓ Validated (same DSL construct; differs only in whether a path term is a token path) |
+| Path constraint — data | ✓ Validated, for the equality shape only |
+| Path constraint — access | ✓ Validated, for the equality shape only (same DSL construct; differs only in whether a term is the token) |
 | Event | ✗ **Not validated.** Requires a DSL extension producing an `EventRef` — a queue-table row insert — rather than `Either Error a`. Surface syntax also undefined; see OQ-030 |
 
-Collapsing data constraints and access control into a single path-equivalence functor means
+Collapsing data constraints and access control into a single path-constraint functor means
 the DSL needs one construct where it previously appeared to need two.
+
+**The spike validated equality, and the kind has since widened.** A path constraint's body may
+now be a query rooted at `self`, asserted non-empty, or the negation of one (OQ-005), and the
+spike encoded neither. Both are anchored traversals over declared `:>` edges rather than
+arbitrary queries, so the construct they need is a bounded walk with a non-emptiness test —
+plausibly reachable, but unvalidated. Add it to the list below until a spike says otherwise.
 
 ### Known ceilings
 
-The DSL is a ceiling by construction. Three limits are already identified:
+The DSL is a ceiling by construction. Four limits are already identified:
 
-- **Regex** requires a DSL extension (or a registered primitive)
+- **Regex** requires a DSL extension (or a registered primitive). This one is no longer
+  hypothetical: `=~` is a `CmpOp` and may appear in any constraint body
+  ([schema/railroad.md](schema/railroad.md#functions-and-expressions)), so the primitive is
+  needed rather than merely anticipated. Its right operand is restricted to a literal, a
+  `Reference` path, or a `Configuration` path, which is what keeps the pattern a constant the
+  DSL can hold rather than an arbitrary expression it would have to evaluate.
+- **Anchored subquery with a non-emptiness test** — the presence and absence shapes above
 - **Recursive types** require a DSL extension
 - **User-defined functions** require new DSL constructors — they cannot be arbitrary Haskell
 

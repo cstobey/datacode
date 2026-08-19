@@ -70,6 +70,34 @@ This is what makes repartitioning a background task rather than a maintenance wi
 under the event scheduler on `system.events.MaintenanceQueue` alongside compaction and view
 refresh, pegged to a stable commit node the way a materialized view computation is.
 
+### Compaction Is Lossless
+
+Compaction shares the maintenance queue with repartitioning and shares its guarantee:
+
+> **Compaction never discards a row version.** It changes where bytes live so they are stored
+> more optimally as the schema evolves, and nothing else.
+
+Superseded row versions are not garbage. They are the version chain, and the version chain is
+the transaction graph's account of how a row reached its current value — the thing "nothing is
+destroyed" is about. A compactor that collapsed old versions to reclaim space would be
+rewriting history to save disk, which is the trade this design exists to refuse.
+
+**Pruning is the sole way data is lost, and what it loses is granularity, on purpose.** It
+happens only as the consequence of a declared `retain` chain, the coarser resolution is written
+before the finer one is discarded, and a prune node records the boundary
+([transaction-graph.md](transaction-graph.md#pruning)). The distinction is worth stating as a
+pair, because both run on the same queue and only one of them may lose anything:
+
+| Operation | Trigger | May lose |
+|---|---|---|
+| Relocation | volume, background | nothing — not even a locator |
+| Compaction | schema change, background | nothing — every version survives |
+| Pruning | a declared `retain` chain | granularity, deliberately, after the rollup exists |
+
+The consequence relied on elsewhere: **anything derivable from a row's version chain stays
+derivable for as long as the row exists.** That is what lets per-field timestamps be a cache
+rather than a stored column ([transaction-graph.md](transaction-graph.md#per-field-timestamps)).
+
 ### Clustering Order
 
 Rows are laid out within an extent in an order chosen per shard family:

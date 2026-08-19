@@ -5,12 +5,18 @@
 ```
 Order >< Customer
   where total > 100
-  { customer.name as name, total as order_total }
+  { customer.name as name, total as order_total, applyTax (total) as with_tax }
 ```
 
 - `where` — row filter
 - `{ field, ... }` — projection (bare braces, no `select` keyword)
 - `as` — alias
+
+A projection item is a field path, an expression, or a `*`. An expression **requires** `as`,
+since a computed column has no name to inherit; a bare path keeps the source field's name and
+type. A `*` copies every field of its source and is qualified (`User.*`) to pick one side of a
+join. What an expression does to a *view*'s field type is
+[View Field Types](#view-field-types).
 
 Field references: `TableName.field_name` or `alias.field_name`. Table aliases are
 encouraged when the full namespace path is in the name.
@@ -62,6 +68,40 @@ Order    >< Customer | MissingCustomer      -- query
 
 A field declared with a fallback chain is joined with no `|` needed at the query site — the
 declaration already carries it.
+
+### Joining Against the Reference Direction
+
+A join may run either way along a `:>` edge. Going backwards — from `Account` to the
+`Suspension` rows that reference it — the result column has no `:>` field to name it, so `as`
+is **mandatory** whenever the query names that source at all:
+
+```
+Account >< Suspension as suspension { name, suspension.opened_at }
+```
+
+Falling back to the bare table name would read as though the table itself were the value.
+A reverse join whose source is never named needs no `as`, which is the common case inside an
+`assert`.
+
+### Filter Before Guard
+
+**A filter on an outer-joined source belongs inside the join term.**
+
+```
+-- WRONG: an account whose every suspension is lifted yields zero rows, not a
+-- NoSuspension row — the filter deleted the very rows the guard produced
+Account >< Suspension | NoSuspension as suspension where lifted is NotLifted
+
+-- RIGHT
+Account >< (Suspension where lifted is NotLifted) | NoSuspension as suspension
+```
+
+An outer-level `where` naming a field of an outer-joined source is a compile-time error, and
+the diagnostic names the parenthesized form as the fix. This is SQL's `ON`-versus-`WHERE`
+trap. It is closed structurally rather than documented as a caution because the same
+expression appears inside `assert`, where the symptom is not missing rows but a constraint
+asserting the opposite of what it reads as — see
+[constraints.md](constraints.md#absence).
 
 ## Grouping
 
@@ -169,24 +209,57 @@ part of what it means.
 
 ## Views
 
-Views are defined identically to tables — they are table definitions whose data is computed
-from the transaction graph rather than stored directly. The distinction is a storage hint,
-not a schema distinction.
+**A view is a named query.**
 
 ```
-view app.commerce.ActiveOrder {
-  customer :> Customer,
-  total    : Amount,
-  where status is Active
-}
+view app.commerce.ActiveOrder = Order where status is Active
+
+view system.auth.ServiceAccount = User >< AccountKind { User.*, AccountKind.purpose }
+  where kind is Service
 ```
 
-A view body uses the same field declaration syntax as a table body, so `:>`, `where`, and
-comma separation apply identically.
+It binds with `=`, exactly as `aggregate` does, and for the same reason: both name a query,
+and a second syntax for writing one would have to be kept in step with the first forever.
+Replication traits still attach where they do on a table — `view X : LogData = …`.
 
-Note the two roles of `where` in one body: attached to a field declaration it validates that
-field; standing alone as a body item it filters rows. Position disambiguates — a `where` that
-begins its own comma-separated item is a row filter.
+A view previously had a table-style body: field declarations, a standalone `where` as a row
+filter, and `from` clauses naming each field's source table. That form could not express a
+join at all, which is what forced the change — there was no production for it, so "the users
+reachable through this linking table" was unwritable. Three things went with it:
+
+- the standalone `where` body item, and with it the rule that position told a row filter apart
+  from a field validation;
+- `WildcardField` (`* from <table>`), replaced by a qualified `*` in the projection;
+- `FieldDecl`'s bare `from <table>` clause, which had no remaining use.
+
+Since a view has no body, its `assert`s are written standalone
+([constraints.md](constraints.md#standalone-form)).
+
+## View Field Types
+
+A view does not declare field types; it inherits or computes them.
+
+- A projected `FieldPath` keeps the source field's name and type, including its validations.
+  `User.email` in a view is still a `system.auth.User.email`.
+- A projected **expression** mints a computed type, named by the view field's path. `normalize
+  (User.name) as name` in `system.auth.ServiceAccount` defines the type
+  `system.auth.ServiceAccount.name`.
+
+The naming rule is not new. A field's `where` is already addressed by the field's path, and
+that path is already the name of the field's computed type
+([README.md](README.md#addressing-validations)) — a projection is the same mechanism reaching
+a new position.
+
+**Types are shared structurally and named by their first definer.** Two views projecting
+`normalize (User.name)` get one type, not two incompatible ones: functors are transparent, so
+the same function over the same source type is the same computed type. What "tied to the
+first definer" decides is the *name*. One consequence to expect: the name outlives its
+definer's `deprecate`, since nothing is destroyed and the type is still in use elsewhere.
+
+**A function over a key column degenerates the key**, because injectivity is not knowable in
+general. That costs the view incremental refresh, pins its sources against `deprecate`, and
+makes it non-writable (below) — so apply functions to non-key columns, or accept a read-only
+view. `:describe` reports which happened.
 
 ## View Keys Are Computed, Never Declared
 
@@ -254,8 +327,9 @@ view claim an identity it does not have, and merge reconciliation would then tru
 ```
 datacode[app.commerce]> :describe app.commerce.OrderSummary
 view app.commerce.OrderSummary
-  key: (all attributes) -- degenerate: `customer` and `order_num` are projected away
-  refresh: full only
+  key:      (all attributes) -- degenerate: `customer` and `order_num` are projected away
+  refresh:  full only
+  writable: no -- degenerate key
 ```
 
 This is the posture [../integrity.md](../integrity.md) already takes elsewhere: the system
@@ -263,7 +337,7 @@ computes what it knows, reports it, and leaves the decision.
 
 ### What the Key Decides
 
-The derived key is not bookkeeping. Two things depend on it:
+The derived key is not bookkeeping. Three things depend on it:
 
 **Incremental refresh.** A materialized view with a meaningful key can be refreshed by
 upserting changed rows, because the key says which row a recomputed one replaces — the same
@@ -275,6 +349,10 @@ recomputation. See [../storage.md](../storage.md#materialized-views).
 independent of its sources' full extent, which makes it a **candidate to replace them** — the
 generalization of what a retention chain does when an aggregate supersedes the raw table it
 was computed from.
+
+**Whether the view can be written through.** A meaningful key says which base row each view
+row is, which is what makes decomposing a mutation unambiguous. See
+[Writing Through a View](#writing-through-a-view).
 
 A degenerate view has no such independence: it can only ever be rebuilt by rescanning its
 sources. **`deprecate` on a table with a degraded dependent view is therefore rejected**, and
@@ -293,28 +371,64 @@ untidy, it pins the schema.
 
 ## The `*` Selector and Field Propagation
 
-Views and connector overlays can use `*` to include all fields from a source table:
+`*` in a projection includes every field of its source, and is qualified to pick one side of a
+join:
 
 ```
--- Wildcard: tracks source schema dynamically
-view app.commerce.OrderSummary {
-  * from connectors.mariadb.production.Order,
-  status : OrderStatus    -- explicit override: coerces Text -> ADT
-}
+-- Wildcard: tracks the source schema dynamically
+view app.commerce.OrderSummary = connectors.mariadb.production.Order { * }
+
+-- Mixed: bulk by wildcard, one field recomputed
+view app.commerce.Order = connectors.mariadb.production.Order
+  { *, toOrderStatus (status) as status }
 
 -- Explicit field list: stable, change-resistant
-view app.commerce.OrderDetail {
-  id     : DataId from connectors.mariadb.production.Order,
-  total  : Amount from connectors.mariadb.production.Order,
-  status : OrderStatus
-}
+view app.commerce.OrderDetail = connectors.mariadb.production.Order
+  { id, total, toOrderStatus (status) as status }
 ```
 
 `*` binds to the source's schema at query time — new fields in the source appear
-automatically. Named fields bind stably — new source fields don't propagate. Mixed views
-can use `*` for the bulk and override specific fields by name.
+automatically. Named fields bind stably — new source fields don't propagate. A later item
+overrides an earlier `*` on the same name, which is how a coercion is applied to one field
+without listing the rest.
 
-`from` is a trailing clause and precedes `unique`, `=`, and `where`.
+The second example is what a connector overlay looks like now. A view body used to write this
+as a bare `status : OrderStatus` re-declaration, leaving the coercion implied; the function is
+named instead, which is both what actually happens and what mints the field's type
+([View Field Types](#view-field-types)).
+
+## Writing Through a View
+
+An insert or update against a view decomposes into one mutation per base table, ordered by FK
+direction — referenced side first, so the row exists before anything references it.
+
+```
+system.auth.ServiceAccount { username = "billing-sync", purpose = "invoice ingestion" }
+-- inserts a system.auth.User row, then an AccountKind row with kind = Service
+```
+
+Note what supplied `kind`. **The view's `where` filter is a check constraint on write, and its
+constant equalities supply values on insert** — the row you write must satisfy the filter, and
+where the filter pins a field to a constant, that constant is written. This is SQL's `WITH
+CHECK OPTION`, doing one extra job: it is what lets adding a row through the view create the
+linking row without the call site knowing the linking table exists.
+
+Write-through is admissible exactly when:
+
+1. the derived key is **meaningful**, not degenerate — it is what says which base row a view
+   row is;
+2. every join is along a `:>` edge, so the key propagation rule above makes the join lossless
+   and each view row corresponds to at most one row per base table;
+3. every required field of each base table — one with no default — is either projected by the
+   view or fixed by its `where`.
+
+Fail any of the three and the view is read-only, with `:describe` reporting which.
+
+**`delete` removes the row the key identifies, and never cascades.** For a `:>` join that is
+the *referencing* side: deleting from `ServiceAccount` appends a tombstone to the `AccountKind`
+row, and the `User` survives, now matching no service-account view. This falls out of key
+propagation rather than being stipulated, but it is stated here because "delete the service
+account" reads as though the user should go too, and it does not.
 
 ## Mutation
 

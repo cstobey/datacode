@@ -74,7 +74,7 @@ Do not restate settled decisions back to them.
 - **The schema is data.** Schema, routes, connector config, event queues, and auth all live in the same append-only transaction graph as user data. Self-hosting is a design goal, not an aspiration.
 - **Nothing is destroyed.** Evolution adds graph nodes; old schema versions stay queryable. `deprecate` hides, `prune` removes, and only orphaned branches are truly deletable. Log data is the one exception, and even there discarding is never manual — a `retain` chain rolls it to coarser resolutions and prunes as a consequence; a `LogData` table with no chain is never pruned. Silence means keep.
 - **No external calls inside a commit.** Side effects go to a queue table and run later under the event scheduler. An `a -> IO b` functor is rejected at schema commit.
-- **Four functor kinds**: validation, foreign key, path equivalence, event. Data constraints and access control are the *same* kind (path equivalence), differing only in whether a path term is the requesting token. A `Behavior` is not a fifth — it enforces nothing, it projects.
+- **Four functor kinds**: validation, foreign key, path constraint, event. Data constraints and access control are the *same* kind, differing only in whether the requesting token is one of the terms — and that difference is read off the assert *body* (does it mention `authed_user`?), never off its name, so an administrator's `bypass access` grant exempts an exact set. An assert body is an equality, a query rooted at `self` (asserting non-empty), or `not` of one. A `Behavior` is not a fifth kind — it enforces nothing, it projects.
 - **Every table declares a candidate key** unless it carries `LogData`, `Component`, or `Keyless`. `DataId` does not count. On a shard-local table the key must reach the shard root through its FK chain, which makes the key declaration also the sharding declaration. Shards are row-rooted. A **view** declares none — its key is derived from its sources, and a derived key that degenerates to all attributes blocks incremental refresh and pins its sources against `deprecate`.
 - **Time is a parameter, never ambient.** `Behavior a ≅ Moment -> a` for values that change with no write. `Moment` (observation, ranges over past and future) is distinct from `Timestamp` (stored). Nothing may read the clock inside a functor — that is the existing `a -> IO b` rejection doing the work.
 
@@ -103,8 +103,11 @@ table app.commerce.Order : UserData {
   order by placed_at desc,
 
   on status is Shipped emit app.events.email_queue { recipient = customer.email },
-  assert access { user.id == customer.user_id }
+  assert ownerAccess { authed_user == customer.user }
 }
+
+view app.commerce.RecentOrder = Order >< Customer { Order.*, Customer.name as buyer }
+  where placed_at > cutoff
 ```
 
 ## Working Norms

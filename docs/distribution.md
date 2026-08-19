@@ -68,7 +68,7 @@ the root it is keyed against. See
 **A keyless table partitions on `DataId`.** The partition function needs a total order, not an
 identity, so `LogData` — which declares no candidate key — partitions on the time source
 carried in the high-order bytes of every `DataId`, rooted at a `system.shards.LogSegment` row
-keyed by `{ server, period_start, branch }`. See
+keyed by `{ origin_server, period_start, branch }`. See
 [transaction-graph.md](transaction-graph.md#placement-keys-are-not-identity-keys).
 
 **A shard with one root row splits on `DataId` too**, into sub-shards forming a **shard group**

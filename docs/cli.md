@@ -27,7 +27,7 @@ REPL prompt and in `.dc` files, and are documented in [schema/](schema/):
 | Types, domain types, absence types | [schema/types.md](schema/types.md) |
 | Tables, fields, foreign keys, sub-tables | [schema/tables.md](schema/tables.md) |
 | Traits and replication policy | [schema/traits.md](schema/traits.md) |
-| `assert`, path equivalence, ACL | [schema/constraints.md](schema/constraints.md) |
+| `assert`, path constraints, ACL | [schema/constraints.md](schema/constraints.md) |
 | Redeclare, deprecate, split, merge | [schema/evolution.md](schema/evolution.md) |
 | Queries, joins, views, mutation | [schema/queries.md](schema/queries.md) |
 | Function definitions and imports | [schema/functions.md](schema/functions.md) |
@@ -167,6 +167,18 @@ revoke token <token-id>
 
 See [auth.md](auth.md).
 
+### Grants
+
+```
+show   grants for app.commerce
+grant  system.auth.Role.Admin on app.pm bypass access
+revoke grant system.auth.Role.Admin on app.pm
+```
+
+A grant is a row in `system.auth.Grant`; these commands write it. `bypass access` exempts the
+grant from every `assert` that mentions `authed_user` and from nothing else — data
+constraints still run. See [namespaces.md](namespaces.md#bypass).
+
 ### Materialized Views
 
 ```
@@ -275,7 +287,8 @@ type Amount : Decimal where \a -> a >= 0
 
 table app.commerce.Customer : UserData {
   email : Email unique,
-  name  : Text
+  name  : Text,
+  user  :> system.auth.User
 }
 
 table app.commerce.Order : UserData {
@@ -286,7 +299,7 @@ table app.commerce.Order : UserData {
   unique orderRef { customer, order_num },
   order by placed_at desc,
 
-  assert access { user.id == customer.user_id }
+  assert ownerAccess { authed_user == customer.user }
 }
 
 table app.commerce.OrderLine : UserData {

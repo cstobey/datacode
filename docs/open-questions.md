@@ -6,7 +6,7 @@ Questions that need answers before or during implementation. Grouped by urgency.
 
 ### OQ-001: Dynamic Loading Mechanism ✓ ANSWERED
 **Answer**: GADT DSL + Data.Dynamic hybrid. See `spikes/dynamic-loading/output.txt`.
-- **GADT DSL** (Approach 2): primary functor mechanism. All four functor kinds must be encodable: validation, foreign key, path equivalence (in both its data-constraint and access-control varieties), and event (the event functor enqueues a work item rather than executing immediately — see `events.md`). Spike validated the first three; the event functor requires a DSL extension that produces an `EventRef` (queue table row insert) instead of `Either Error a`. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors.
+- **GADT DSL** (Approach 2): primary functor mechanism. All four functor kinds must be encodable: validation, foreign key, path constraint (in both its data and access varieties), and event (the event functor enqueues a work item rather than executing immediately — see `events.md`). Spike validated the first three; the event functor requires a DSL extension that produces an `EventRef` (queue table row insert) instead of `Either Error a`. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors. **Two of these have since become load-bearing rather than anticipated** (OQ-005): the path-constraint kind widened past equality to anchored presence/absence subqueries, which the spike did not encode, and `=~` became a real operator admissible in any constraint body, so the regex primitive is now required rather than merely possible. See `dynamic-loading.md`.
 - **Data.Dynamic** (Approach 3): type registry substrate. TypeRep-based type checking is O(1). Serves as the "registered type library" that the DSL references by name.
 - **hint** (Approach 1): failed to compile in the spike — GHC not on PATH or hint version mismatch. Revisit as an escape hatch for advanced user-defined functors; compile async and sandbox the result.
 - **Multi-daemon**: needed when compiled-in types must change (requires server restart to load new Haskell modules); the schema daemon restarts are coordinated by a supervisor.
@@ -33,6 +33,8 @@ Questions that need answers before or during implementation. Grouped by urgency.
 - **LMDB threading fix confirmed**: requires `-threaded` in ghc-options AND wrapping the LMDB session in `runInBoundThread` (session-level, not per-operation). The `lmdb` Haskell package calls `isCurrentThreadBound` before acquiring its write lock; without `-threaded`, this always returns False. See `spikes/capnproto/src/Spike/LmdbFixed.hs`.
 - **LMDB latency**: read 11µs/op, write 1,107µs/op. Write latency is high because LMDB calls `fdatasync()` on every transaction commit by default (durability guarantee). **This is not a problem** — DataCode batches multiple mutations into a single transaction. At 10–100 mutations/tx, the per-mutation cost is 11–110µs, which is acceptable. Single-mutation micro-benchmarks are not representative of production write patterns.
 - **Production LMDB pattern**: dedicate one OS-bound thread (via `forkOS`) for all LMDB writes, with a `TQueue` for serialization. Readers are concurrent (LMDB MVCC — readers never block writers).
+- **Compaction is lossless.** It relocates bytes so they are stored more optimally as the schema evolves and never discards a row version. Superseded versions *are* the version chain, which is the graph's account of how a row reached its value; collapsing them to reclaim disk would be rewriting history for space. Pruning is the only operation that loses anything, it loses granularity deliberately, and it happens only as the consequence of a declared `retain` chain (OQ-032). Relocation, compaction, and pruning share the maintenance queue and only the last may lose data — see `storage.md`. The consequence leaned on elsewhere: anything derivable from a row's version chain stays derivable for as long as the row exists.
+- **Per-field `created_at`/`updated_at` are derived, cached by configuration, and proposed by usage.** `Table.field.updated_at` is a backward walk of the version chain comparing one column; `Table.field.created_at` is the first non-`Null`-derived value, which is the well-defined reading for a field added by evolution. Never stored on the row — that would multiply row width by field count to hold what the log already contains. Which fields keep a cache is a `system.telemetry.FieldTimeCache` row (`Configuration`, because the set tracks load and a schema commit per tuning change is the wrong grain), and because compaction is lossless the cache qualifies as a materialized view rather than a rollup table. Uncached references are logged to `system.telemetry.FieldTimeRequest` (`LogData`, with a `retain` chain rolling to counts) and the maintenance queue raises a *proposal* — a query must never silently create the view, since that writes state nobody authored in a system built on named branches and no anonymous forks. Declaring up front stays the primary path: usage-driven discovery cannot cover a cold start, where the first query pays the full walk per row. See `transaction-graph.md`.
 
 ### OQ-026: API Version Token Format ✓ ANSWERED
 **Answer**: Three interchangeable version token types, all valid as the `{version}` segment in `/v{version}/...` API paths:
@@ -141,6 +143,45 @@ exception to "nothing is destroyed", it must be recorded as a graph node the way
 is, and it must be impossible to reach from the query language — which is why `delete!` was
 withdrawn rather than given these semantics (OQ-005, `schema/queries.md`).
 
+### OQ-037: Reversible Secret Storage
+**Question**: What type constructor stores a secret the server must be able to read back, and
+where does its key live?
+
+`Secret` is a type property; `Hashed a` is the one constructor carrying it, and it is one-way
+by construction. That covers every credential verified by re-deriving — a password, an API
+key, a WebAuthn public key. It does not cover a credential the server must *reproduce from*: an
+authenticator app's shared secret (RFC 6238) has to be recovered to compute the current code,
+and a connector's outbound credential has to be recovered to authenticate with. Neither is
+expressible, so **a method needing a recoverable secret cannot currently be declared**
+(`auth.md`).
+
+**Scope narrowed.** This does *not* block having a second factor. A **delivered** one-time code
+is an occurrence rather than an enduring capability, so it is a `Challenge` row in its own
+`LogData` table rather than a `Credential`: generated per attempt, stored `Hashed`, verified
+with `matches`, sent by an `on state is Issued emit` event, expiring by `Behavior`, and pruned
+by a `retain` chain. It needs nothing that does not exist. What remains blocked is narrower
+than "multi-factor" — it is authenticator apps and outbound connector credentials
+specifically.
+
+The shape is presumably `Encrypted a using <policy>`, mirroring `Hashed a using
+system.crypto.HashPolicy.…`, and it would inherit `Secret`'s four effects unchanged except for
+reads. What is undecided is everything underneath:
+
+- **Where the key lives.** Not in the same shard as the ciphertext, or the pair travels
+  together in every backup and every replication stream. An external KMS is the conventional
+  answer and is the first external dependency in a system that has none.
+- **Whether reads are a functor at all.** Decryption on read is a per-row operation on the
+  read path, which is the path `storage.md`'s zero-copy claim is about — the same collision
+  crypto-shredding runs into in OQ-036, and the two should probably be answered together.
+- **What a read returns to a token that may not decrypt.** `Sealed` means "one-way"; this is
+  not that.
+- **Rotation.** Re-encrypting under a new policy is a rewrite of every affected row, which the
+  append-only log makes an append of new versions — bounded, but not free, and it interacts
+  with `enforce forward` the way password policy rotation already does.
+
+Blocks TOTP specifically (OQ-011); does not block the `User`/`Credential` split, which is
+settled.
+
 ## Must Resolve During Core Development
 
 ### OQ-005: Schema DSL Syntax ✓ ANSWERED
@@ -161,8 +202,16 @@ Key decisions:
 - **Inline sub-tables**: `address :> Address { ... }` — sugar for a sibling table plus an FK; there is no embedded product-in-row.
 - **Traits**: abstract base types (`trait` keyword); tables extend via `:` syntax; replication traits (`Reference`, `UserData`, `LogData`, `Configuration`) are regular traits
 - **Joins**: `><` bowtie operator; outer join = `Order >< Customer | MissingCustomer` (guard semantics — the same rule as a nullable `:>` field)
-- **Constraints/ACL**: unified `assert name { expr }` keyword; `assert access { user.field == row.field }` for ACL. `where` is unnamed and field-scoped; `assert` is named and row-scoped.
-- **Functor kinds reduced to four**: data constraints and access control are the *same* functor (path equivalence), differing only in whether the left path term is a data path or the requesting token. That difference determines when it runs (commit vs. read+write) and what a read failure does (`Redacted` rather than abort).
+- **Constraints/ACL**: unified `assert name { body }` keyword. `where` is unnamed and field-scoped; `assert` is named and row-scoped.
+- **Functor kinds reduced to four**: data constraints and access control are the *same* functor (path constraint), differing only in whether the requesting token is one of the terms. That difference determines when it runs (commit vs. read+write) and what a read failure does (`Redacted` rather than abort).
+- **The access variety is recognized structurally, not by name.** An assert whose body mentions `authed_user` is an access constraint; anything else is a data constraint. The earlier rule made the *name* `access` select the variety, which was a magic `Ident` with no lexical status — unusable as an ordinary constraint name, yet not reserved. The decisive defect was elsewhere: it made administrator bypass depend on a naming convention, so a perfectly good access rule named `ownerCheck` would not have been bypassed and nothing in the syntax would have said so. Scanning the body is exact. Consequences: `access` is an ordinary name again; every assert has a real name, which every diagnostic benefits from; **all asserts conjoin regardless of variety**, so alternatives are `||` inside one assert rather than several asserts (an access assert that *widened* would invert "recursion sets the ceiling, functors lower it", OQ-024); a conjunct not mentioning the token inside an access assert is silently bypassed too, so schema commit **warns** and names it; and an edit that adds a token mention **reclassifies** the assert, changing read behaviour without touching a field, so the commit diff reports it.
+- **Path constraints gained presence and absence.** The kind's signature widened from `(a, a) → Either Error ()` to `Row → Either Error ()`. A `Query` in assert position asserts its result is **non-empty**; `not` of one asserts it is empty. Equality is now the case where the body is an expression rather than a query. This was not expressible before and could not be faked: every path in the schema graph is single-valued by construction, so an equality-only assert had nothing to quantify over — which is exactly why the pre-existing ACL examples read as contrived. The requesting token enters as a **join term** (`self >< Project >< Member >< authed_user`), so the equality *is* the join and no comparison is written. An outer join with a `Null`-derived catch-all expresses absence too, but `not` is preferred in an assert: nothing consumes the variant there, and the guard form invites the filter-placement error below. No quantifier keyword was added — `any`, `none`, `exists`, and `elem` were all considered and are all unnecessary once a query can stand in boolean position.
+- **Asserts are anchored.** An assert's query must be rooted at `self`, and every subsequent source must be reached by a join along a declared `:>` edge in either direction; an unanchored source is a compile-time error. Access asserts run on every read, so an assert free to scan would scan on every read; anchoring bounds the work to the row's connected component, and any number of hops within it is fine. It also makes the *reverse* direction findable, which is what an absence assertion needs — a write to `Suspension` must revalidate the `Invoice` rows reaching it, and the FK chain traversed backwards is that set. What anchoring does not buy is locality: an FK may cross a shard, which is a warning naming the edge, with system-shard role tables as the pattern that avoids it.
+- **`authed_user` replaces `user`** as the requesting-token binding, and is a full `User` row rather than an id — which answers what the token exposes by making it ordinary path traversal. `user` read like a table name and would have collided with the likeliest field name in any permissions schema. `self` and `authed_user` are **contextual bindings, not reserved words**; `self` had been used in trait function bodies since `traits.md` was written without being listed anywhere. There is deliberately **no `authed_client`** binding: client scope is schema-level configuration, and admitting the client into an assert would put one decision in two places.
+- **Administrator escalation is a grant attribute, not an expression.** `grant <role> on <namespace> bypass access` skips every assert mentioning `authed_user` and nothing else — an administrator is exempt from access control, never from data integrity. Rejected: `|| authed_user.role is Admin` in every rule (spreads one decision across every table, unauditable), and rebinding `authed_user` to all users for administrators (silently changes a term's arity, so `>< authed_user` degrades from "I am a member" to "any member exists", and means nothing for an assert that compares rather than joins). `grant`, `grants`, and `bypass` are the three words this reserved, joining the `TokenCmd` family that already had `revoke`, `on`, and `scoped`.
+- **`=~` is a real operator.** It had been lexed and used since the first draft of `functions.md` while appearing in no production; it is now a `CmpOp`. Its right operand is restricted **by trait** — a string literal, a `Reference` path, or a `Configuration` path — so a pattern can never be user-supplied. The first two resolve at compile time (a `Reference` insert *is* a schema commit) and reject a malformed pattern there; a `Configuration` pattern resolves at runtime, keys the compiled-pattern cache on the config row version, and fails at runtime. TDFA is a DFA engine, so the restriction is about provenance, not backtracking.
+- **Filter before guard.** A filter on an outer-joined source must be written inside the join term; an outer-level `where` naming an outer-joined source's field is a compile-time error. Filtering after the guard deletes the very rows the guard produced, so an account whose every suspension is lifted yields zero rows rather than a `NoSuspension` row. This is SQL's `ON`-versus-`WHERE` trap, closed structurally rather than documented, because the same expression appears inside `assert` where the symptom is not missing rows but a constraint asserting the opposite of what it reads as. Relatedly, `as` is **mandatory** on a join running against the reference direction whenever the query names that source, since there is no `:>` field to name the column and the bare table name would read as though the table were the value.
+- **`not $ …` parses.** `NotExpr` gained an explicit `'not' '$' Expr` alternative. `not` is a prefix operator here rather than a function, so `$` could not fall out of the operator table as it does in Haskell — without it, `not $ …` was written throughout `functions.md` and `auth.md` and parsed nowhere.
 - **Schema evolution**: redeclare table body; system diffs; `rename from` hint; same-name hides old type; `deprecate`/`prune` for removal
 - **Scope**: top-level = global (stored in schema); `let` = local inside function bodies; REPL = transaction model (`:commit`/`:rollback`)
 - **Equality**: `=` is binding only (field default, function definition, sum-type declaration, `let`, row construction and update), `==` is comparison, `is` is constructor match ignoring payload. Follows Haskell. Resolves the earlier doubling where `=` also meant exact value equality.
@@ -173,13 +222,17 @@ Key decisions:
 - **Units are validation, not algebra.** `Duration`'s canonical unit is the millisecond; conversions are stdlib functions (`days`, `hours`, …) written at the use site, so `rate * days (t - opened_at)` says what `rate` means without a dimensional type system. Domain types narrow value sets; arithmetic operates on the underlying primitive. Dimensional typing was rejected as too large an addition for the benefit, and because it collides with functor transparency and the GADT DSL's ceiling (OQ-001).
 - **Retention and rollups**: `aggregate <Name> = <query>` declares what to compute; `retain <Table> as <Name>` declares a chain of resolutions and how long each is kept. A chain never reshapes, which is why the aggregate is named once on the header — a differing step is unrepresentable rather than rejected. Terminals are `forever` (keep) and `drop` (discard); `never` was rejected because in a construct full of durations it reads as "never delete". Ordered `where`/`otherwise` branches partition a table, first match wins, as in a Haskell guard — one block rather than N statements, because order is load-bearing and separate statements have no reliable order. Chain aggregates must declare an associative merge with an identity (`count`/`sum`/`min`/`max` do; `avg` is silently rewritten to `(sum, count)`; `percentile` cannot and is rejected past one step) — phrased as a rule about merges rather than a whitelist so sketch types drop in later. `bucket_start` is injected into every generated level and `grain` is a virtual column, so `RequestRollup where grain == hour` selects a level with no new query syntax; the aggregate's plain name is the union view over all levels, making transparent querying the default and reaching into one level the marked case. **Pruning `LogData` is only ever a consequence of a chain** — there is no manual prune, and a table with no chain is never pruned, which is what closes OQ-032 structurally. A rollup is two appends (aggregate rows, then a prune node), never a rewrite of the transaction being summarized. Rollup levels are consequently real tables, not materialized views: a materialized view is recomputable from its source by definition, and here the source is gone.
 - **View keys are derived, never declared.** A `unique` declaration in a view body is rejected. Every view has a key — a table is a set of tuples, so at worst the whole tuple is one — which makes *existence* the wrong question and **meaningful** (a proper subset identifying an entity) versus **degenerate** (all attributes) the right one. Propagation: `where` preserves; projection preserves iff every key column survives, else degenerates; `group` yields the group columns exactly, and exactly rather than approximately because DataCode's `group` nests instead of aggregating away; a `:>` join yields the referencing side's key alone and is lossless, with FK fields substituting to the referent's key so the key survives the FK column being projected away; a non-key join yields the union; a union of relations needs a discriminator that may not exist; an outer join degenerates when a key column comes from the outer side, for the same reason a declared key may not contain a `Null`-derived variant. Degeneracy is a **warning, not an error** — reporting views legitimately have no entity identity — but never silent, because a view claiming an identity it lacks would be trusted by merge reconciliation. Two things depend on the answer: a meaningful key admits **incremental refresh** (upsert by key) where a degenerate one admits only full recomputation; and an incrementally-maintainable view is a **candidate to replace its sources** — the general form of a retention chain superseding its raw table — while a degenerate one pins them, so `deprecate` on a source with a degraded dependent view is rejected until the view is altered or deprecated.
+- **A view is a named query**: `view Name : Traits = <query>`, binding with `=` exactly as `aggregate` does. The table-style view body is **withdrawn**. It could not express a join at all — there was no production for one — which made "the users reachable through this linking table" unwritable, and that was the whole requirement. Three things went with it: the standalone `where` body item (and the rule that position told a row filter from a field validation), `WildcardField` (`* from <table>`), and `FieldDecl`'s bare `from <table>` clause. `rename from` stays; it is an evolution hint and never concerned views. A view's asserts are consequently standalone-only. Projections gained two forms to compensate: an `Expr` (requiring `as`, since a computed column has no name to inherit) and a qualified `*` (`User.*`) to take one side of a join, with a later item overriding an earlier `*` on the same name.
+- **A view's field types are inherited or computed, never declared.** A projected `FieldPath` keeps the source field's type and its validations; a projected expression **mints a computed type named by the view field's path**, which is not a new naming rule but the existing one (a field's `where` is already addressed by its path, and that path already names its computed type) reaching a new position. Types are shared **structurally** and named by their first definer — two views projecting the same function over the same source type get one type, since functor transparency makes that decidable — so the name outlives its definer's `deprecate`. A function over a key column **degenerates the key**, because injectivity is not knowable in general, which costs incremental refresh, pins the sources, and makes the view read-only.
+- **Views are writable, and the derived key is what decides it** — a third consumer of the meaningful/degenerate distinction, alongside incremental refresh and `deprecate` blocking. An insert decomposes into one mutation per base table ordered by FK direction, admissible exactly when the key is meaningful, every join is along a `:>` edge (so the join is lossless and each view row is at most one row per base), and every undefaulted field of each base is projected or fixed by the view's `where`. **The view's `where` is a check constraint on write whose constant equalities supply values on insert** — SQL's `WITH CHECK OPTION` doing one extra job, and the mechanism that lets adding a row through `system.auth.ServiceAccount` create the linking row without the call site naming it. `delete` removes the row the key identifies and never cascades: for a `:>` join that is the referencing side, so deleting a service account leaves the `User`. Stated explicitly because it reads as though the user should go too.
 - **Capitalization** follows Haskell: types, traits, tables, views, and sum-type variants are `UpperCamelCase` and singular (a table is a type — `table T : Trait` uses the same `:` that `type A : B` does, and a row is an `Order`, not an `Orders`); fields are `lower_snake_case`; functions, predicates, and constraint names are `lowerCamelCase`; namespace segments are `lowercase`. The field/function split is deliberate — a field names stored data and reads as a column, a function is code and reads as Haskell. Capitalization is style checked by the linter, not grammar: `Ident` admits either case everywhere and position decides what a name is.
-- **Placement is separate from identity and needs only a total order.** A candidate key answers *which row is this*; placement answers *where does it go*. `DataId` is excluded from satisfying the candidate-key rule — counting the surrogate would make it vacuous — but it is monotone, total, and present on every row, so it is always a valid *placement* key. Consequence: **every shard can be split**, and a declared partition space only chooses where the cut falls. `LogData` therefore gets the root it was missing: a `system.shards.LogSegment` row keyed `{ server, period_start, branch }`, with all three components derivable or decidable at write time — server from bytes 6–7 of the row's own `DataId`, period from bytes 0–5, branch from the `retain` predicate, which may reference only group fields and the time source. Routing costs zero stored bytes, the log table itself stays keyless, the segment root carries the key instead, and retention aligns to segments so pruning becomes an unlink. A third layer is named to keep this safe: an **extent** is storage, a **shard** is authority, and `PhysicalLocator` already draws the line by carrying `plShard` but *not* the byte offset — so moving a row within its shard rewrites one `log_index` value and is invisible to the graph, while moving it across shards is a recorded split. Splitting a shard with one root row is thus possible but yields a **shard group** sharing a primary, because non-root uniqueness, `assert` evaluation, and `Ordinal` assignment are all defined as within-one-shard. **No syntax was added**: a `shard by <grain>` clause on `retain` was considered and rejected, since the segment key supplies the same alignment for free.
+- **Placement is separate from identity and needs only a total order.** A candidate key answers *which row is this*; placement answers *where does it go*. `DataId` is excluded from satisfying the candidate-key rule — counting the surrogate would make it vacuous — but it is monotone, total, and present on every row, so it is always a valid *placement* key. Consequence: **every shard can be split**, and a declared partition space only chooses where the cut falls. `LogData` therefore gets the root it was missing: a `system.shards.LogSegment` row keyed `{ origin_server, period_start, branch }`, with all three components derivable or decidable at write time — `origin_server` from bytes 6–7 of the row's own `DataId` (the virtual column, declared nowhere), period from bytes 0–5, branch from the `retain` predicate, which may reference only group fields and the time source. Routing costs zero stored bytes, the log table itself stays keyless, the segment root carries the key instead, and retention aligns to segments so pruning becomes an unlink. A third layer is named to keep this safe: an **extent** is storage, a **shard** is authority, and `PhysicalLocator` already draws the line by carrying `plShard` but *not* the byte offset — so moving a row within its shard rewrites one `log_index` value and is invisible to the graph, while moving it across shards is a recorded split. Splitting a shard with one root row is thus possible but yields a **shard group** sharing a primary, because non-root uniqueness, `assert` evaluation, and `Ordinal` assignment are all defined as within-one-shard. **No syntax was added**: a `shard by <grain>` clause on `retain` was considered and rejected, since the segment key supplies the same alignment for free.
 - **Operational tuning is a row, not a trait.** A trait declares what a table *is*; a `Configuration` row declares how a deployment *treats* it. Extent size and segment period track hardware and must differ between staging and production without branching the schema, so they are rows in `system.shards.ExtentPolicy` keyed by table path, with `system.shards.ExtentOverride` keyed `{ table, server }` for per-server exceptions, resolved most-specific-first — two tables rather than one, because a `Null`-derived "all servers" variant in a key is rejected. Traits consequently take **no parameters**; where a declaration must name a policy the spelling is a reference to a policy row, as `Hashed Text using system.crypto.HashPolicy.password_v2` already does. Same separation as enforcement modes, queue retry policy, and retention.
 - **`system` is a namespace, not a replication class.** It had been listed as a fifth shard type in `transaction-graph.md` and as a table type in `namespaces.md`; both are corrected. Tables in `system` carry ordinary replication traits — `system.integrity.Violation` is `LogData`, `system.shards.Node` is `Configuration`. Namespace says whose a table is and who may see it; trait says how it propagates.
 - **There is one `delete`.** The `delete!` "hard delete" spelling is **withdrawn**. Its documented distinction from `delete` was not one — both left the record in the transaction graph and removed the row from the current state, which is the definition of a delete, so `delete!` was redundant syntax carrying a sigil that promised something it did not do. `delete` is an ordinary mutation: it appends a tombstone version, the row is absent at sample moments at or after it and present at any earlier `at`, the `DataId` is never reused, and writing a new version restores it. The operation `delete!` would have had to mean — destroying bytes already in the append-only log — is real and needed, but it is an administrative act on a shard rather than a row mutation, so it is not reachable from the query language at all. See OQ-036.
+- **The virtual columns are projections of the row identifier**, which makes `created_at` an instance of a rule rather than a special case: bytes 0–5 are `created_at`, bytes 6–7 are `origin_server`, and a component's id suffix is `ordinal`. Two are added. **`origin_server`** is typed `:> system.shards.Node` rather than `Int` — as a bare 2-byte integer every "which server wrote this" query is a manual join against a magic number meaningless outside the registry that defines it. It is the only virtual column that is a reference and the only one resolving through a candidate key rather than a `DataId`, since the projected bytes *are* `Node`'s key; `Node` is `Configuration` so the join is local everywhere, and its rows become permanently non-prunable, which costs nothing at one row per server and is what keeps a retired server's historical rows readable (an `| RetiredServer` alternation was rejected — it puts an absence case in every query for no gain). `system.shards.LogSegment` had been hand-rolling this projection as a declared `server` field; that field is **removed** and its key now names `origin_server` directly, which required settling that virtual columns are eligible in a key — all of them but `updated_at`, which is excluded for the same reason a `Behavior` is: not because it is virtual, but because it moves. `period_start` stays declared, and the asymmetry is the point — `period` is a `Configuration` value that may be retuned while routing is never revised, so a truncation under a mutable policy must be pinned at write time; bytes 6–7 cannot be retuned and so need no pinning. **`ordinal`** closes a real gap rather than adding sugar: without it there is no way to *state* document order in a query, only to receive it from a range scan, which cannot be restated after a join or reversed. It is the position at the row's own level, not the full path — nesting makes a path variable-length, the rendered identifier already spells it, and a column whose type varied with nesting depth would be worse than what it duplicates. **The sequence counter (bytes 8–11) stays unexposed**: it disambiguates within one server-millisecond and is a tiebreak rather than an ordering — two servers' values are incomparable, and the clock-regression clamp deliberately continues it across a held timestamp — while `DataId` order already gives the total order anyone reaching for it wants. `updated_at` remains the odd one out, reading the head locator rather than the identifier. See `transaction-graph.md`.
 - **Guiding principle**: where a choice is otherwise balanced, pick the spelling a Haskell reader would expect. DataCode's operators may carry narrower meanings than Haskell's — `where` constrains rather than binds — but the shape should be familiar.
-- **Open**: migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`); ACL token field access — what `user` exposes beyond `user.id` (`auth.md`)
+- **Open**: migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`)
 
 ### OQ-030: Event Functor Syntax ✓ ANSWERED
 **Answer**: `on <condition> emit <queue> { <payload> }` on the producing table, and
@@ -384,8 +437,15 @@ Thresholds and the segment period are `Configuration` rows (`system.shards.Exten
 OQ-035.
 
 ### OQ-008: Client Token Provisioning
-**Question**: How are client tokens issued and distributed to thick client deployments?
-**Notes**: Client tokens are long-lived and represent an application's identity. Must be rotatable without disrupting users.
+**Question**: Which identifiers must each platform supply at device registration?
+**Settled**: Client tokens are issued to a **device**, through a registration process, and the
+required identifiers are **per-platform configuration in `system.auth.*` rather than a fixed
+schema** — a desktop install, a mobile app, and a headless agent agree on nothing, so a fixed
+set would be wrong for at least two of them. Registration yields a token scoped to a namespace
+subtree (`issue client token for … scoped to …`), rotatable without disturbing the user tokens
+presented alongside it. See `auth.md`.
+**Still open**: the identifier set per platform, and what constitutes sufficient device
+identity on each.
 
 ### OQ-009: Weighted Cardinality Algorithm
 **Question**: What is the exact function `f(element_count, element_size)` that determines relationship rendering level?
@@ -394,14 +454,33 @@ OQ-035.
 
 ### OQ-010: PageRank Parameters for Schema Linearization
 **Question**: What are the damping factor, convergence criteria, and edge weighting rules for schema PageRank?
-**Notes**: Edge types (foreign key, path equivalence) may warrant different weights. Should be tunable.
+**Notes**: Edge types (foreign key, path constraint) may warrant different weights. Should be tunable.
 **Second consumer**: schema PageRank also breaks ties in `UserData` extent clustering — which dependent tables sit next to the root when they cannot all fit (`storage.md`). That imposes a requirement the IDE alone did not: the computation must be **deterministic**, because two servers computing it independently must reach the same layout. Convergence criteria expressed as "close enough" are therefore unacceptable without a fixed iteration count and a canonical tie-break.
 
 ## Can Defer to Post-MVP
 
-### OQ-011: FIDO2/WebAuthn for Long-Lived Credentials
-**Question**: Should the identity provider support hardware security keys?
-**Notes**: Strong security improvement but significant implementation complexity. Not required for initial deployment.
+### OQ-011: FIDO2/WebAuthn for Long-Lived Credentials ✓ ANSWERED
+**Answer**: **Yes, but not in the first pass.** What the first pass owes it is a model flexible
+enough to take it later without disturbing anything, and that is settled:
+
+- **`system.auth.User` is authentication-method agnostic.** A user row is an identity; the
+  proof of that identity is a `system.auth.Credential` row keyed `{ user, method }`. One user
+  may hold several credentials at once, and a new method is a new `CredentialMethod` row —
+  a `Reference` table, so adding one is a schema commit — rather than a change to `User` or to
+  the rows already in it. Adding WebAuthn later touches no existing row.
+- **Multi-factor is a prerequisite edge, not a flag.** `CredentialMethod.requires` names a
+  method that must also be satisfied, which puts "administrators need a second factor" in the
+  method and in one presence assert rather than in login code.
+- **A delivered one-time code is an occurrence, not a credential**, so it is a `Challenge` row
+  in its own `LogData` table: `Hashed` code, `on state is Issued emit` for the send, expiry as
+  a `Behavior`, `retain` chain for cleanup. Nothing new was needed, and it means a second
+  factor is available in the first pass. Separating enduring capability from occurrence is the
+  `User`/`Credential` split paying for itself twice.
+- **Not every method fits `Hashed`** — an authenticator app's shared secret must be recoverable.
+  That is OQ-037, and it blocks authenticator apps and outbound connector credentials
+  specifically, not multi-factor and not the split above.
+
+Implementation remains post-MVP. See `auth.md`.
 
 ### OQ-012: Analytical Query Distribution Protocol
 **Question**: How exactly are distributed materialized view computations coordinated between neighboring servers?
@@ -417,9 +496,29 @@ OQ-035.
 **Question**: How does the HTML rendering engine decide when to use D3.js visualizations vs. plain HTML?
 **Notes**: Likely a theme-level decision (some themes include D3 components). Needs more design once base HTML rendering is working.
 
-### OQ-015: Service Accounts
-**Question**: Should there be a distinct "service account" token type for machine-to-machine calls (not associated with a human user)?
-**Notes**: The current model requires a user token on every request. Service-to-service calls may need a different model.
+### OQ-015: Service Accounts ✓ ANSWERED
+**Answer**: **Yes as a concept, no as a token type.** Machine callers hold ordinary
+`system.auth.User` rows, so every request still carries a user token and there is no second
+identity model. What distinguishes a service account is a linking row and a **view** over it:
+
+```
+view system.auth.ServiceAccount = User >< AccountKind { User.*, AccountKind.purpose }
+  where kind is Service
+```
+
+The view is a filter over `User`, not a subtype — it narrows to the rows reachable through a
+linking table and may project that table's columns or not. Because the join is along a `:>`
+edge and the derived key is meaningful, it is **writable**: inserting through it creates the
+`User` row and the `AccountKind` row, with `kind = Service` supplied by the view's own filter.
+That is the point of the pattern rather than a bonus — the call site never names the linking
+table.
+
+A trait was rejected. A trait is a declaration on a table, so `User : ServiceAccount` would
+make every user one; the thing being described is a set of rows, which is a view's job.
+
+The motivating case is third-party ingestion: a connector authenticates as a service account
+whose credentials are `ApiKey`-method rows, and everything it writes is attributable to an
+identity living in the same tables and obeying the same asserts as a human's. See `auth.md`.
 
 ### OQ-016: The Progression of Relationship Rendering Levels
 **Question**: What is the full progression from radio buttons through "shopping cart" for relationship rendering?
@@ -461,9 +560,33 @@ OQ-035.
 **Notes**: When functor-based and timestamp-based resolution both fail, an operator must review. The UI needs to show: both versions of the conflicting record, the mutation history from both transaction logs, and a way to choose or merge.
 **Action**: Design after the connector sync protocol is implemented.
 
-### OQ-024: Namespace Access Control Inheritance
-**Question**: Does granting access to a namespace automatically grant access to all child namespaces and tables, or must each level be granted explicitly?
-**Notes**: Implicit inheritance is more convenient; explicit grants are more secure. A default-deny model with explicit grants is safer for production, but more verbose for initial setup.
+### OQ-024: Namespace Access Control Inheritance ✓ ANSWERED
+**Answer**: **Grants recurse to children.** A grant on a namespace reaches that namespace and
+every descendant namespace, table, view, and functor within it. See
+[namespaces.md](namespaces.md#namespace-access-control).
+
+The model is default-deny with recursive grants, which is not the same as the "implicit
+inheritance vs. explicit grants" tradeoff the question posed. Nothing is granted by tree
+membership: there is no root grant, and a grant confers nothing on siblings or ancestors. What
+recurses is an *explicit* grant, downward over the subtree it names. Requiring a grant per
+level would have made the namespace tree decorative for authorization purposes — the reason to
+put a table under `app.commerce` is that it belongs with the rest of `app.commerce`, and that
+is exactly the statement a grant wants to make.
+
+Narrowing stays available and is the marked case: additional functors restrict at the table or
+row level beneath an inherited grant. Recursion sets the ceiling; functors lower it.
+
+**Amended: a grant may declare `bypass access`.** "Functors lower it" left no way to express an
+administrator, whose authority is precisely not to be lowered, and the alternatives were both
+bad — `|| authed_user.role is Admin` in every rule spreads one decision across every table and
+cannot be audited, and rebinding the token to all users silently changes a term's arity.
+`grant <role> on <namespace> bypass access` skips every assert mentioning `authed_user`, on
+read and on write, and skips nothing else: an administrator is exempt from access control,
+never from data integrity. The exemption is exact because the set of access constraints is
+read off the assert bodies rather than off their names (OQ-005). Two properties follow from
+putting it in the grant: bypass is one queryable place, and it is subtree-scoped like every
+other grant, so an administrator of `app.pm` is an ordinary user everywhere else. See
+`namespaces.md`.
 
 ### OQ-025: Connector Schema Change Propagation
 **Question**: When an external schema changes (new column added to MariaDB table), how does DataCode notify users whose application schema (`app.*`) references that connector table?

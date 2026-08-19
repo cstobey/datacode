@@ -201,7 +201,7 @@ table system.integrity.Violation : LogData {
   observed      : Bytes | Redacted | NotGiven,
   state         : Open | Acknowledged | Waived Text | Repaired,
 
-  assert access { user.id `canRead` subject_table }
+  assert readableAccess { authed_user `canRead` subject_table }
 }
 ```
 

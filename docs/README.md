@@ -21,7 +21,7 @@ diagrams.
 | [schema/types.md](schema/types.md) | Primitives, domain types, sum types, `Moment` and `Behavior`, absence types, `is`, `Secret` and `Hashed` |
 | [schema/tables.md](schema/tables.md) | Table bodies, fields, defaults, candidate keys, ordering, foreign keys, sub-tables |
 | [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
-| [schema/constraints.md](schema/constraints.md) | `assert`, path equivalence, access control |
+| [schema/constraints.md](schema/constraints.md) | `assert`, path constraints, presence and absence, access control |
 | [schema/documents.md](schema/documents.md) | The `Doc` type, shredding, key interning |
 | [schema/aggregates.md](schema/aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
 | [schema/evolution.md](schema/evolution.md) | Redeclare, deprecate, prune, split, merge, ADT extension |

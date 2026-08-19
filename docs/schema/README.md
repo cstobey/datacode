@@ -10,7 +10,7 @@ than restating it.
 | [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, absence types, `is`, `Secret`, `Hashed` |
 | [tables.md](tables.md) | Table bodies, field declarations, defaults, candidate keys, ordering, foreign keys, sub-tables |
 | [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
-| [constraints.md](constraints.md) | `assert`, path equivalence, access control |
+| [constraints.md](constraints.md) | `assert`, path constraints, presence and absence, access control |
 | [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill |
 | [aggregates.md](aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
 | [evolution.md](evolution.md) | Redeclaration, rename, deprecate, prune, split, merge, ADT extension, visibility |
@@ -172,7 +172,8 @@ Because a bare `=` therefore cannot appear at bracket depth 0 inside a predicate
 `total : Amount = 0 where isPositive` has exactly one parse.
 
 Operator spelling follows Haskell throughout: `==`, `/=`, `&&`, `||`, `not`, `True`,
-`False`. There are no `!=`, `and`, or `or` tokens.
+`False`. There are no `!=`, `and`, or `or` tokens. `=~` is regex match, and its right operand
+must be a literal, a `Reference` path, or a `Configuration` path — never user input.
 
 ### Backticks and `$`
 
@@ -183,8 +184,8 @@ operator, looser than juxtaposition). This matters most for two-argument predica
 read as the assertions they are rather than as function calls:
 
 ```
-attempt `matches` user.password
-user.id `canRead` subject_table
+attempt `matches` credential.secret
+authed_user `canRead` subject_table
 ```
 
 **`$` is low-precedence right-associative application** (`infixr 0`). Its practical effect is

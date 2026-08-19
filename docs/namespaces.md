@@ -89,12 +89,14 @@ These namespaces are:
 - **Referenceable** in user-defined namespaces via views:
   ```
   -- app.commerce.Order is a refined view of the connector shadow schema
-  view app.commerce.Order {
-    customer :> app.commerce.Customer,
-    total     : Amount,      -- coerced from connectors.mariadb.production.Order.total_cents / 100
-    status    : OrderStatus  -- coerced from String to ADT
-  }
+  view app.commerce.Order = connectors.mariadb.production.Order
+    { customer
+    , total_cents / 100     as total
+    , toOrderStatus (status) as status
+    }
   ```
+  Each coercion is a named function in the projection, and each mints the view field's type —
+  see [schema/queries.md](schema/queries.md#view-field-types).
 
 ## Schema Visibility Layers
 
@@ -114,10 +116,40 @@ The human-managed application schema (`app.*`) is `standard` or `featured` by de
 
 ## Namespace Access Control
 
-Access control functors can be applied at the namespace level, not just the table level:
+The model is **default-deny with recursive grants** (OQ-024). Access control functors can be
+applied at the namespace level, not just the table level:
+
 - A client token granted access to `app.commerce` automatically has access to all tables in that namespace and its children
 - Access can be further restricted at the table or row level by additional functors
-- A token with access to `app` does not automatically have access to `system` — namespace containment does not imply access containment
+- Grants are per-subtree and explicit: a grant on `app` reaches only `app` and its descendants. It confers nothing on siblings or ancestors — access to `app` is not access to `system`, and there is no implicit grant at the root
+
+### Bypass
+
+Recursion sets the ceiling and functors lower it — which leaves no way to express an
+administrator, whose authority is precisely *not* to be lowered. A grant may therefore declare
+that row-level access does not apply to it:
+
+```
+grant  system.auth.Role.Admin on app.pm bypass access
+revoke grant system.auth.Role.Admin on app.pm
+show   grants for app.pm
+```
+
+`bypass access` skips every `assert` that mentions `authed_user`, on read and on write, and
+**skips nothing else**. Data constraints still run: an administrator is exempt from access
+control, never from data integrity. Because the set of access constraints is read off the
+assert bodies rather than off their names
+([schema/constraints.md](schema/constraints.md#the-variety-is-decided-by-the-body)), that
+exemption is exact rather than a matter of whether a rule was named the way its author
+expected.
+
+Two properties follow from putting this in the grant rather than in the tables. Bypass is
+**one queryable place** — "who can see everything under `app.pm`" is a query against
+`system.auth.Grant`, not a scan of every table's asserts. And it is **subtree-scoped** like
+every other grant, so an administrator of `app.pm` is an ordinary user everywhere else.
+
+The grant is a row; the CLI spelling above writes it. See
+[cli.md](cli.md#grants) and [auth.md](auth.md#schema-level-access-and-bypass).
 
 ## Backwards Compatibility
 

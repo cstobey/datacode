@@ -89,6 +89,12 @@ This one rule covers both kinds of trigger, which is why there is no separate ke
 
 - A condition over **stored fields** is evaluated before and after the write. An order
   committed twice while already `Shipped` enqueues one email, not two.
+- **An insert is the degenerate case of the same rule.** Before the write the row did not
+  exist, so the condition was not true; after it, it may be. `on state is Issued emit …` on a
+  table whose rows are created with `state = Issued` therefore fires once per row, at creation,
+  with no "on insert" keyword. `system.auth.Challenge` ([auth.md](auth.md#challenge-methods))
+  is the case this was noticed on: issuing a one-time code *is* inserting the row, and the send
+  is the event.
 - A condition over a [behavior](schema/types.md#behaviors) has no write to observe, so the
   scheduler **solves for the moment the condition becomes true** and wakes up then:
 
