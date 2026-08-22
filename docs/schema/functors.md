@@ -13,11 +13,17 @@ in system tables, referenced by `FunctorRef`, and encoded in the GADT DSL (confi
 | 1 | **Validation** | `a → Either Error a` | On commit | Rejects invalid field values (range checks, format checks, domain invariants) |
 | 2 | **Foreign key** | `DataId → Either Error Row` | On commit | Referential integrity — resolves a DataId to a live row in the referenced table |
 | 3 | **Path constraint** | `Row → Either Error ()` | See below | Asserts something about what is reachable from a row through the schema graph. Comes in two varieties: data constraint and access constraint |
-| 4 | **Event** | `a → EventRef` | On commit | Schedules a deferred side effect — enqueues a work item in a DataCode queue table rather than executing immediately |
+| 4 | **Event** | `a → EventRef` | On commit, or on a tick | Schedules a deferred side effect — enqueues a work item in a DataCode queue table rather than executing immediately |
 
 Kinds 1–3 are synchronous and transactional: they run as part of the commit and can abort
 it. Kind 4 is asynchronous and decoupled: the commit always succeeds (inserting the queue
 row is the commit), and the side effect runs later under the event scheduler.
+
+All four are `Read` or `Tx` — none of them may call out. The **handler** a queue names is not a
+fifth kind and is not a functor at all: it runs in `Effect`, outside the commit, and is
+compiled-in Haskell rather than a DSL term. That is why it can be arbitrary Haskell when
+functors cannot — it needs none of transparency, static access analysis, or replayability. See
+[functions.md](functions.md#the-effect-ladder) and [../events.md](../events.md#handlers).
 
 **A [behavior](types.md#behaviors) is not a fifth kind.** Each kind above enforces something —
 validation rejects, foreign keys resolve, path constraints assert, events enqueue. A behavior
@@ -33,7 +39,8 @@ functors only as the subject of an event condition.
 | Foreign key | `:>` field declaration | [tables.md](tables.md) |
 | Path constraint — data | `assert <name> { … }`, body without `authed_user` | [constraints.md](constraints.md) |
 | Path constraint — access | `assert <name> { … }`, body with `authed_user` | [constraints.md](constraints.md) |
-| Event | `on <condition> emit <queue> { <payload> }` | [../events.md](../events.md) |
+| Event — transition | `on <condition> emit <queue> { <payload> }` | [../events.md](../events.md) |
+| Event — sampled | `every <interval> emit <queue> { <payload> } where <condition>` | [../events.md](../events.md) |
 
 ## Order of Operations for a Field Write
 
@@ -153,13 +160,20 @@ on status is Shipped emit app.events.EmailQueue { recipient = customer.email, ..
 
 **The condition fires on a `False` → `True` transition, never on merely being true.** For a
 condition over stored fields the transition is observed across the write. For a condition over
-a [behavior](types.md#behaviors) there is no write to observe, so the scheduler solves for the
-moment the condition becomes true and wakes then — which is why behaviors are restricted to a
-closed-form-solvable class. See
+a closed-form [behavior](types.md#behaviors) there is no write to observe, so the scheduler
+solves for the moment the condition becomes true and wakes then — which is why behaviors are
+restricted to a closed-form-solvable class. See
 [../events.md](../events.md#behavior-triggered-scheduling) for what remains open there.
 
+`every` is the second trigger form and the same rule holds: it samples the condition at each
+tick and fires only on a transition, observed between ticks rather than across a write. Its
+interval is any `Read` expression of type `Duration`, so a literal, a field of the row, and a
+`Configuration` path are one production — which is how a poll interval stays tunable without an
+override mechanism. Sampling costs a stored last-tick bit per `(trigger, row)`, so schema commit
+warns when the solver could have closed the condition instead.
+
 Retry policy is deliberately not part of the registration: `max_attempts` and `backoff_base`
-are rows in `system.events.Queue`, because retry is an operational property of the
+are rows in `system.events.QueuePolicy`, because retry is an operational property of the
 destination rather than of the trigger, and tuning it should not require redeclaring a table.
 This is the same separation used for enforcement modes.
 

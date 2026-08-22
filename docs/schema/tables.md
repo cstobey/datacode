@@ -223,6 +223,57 @@ ambiguity — which is what lets the rule be strict.
 > illustrating something else. A three-line fragment showing `order by` or an `assert` is not
 > a complete table and would not compile as written.
 
+## Sequences
+
+`next <UniqueName>` in a default allocates the next value in a sequence:
+
+```
+table app.commerce.Order : UserData {
+  customer  :> Customer,
+  order_num : Int = next orderRef,
+  unique orderRef { customer, order_num }
+}
+
+table app.billing.Invoice : UserData {
+  invoice_num : Int = next invoiceNum,
+  unique invoiceNum { invoice_num }
+}
+```
+
+> **The scope of a sequence is the scope of the uniqueness it serves.**
+
+`next` allocates within the named `unique` constraint's field list **minus the field being
+defaulted**. That one rule produces both cases without the author declaring a scope twice:
+
+| Declaration | Sequence scope | Coordination |
+|---|---|---|
+| `unique orderRef { customer, order_num }` | per `customer` | none — local to that shard |
+| `unique invoiceNum { invoice_num }` | table-wide | the table's master shard |
+
+`orderRef`'s prefix is `customer`, so the counter lives with the customer row, and the
+increment is a read-modify-write inside a transaction that already touches that shard.
+`invoiceNum`'s prefix is empty, so it is table-wide and reaches the master shard — exactly like
+a table-wide `unique` constraint, and for the same reason. **The shard cost is readable off the
+declaration**, because it is the same prefix-reaches-the-root question the candidate key already
+asks (see [Candidate Keys](#candidate-keys-are-mandatory)).
+
+Three consequences:
+
+- **A table-wide `next` warns at schema commit**, naming the serialization it introduces —
+  every insert to that table will queue behind the master shard. A prefixed `next` whose prefix
+  reaches the shard root warns about nothing, because it costs nothing.
+- **Gaps are guaranteed.** An aborted transaction burns a value. Nobody gets gapless sequences
+  without serializing every insert, and where the number is externally meaningful — invoice
+  numbers an auditor will read — gapless is a *reporting* requirement satisfied by a view over
+  the log, not by the allocator.
+- **`next` is an allocation, not a value.** It is admissible only in a `DefaultClause`, only on
+  a field the named `unique` includes, and is rejected in a `where`, a `Behavior` definition, a
+  projection, and a view.
+
+Counter storage is one row per (constraint, prefix value), sharded by the prefix — the same
+sharding rule as everything else. Layout numbers are open with the other sharding numbers in
+[OQ-035](../open-questions.md#oq-035-extent-size-segment-period-and-shard-group-formation).
+
 ## Behavior Fields
 
 A field whose type is `Behavior a` is computed from the row at the moment it is observed
@@ -373,6 +424,42 @@ table app.log.Request : LogData {
 `Component` is a replication trait, so it occupies the same slot as `UserData` or `LogData`
 and cannot be combined with one. Full treatment, including the invariants that make the
 compact identifier sound, is in [traits.md](traits.md#component).
+
+#### A Component Default Constructs the Row
+
+A `DefaultClause` on a component field is a row construction, performed in the same
+transaction as the parent's insert:
+
+```
+table app.crm.Account : UserData {
+  name     : Text unique,
+  settings :> Settings : Component = { theme = Dark, digest = Weekly }
+}
+```
+
+The sub-table body is what makes it a construction rather than a reference, and that is the
+whole difference between the two default shapes a `:>` field admits:
+
+```
+created_by :> User = authed_user                      -- references an existing row
+settings   :> Settings : Component = { theme = Dark } -- constructs one
+```
+
+**A row that must exist whenever its parent exists is a total function of the parent, not an
+event.** This is why the "default table" case needs no trigger machinery: `Component` already
+owns lifetime and `=` already takes a row construction, so the two compose. No shard question
+arises either — a component lives in its parent's row-rooted shard by definition, so the
+construction is local.
+
+Deleting the parent deletes its components, in the same transaction, mechanically over
+`Component` edges. There is no cascade declaration and no depth limit to configure, because the
+edges *are* the ownership; this is the same statement about lifetime read in the other
+direction. Non-`Component` foreign keys never cascade.
+
+A cross-table in-commit trigger to a **non**-`Component` table is refused. If a row must exist
+atomically with another and has independent identity and lifetime, that is a modelling error —
+make it a component, or make it a view. See
+[../events.md](../events.md#internal-effects-are-derived-not-triggered).
 
 ## Constraints and Access Control
 

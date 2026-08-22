@@ -23,6 +23,12 @@ possible while retaining dynamism.
 
 **Zero runtime GHC dependency.** ~0µs functor apply latency.
 
+**The DSL should be indexed by effect.** Every term is `Read` or `Tx` — a validation, an assert,
+and a template hole are `Read`; a field default is `Tx` — and **nothing in the DSL is `Effect`**,
+because effectful code is compiled-in Haskell that lives outside it. That is the shape "no
+arbitrary IO" now takes: not a rejected signature, but an absent lift. See
+[schema/functions.md](schema/functions.md#the-effect-ladder).
+
 This is the *Typed DSL* approach (Option A in the addendum) taken as the foundation, with
 the multi-daemon architecture (Option C) covering the cases the DSL cannot absorb. The
 runtime-Haskell escape hatch (Option E) is deferred, not adopted — see below.
@@ -37,7 +43,7 @@ All four functor kinds (see [schema/functors.md](schema/functors.md)):
 | Foreign key | ✓ Validated |
 | Path constraint — data | ✓ Validated, for the equality shape only |
 | Path constraint — access | ✓ Validated, for the equality shape only (same DSL construct; differs only in whether a term is the token) |
-| Event | ✗ **Not validated.** Requires a DSL extension producing an `EventRef` — a queue-table row insert — rather than `Either Error a`. Surface syntax also undefined; see OQ-030 |
+| Event | ✗ **Not validated.** Requires a DSL extension producing an `EventRef` — a queue-table row insert — rather than `Either Error a`. Surface syntax is now settled (OQ-030) and has **two** trigger forms: `on`, and `every` with a per-row `Read` interval expression |
 
 Collapsing data constraints and access control into a single path-constraint functor means
 the DSL needs one construct where it previously appeared to need two.
@@ -60,7 +66,23 @@ The DSL is a ceiling by construction. Four limits are already identified:
   DSL can hold rather than an arbitrary expression it would have to evaluate.
 - **Anchored subquery with a non-emptiness test** — the presence and absence shapes above
 - **Recursive types** require a DSL extension
-- **User-defined functions** require new DSL constructors — they cannot be arbitrary Haskell
+- **User-defined functions** require new DSL constructors — they cannot be arbitrary Haskell.
+  **This ceiling has since split in two, and only half of it still binds.** *Handlers* escape it
+  on their merits: a handler runs in `Effect`, outside the commit, and needs none of
+  transparency, static access analysis, or replayability, so it is compiled-in Haskell
+  registered in `system.events.Handler` rather than a DSL term. *Functors* do not escape it —
+  they are `Read` or `Tx` DSL terms, and a new business rule must need no restart. The cost
+  moved rather than vanishing: adding an **integration** now sits on the multi-daemon restart
+  path, which makes restart latency a number this design owes rather than an unrun spike. See
+  [events.md](events.md#handlers).
+- **An interval expression per row per tick.** `every`'s interval is any `Read` expression of
+  type `Duration`, evaluated per row on every tick, so the event extension is not just a
+  constant-carrying `EventRef` producer.
+- **A stored DSL term as a typed column value.** A function-typed column is a `FunctorRef` whose
+  signature the type checker knows ([schema/functions.md](schema/functions.md#functions-as-column-values)).
+  Mostly a typing change over what `FunctorRef` already does, but it makes acyclicity over the
+  function call graph a schema-commit obligation, and it puts template holes in the same
+  encoding as assert bodies.
 
 Hitting any of these is the trigger to revisit the addendum below.
 
@@ -75,7 +97,7 @@ Any adoption must compile asynchronously and sandbox the result.
 
 Regardless of the mechanism, dynamically loaded code must obey:
 
-- **No arbitrary IO** — functors must be pure or use a restricted effect set. Enforced at schema commit: an `a -> IO b` signature is rejected outright (see [schema/functions.md](schema/functions.md)); external side effects go through the event queue instead (see [events.md](events.md))
+- **No arbitrary IO** — functors are `Read` or `Tx`. Enforced by a missing lift rather than a signature check: `commit :: Tx a -> Effect a` exists and nothing takes an `Effect a` to a `Tx a`, so a functor cannot reach an external call even through `traverse` or a type alias (see [schema/functions.md](schema/functions.md#the-effect-ladder)). External side effects go through the event queue, whose handlers run in `Effect` and are compiled-in rather than DSL terms (see [events.md](events.md#handlers))
 - **No FFI** — prevents sandbox escape
 - **Transparent** — all behavior must be inspectable by the runtime for optimization and access control analysis
 - **Versioned** — every loaded code unit references a schema graph node; the runtime knows which version of each functor is active

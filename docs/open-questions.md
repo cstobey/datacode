@@ -11,6 +11,39 @@ Questions that need answers before or during implementation. Grouped by urgency.
 - **hint** (Approach 1): failed to compile in the spike — GHC not on PATH or hint version mismatch. Revisit as an escape hatch for advanced user-defined functors; compile async and sandbox the result.
 - **Multi-daemon**: needed when compiled-in types must change (requires server restart to load new Haskell modules); the schema daemon restarts are coordinated by a supervisor.
 
+**Requirements accumulated for the architecture revisit.** OQ-005 and OQ-030 settled the event
+and function-column syntax, and doing so put four loads on this answer that it was not written
+against. Recorded here so the revisit starts from them rather than rediscovering them:
+
+- **The DSL's "user-defined functions" ceiling is now split in two, and only one half still
+  binds.** Handlers escape it on their merits — they run in `Effect`, outside the commit, and
+  need none of transparency, static access analysis, or replayability — so they are compiled-in
+  Haskell registered in `system.events.Handler`, and the ceiling costs a build and a
+  schema-daemon restart per new *integration*. Functors do not escape it: they are `Read` or
+  `Tx`, they are DSL terms, and a new business rule must need no restart. **This is what makes
+  the multi-daemon layer load-bearing rather than contingent** — the restart path is now on the
+  documented route for adding an integration, so its latency is a real number the revisit owes
+  rather than a "not run" spike. Option E (the `hint` escape hatch) stays deferred, and the
+  handler split is the reason it can: the case that wanted arbitrary Haskell got it somewhere
+  the DSL does not have to reach.
+- **The DSL must encode two things it was not sized for.** The **event functor** was already
+  unvalidated; it now has two trigger forms, and `every` needs an interval that is a `Read`
+  expression evaluated per row per tick, not a constant. Separately, **function-typed columns**
+  mean a DSL term is now a stored *value* whose signature the type checker knows — which is
+  mostly a typing change over the existing `FunctorRef`, but it makes the acyclicity check over
+  the function call graph a schema-commit obligation and puts template holes (anchored queries
+  with a non-emptiness-shaped result count) in the same encoding as assert bodies.
+- **The effect ladder replaces the signature blacklist**, so "no arbitrary IO" is enforced by
+  the absence of an `Effect a -> Tx a` lift rather than by rejecting `a -> IO b`. The revisit
+  should confirm the GADT DSL can be *indexed by effect* — a validation term and a template hole
+  are both `Read`, a field default is `Tx`, and nothing in the DSL is `Effect` at all, since
+  effectful code lives outside it.
+- **One scheduler, not two.** Connector polling is a scheduled event (OQ-019), so the process
+  topology question is scheduler + worker pools + schema daemon + data daemons, not that plus a
+  connector daemon with its own timing. This is a simplification, but it means the scheduler is
+  on the critical path for ingest as well as egress and its failure domain is correspondingly
+  larger.
+
 ### OQ-002: Servant + Dynamic Schema ✓ ANSWERED
 **Answer**: Servant + Warp works. The pattern is `"schema" :> Capture "ns" String :> Capture "name" String :> Raw`. Servant handles the static URL structure; the `Raw` endpoint delegates to an IORef-backed WAI dispatch table for runtime-dynamic routing. No Yesod needed for the data plane. See `spikes/servant-warp/output.txt`.
 
@@ -231,6 +264,14 @@ Key decisions:
 - **`system` is a namespace, not a replication class.** It had been listed as a fifth shard type in `transaction-graph.md` and as a table type in `namespaces.md`; both are corrected. Tables in `system` carry ordinary replication traits — `system.integrity.Violation` is `LogData`, `system.shards.Node` is `Configuration`. Namespace says whose a table is and who may see it; trait says how it propagates.
 - **There is one `delete`.** The `delete!` "hard delete" spelling is **withdrawn**. Its documented distinction from `delete` was not one — both left the record in the transaction graph and removed the row from the current state, which is the definition of a delete, so `delete!` was redundant syntax carrying a sigil that promised something it did not do. `delete` is an ordinary mutation: it appends a tombstone version, the row is absent at sample moments at or after it and present at any earlier `at`, the `DataId` is never reused, and writing a new version restores it. The operation `delete!` would have had to mean — destroying bytes already in the append-only log — is real and needed, but it is an administrative act on a shard rather than a row mutation, so it is not reachable from the query language at all. See OQ-036.
 - **The virtual columns are projections of the row identifier**, which makes `created_at` an instance of a rule rather than a special case: bytes 0–5 are `created_at`, bytes 6–7 are `origin_server`, and a component's id suffix is `ordinal`. Two are added. **`origin_server`** is typed `:> system.shards.Node` rather than `Int` — as a bare 2-byte integer every "which server wrote this" query is a manual join against a magic number meaningless outside the registry that defines it. It is the only virtual column that is a reference and the only one resolving through a candidate key rather than a `DataId`, since the projected bytes *are* `Node`'s key; `Node` is `Configuration` so the join is local everywhere, and its rows become permanently non-prunable, which costs nothing at one row per server and is what keeps a retired server's historical rows readable (an `| RetiredServer` alternation was rejected — it puts an absence case in every query for no gain). `system.shards.LogSegment` had been hand-rolling this projection as a declared `server` field; that field is **removed** and its key now names `origin_server` directly, which required settling that virtual columns are eligible in a key — all of them but `updated_at`, which is excluded for the same reason a `Behavior` is: not because it is virtual, but because it moves. `period_start` stays declared, and the asymmetry is the point — `period` is a `Configuration` value that may be retuned while routing is never revised, so a truncation under a mutable policy must be pinned at write time; bytes 6–7 cannot be retuned and so need no pinning. **`ordinal`** closes a real gap rather than adding sugar: without it there is no way to *state* document order in a query, only to receive it from a range scan, which cannot be restated after a join or reversed. It is the position at the row's own level, not the full path — nesting makes a path variable-length, the rendered identifier already spells it, and a column whose type varied with nesting depth would be worse than what it duplicates. **The sequence counter (bytes 8–11) stays unexposed**: it disambiguates within one server-millisecond and is a tiebreak rather than an ordering — two servers' values are incomparable, and the clock-regression clamp deliberately continues it across a held timestamp — while `DataId` order already gives the total order anyone reaching for it wants. `updated_at` remains the odd one out, reading the head locator rather than the identifier. See `transaction-graph.md`.
+- **Effects are a ladder, and one missing lift carries the whole "no external calls in a commit" rule.** `Pure ⊂ Read ⊂ Tx`, with `Effect` outside that chain and connected by exactly one arrow: `commit :: Tx a -> Effect a` exists, and nothing takes an `Effect a` to a `Tx a`. This **replaces the `a -> IO b` signature rejection**, which was weaker — a signature check does not close `traverse` over an effectful function inside a validation, or one hidden behind a type alias, and an unconstructible type does. `IO` no longer appears in any DataCode signature at all. The arrow that *does* exist is what makes handlers workable: a handler runs in `Effect` and calls `commit` freely, so advancing a queue row's state or writing 50 000 ingested rows in batches is an ordinary transaction subject to every validation and assert. It also fixes retry granularity by placement — everything before the first `commit` is redone on retry, everything after is not. `Effect`'s capabilities come from the handler's `Configuration` row, never from code, so a handler cannot reach an ungranted host and never holds a credential in a compiled constant. See `schema/functions.md`.
+- **`every <Expr> emit <queue> { … } where <cond>` is the second event trigger form**, and its interval is an **expression**, not a literal — a `DurationLit`, a field of the row, or a `Configuration` path are one production. That is what retired the interval-override mechanism that was briefly proposed: you do not need an override when you can point the expression at wherever tuning should live. It fires per row of the table it is declared on, so fan-out is what "declared on a table" already means rather than a feature of `every`. **False-to-true still holds** — sampling observes the transition between ticks instead of across a write — which costs a `system.events.TriggerState` bit per (trigger, row) and is why schema commit **warns** when the solver could have closed the condition instead. There is deliberately **no top-level cron form**: a timer job always has rows that parameterize it (which feed, which directory, which account), so that table is the producing table and the payload stays typed against a row it can name. `schedule` and `cron` were considered and not reserved.
+- **Inbound arrival is not an event.** A webhook, a connector row, and an operator API call are *writes*: a route whose functor inserts into a landing table, after which the ordinary insert case of `on … emit` covers whatever happens next. Modelling arrival as a trigger form would have provided neither of the two properties the event system exists to provide — there is no side effect to defer and no external call to keep out of the commit, because the row *is* the durable record. This makes OQ-020 purely a route concern.
+- **`next <UniqueName>` allocates a sequence, and the scope of a sequence is the scope of the uniqueness it serves.** `next` allocates within the named `unique` constraint's field list minus the field being defaulted, so `unique orderRef { customer, order_num }` gives a per-`customer` counter living with the customer row — a local read-modify-write in a transaction that already touches that shard, with no central coordination — while `unique invoiceNum { invoice_num }` has an empty prefix and reaches the table's master shard, exactly like a table-wide `unique`. Both cases fall out of one rule and **the shard cost is readable off the declaration**, because it is the prefix-reaches-the-root question the candidate key already asks; a table-wide `next` warns at commit, a prefixed one warns about nothing. Gaps are guaranteed (an aborted transaction burns a value) and gapless numbering is a *reporting* requirement served by a view over the log, not by the allocator. `next` is an allocation rather than a value, so it is admissible only in a `DefaultClause` on a field the named `unique` includes. `sequence` and `serial` were considered and not reserved — a modifier would restate a scope that is already declared.
+- **A `Component` default constructs the row**, in the same transaction, and the sub-table body is what makes it a construction rather than a reference (`settings :> Settings : Component = { theme = Dark }` versus `created_by :> User = authed_user`). This is what closes the "default table" requirement with no trigger machinery: a row that must exist whenever its parent exists is a total function of the parent, `Component` already owns lifetime, and `=` already takes a row construction. No shard question arises, since a component lives in its parent's row-rooted shard by definition. **Deleting a parent deletes its components**, mechanically over `Component` edges — no cascade declaration and no depth limit, because the edges *are* the ownership. A cross-table in-commit trigger to a non-`Component` table is **refused**: if a row must exist atomically and has independent identity, that is a modelling error, and admitting the general case would put arbitrary user mutation in the commit path with unbounded cascade depth and a cost unreadable from the schema.
+- **A function-typed column is a `FunctorRef` with a static signature.** Storage changes nothing — `FunctorRef` is already a column type and already points at a serialized DSL term — and what is new is that the compiler knows the signature. A function type is declared `type Renderer = Amount -> Read Html`; **a field names a declared function type and may not write an arrow inline**, which makes "every function in a field shares one signature" a property of what a field *is*. Values are a named function or a lambda literal, both already grammatical (`Behavior`'s mandatory `=` lambda is the precedent), so **no syntax was added**. Template-Haskell-style `[| … |]` was rejected: its whole appeal is promising arbitrary Haskell inside, which the GADT DSL cannot deliver, and a syntax selling a permanent lie about the ceiling is worse than none. Literals are admissible only on `Reference` tables — because inserting a `Reference` row *is* a schema transaction, so "it still has to compile" is structural — while `Configuration` admits a `FunctorRef` and no literal: **code by schema, selection-among-code by data.** Restrictions all follow from function types having no equality: rejected in `unique`, `order by`, `group by`, `==`, `indexed`, a candidate key, and a field `where`; queries in the body must be rooted at `self` like an assert's; the call graph must be acyclic (decidable, since it is in the schema graph); and an `Effect` function type is name-only, because effectful code is compiled-in and a data write may select a handler but never author one.
+- **A template is text with holes, and cardinality is the control flow.** One production — `Hole ::= '{{' Query ( 'using' QName )? '}}'` — where the query's result count supplies every construct a template language usually spells: zero rows render nothing (the conditional, and it is just the query's `where`), one row renders once (plain interpolation, since `self` is a query of one row), N rows render N times joined by the template's separator (the loop). `each`, `if`, and `else` were consequently **not reserved**. `using` names the template applied per row; omitted, the active theme's render function for the row's type applies, which makes the template system and the theme system **one mechanism** rather than two. The separator is a field on the template's `Reference` row, not part of the hole. The one gap — a negative branch — needs no syntax: outer-join a `Null`-derived catch-all and the render function for the absence variant handles it, so **absence renders because absence is a type**. Formatting is an ordinary function call, so there are no filters or pipes; escaping follows the output type, so emitting unescaped markup requires an `Html` value and injection safety is a typing property with no raw-output form. Holes are `Read` and rooted at `self`, for the same read-cost reason asserts are anchored. Cost stated plainly: **a page whose layout is not derivable from the schema walk cannot be expressed as a template**, and fixing that would turn one production into a language.
+- **A `Reference` table is needed exactly where a fact originates outside the schema graph.** Self-hosting means system *state* is queryable, not that declarations get mirrored into rows — the schema graph is already queryable, so restating a declaration as a `Reference` row gives two authorities for one fact. `system.events.Handler` qualifies, because it is the bridge that makes `handler system.connectors.ldap.sync` compile-check against Haskell the schema graph cannot see. `system.events.Queue` did not, and was removed on this rule.
 - **Guiding principle**: where a choice is otherwise balanced, pick the spelling a Haskell reader would expect. DataCode's operators may carry narrower meanings than Haskell's — `where` constrains rather than binds — but the shape should be familiar.
 - **Open**: migration functor syntax (`evolution.md`); pagination config; UI template hints (`schema/traits.md`); package import scope (`schema/functions.md`)
 
@@ -268,6 +309,69 @@ violating row.
 **Not answered here**: behavior-triggered conditions require the scheduler to *solve* for a
 crossing moment rather than observe a transition, which is new machinery. See OQ-034. Event
 functors over stored fields are implementable as specified; over behaviors they are not yet.
+
+### Completing the Event Model
+
+The above answered the trigger and the queue binding. Working through the remaining event
+kinds — timer ingest, webhook arrival, on-demand external lookup, open-form behaviors, and
+internal triggers — settled the rest without a new statement at top level. `every`, the effect
+ladder, inbound-is-not-an-event, `next`, and `Component` defaults are recorded under OQ-005.
+What belongs here is the queue and handler structure:
+
+- **`Queue` is a trait extending `LogData`**, and `handler` is valid only on a `Queue` — it was
+  previously valid on any `LogData` table, and a log is not a work list. The trait carries
+  `scheduled_at`; the rest is four structural rules checked at commit, because two of them are
+  about field *types* and the grammar cannot say "a foreign key to any table carrying trait X":
+  exactly one `handler`, exactly one `:>` to a `QueueState` table, at most one field of type
+  `Priority`, and append-only everywhere else. Rules 2 and 3 read the **type**, never the name —
+  the same structural reading that decides an assert's variety from its body.
+- **The `QueueState` field is the one exemption from append-only in the whole system**, and it
+  is narrow: one field, on a `Queue`, written only by that queue's handler. It is what makes a
+  request/response event expressible with no second mechanism — a client polls the row and reads
+  a domain-meaningful state (`Bound`, `Applied`) while the scheduler reads that state's
+  `disposition : Pending | InFlight | Done | Failed`. `QueueState` extends `Reference`, so
+  adding a state is a schema commit and `state is Bound` is compile-checked.
+- **Priority is per item, defaulted per field, and recognized by type.** `type Priority : Int`
+  with `nice` semantics (lower is more urgent), aged toward urgency by the scheduler so a
+  background item behind a saturated urgent queue does not starve. Per-*queue* priority was
+  rejected: an on-demand single-user LDAP lookup and a nightly full refresh share a handler, a
+  payload shape, and a destination and differ only in urgency, and per-queue priority would
+  force that into two tables — duplicating the schema and splitting the rows an operator wants
+  in one list.
+- **Handlers are the one place arbitrary Haskell is admissible, and they are compiled in.** A
+  handler runs outside the commit, so it needs none of the three properties the GADT DSL exists
+  to provide: it is not inspected by the optimizer, not part of static access analysis, and
+  never replayed. Registration is two rows on the split that already exists everywhere else —
+  `system.events.Handler : Reference` for existence (code, so `handler foo.bar` is
+  compile-checked against the compiled-in registry) and `system.events.HandlerConfig :
+  Configuration` for tuning (hot). Adding a handler needs a build and a schema-daemon restart,
+  which is acceptable because handlers arrive at the rate of new **integrations** (SMTP, HTTP
+  POST, LDAP bind, S3 put), not new business rules — those are functors and need no restart.
+  Retuning one is a `Configuration` write.
+- **Retries are occurrences, so they are rows.** One `Attempt` table is generated per queue
+  table, sharded with the rows it describes. `attempt_count` is a count over it and the next
+  `scheduled_at` is derived from backoff over it, so a flapping destination is visible per item
+  instead of collapsed into an integer. This is the queue rule ("anything needing a record after
+  the fact goes in its own `LogData` table referencing the queue row") applied to the scheduler's
+  own bookkeeping.
+- **Two system tables were removed rather than fixed.** `system.events.Item` carried `payload :
+  Bytes`, which duplicated the queue row — the payload existed twice, could diverge, and "the
+  queue is inspectable with standard DataCode tools" is false of a blob. Its other fields
+  decomposed: `scheduled_at` to the trait, `status` was a second authority for what the
+  `QueueState` field holds, and `attempt_count`/`last_error` became the attempt history.
+  `system.events.Queue` went to the `Reference`-tables rule under OQ-005. What remains is
+  `QueuePolicy`, `BackoffState`, and `SchedulerLimit`, all `Configuration`.
+- **`repair` is deferred because of *when*, not *where* — nothing to do with shards.** `repair`
+  is `monitor` plus an enqueue, and `monitor` means the write was *accepted*, so by the time a
+  violation exists the commit is over and there is no in-commit moment left. The retroactive
+  case settles it independently: adding a predicate to a populated table can enqueue millions of
+  repairs, which is not one transaction. **The in-commit way to fix a value is a type
+  transform**, steps 1 and 4 of the order of operations — a value that should be rounded to
+  cents belongs in `Amount`'s transform, not in a validation with a repair queue behind it, so
+  `events.md`'s illustration was changed to a postal code, something only fixable by consulting
+  something outside the row. A `ValidationRef` may now name an `assert`, which is what makes
+  "an unsatisfiable path constraint hands the row to a functor that inserts the missing row"
+  need no new syntax.
 
 ### OQ-031: Record Literals and Operator Spelling ✓ ANSWERED
 **Answer**: Both resolved in favour of Haskell spelling.
@@ -371,6 +475,17 @@ The policy, and whether it belongs per queue or per trigger, is undecided.
 **Constraint**: whatever is chosen must not reintroduce polling, since eliminating the
 hand-rolled `scheduled_at ≤ now` timer is most of the point of solving for crossings at all.
 
+**`every` unblocks the use case without answering the question.** An open-form behavior is now
+expressible by sampling it — `every 30 seconds emit … where balance >= credit_limit` (OQ-005) —
+at the cost of a `system.events.TriggerState` bit per (trigger, row) and a bounded lateness of
+one interval. That makes behaviors *usable* before this OQ is settled, and it deliberately does
+not resolve it: sampling is exactly the polling solving exists to eliminate. Two consequences
+for the work here. The solver's job is now framed as **shrinking the set of conditions for which
+`every` is the only option**, which gives the "analyzable class" question a measurable target.
+And schema commit must decide, per condition, whether the solver *could* have closed it — the
+warning that fires when `every` is used unnecessarily needs the same classifier the solver
+needs, so the classifier is required even for conditions the solver declines to handle.
+
 **Aggregate encoding belongs here too.** A retention chain (`schema/aggregates.md`) needs the
 same kind of machinery from the other direction: an aggregate admissible in a multi-step chain
 must declare an associative merge with an identity, and that merge has to be encodable in the
@@ -404,6 +519,12 @@ The mechanism is settled (OQ-007, `transaction-graph.md`, `storage.md`); the num
 - **Segment period**, defaulting to day. It must divide sensibly into the retention grains in
   use — a raw step of `for 6 hours` under a daily period cannot prune by segment — and a
   low-volume server must not accumulate near-empty segments.
+- **Sequence counter storage.** `next <UniqueName>` (OQ-005) allocates one counter per
+  (constraint, prefix value), sharded by the prefix. The rule is settled and so is where the
+  coordination lands — with the prefix row for a prefixed sequence, on the table's master shard
+  for a table-wide one. The layout is not: whether the counter is a row in a generated table, a
+  reserved field on the prefix row, or an LMDB-side value outside the log, and how it interacts
+  with a shard split that moves the prefix row.
 - **Shard-group formation.** Sealing a log segment is automatic and splitting a `UserData`
   shard is operator-initiated. A shard group sits between them: it adds sub-shards under one
   existing primary without redistributing roots or moving authority. Whether that makes it
@@ -539,6 +660,17 @@ identity living in the same tables and obeying the same asserts as a human's. Se
 **Question**: Is the connector daemon a separate process (separate daemon alongside the schema and data daemons) or a thread pool within the main DataCode server process?
 **Notes**: Separate process allows independent restart; same process is simpler. Connector failures should not crash the main server.
 **Action**: Decide during core architecture design; likely a separate supervised process.
+
+**Narrowed to worker-pool topology.** There is **one scheduler**, and connector polling is a
+scheduled event under it rather than an independent loop: a connector's CDC sync and its state
+verification are two `every` declarations on the connector row, with the intervals as ordinary
+`Configuration` fields (`connectors.md`). Two schedulers would have meant two retry policies,
+two backoff states, and no way to reason about total outbound load — the thing to avoid before
+writing code rather than after. What remains open is only whether the connector *workers* are a
+separate supervised process or a pool inside the server, which is the original question minus
+the scheduling half. The inbound direction is not scheduled at all (OQ-005, arrival is a write),
+so a connector's failure surface is a handler's failure surface and is bounded by
+`HandlerConfig`.
 
 ### OQ-020: Webhook Endpoint Security
 **Question**: How does DataCode authenticate incoming webhooks from external services (e.g., Stripe signature verification)?

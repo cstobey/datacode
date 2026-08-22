@@ -189,7 +189,7 @@ arrived.
 
 This is what makes [behaviors](types.md#behaviors) well defined: `balance` has no value
 except at a moment, and the moment is supplied by the query rather than fetched by the field.
-It is the same discipline the `a -> IO b` rejection already enforces on functors
+It is the same discipline the missing `Effect`-to-`Tx` lift already enforces on functors
 ([functions.md](functions.md)) — nothing inside the evaluation may read the clock, because a
 commit that reads the clock is not replayable and a view that reads the clock is not
 recomputable.

@@ -260,6 +260,45 @@ Connector shadow tables carry `Keyless` automatically when the external source h
 key, and the connector records why — see
 [../integrity.md](../integrity.md#connector-tables-without-a-source-key).
 
+## `Queue` and `QueueState`
+
+`Queue` extends `LogData` and marks a table as a work list for the event scheduler:
+
+```
+trait Queue : LogData {
+  scheduled_at : Timestamp = created_at
+}
+```
+
+Beyond that field the trait body is empty, because what makes a queue a queue is four rules
+about field *types*, and the grammar has no way to say "a foreign key to any table carrying
+trait X". They are checked at schema commit:
+
+1. Exactly **one** `handler`.
+2. Exactly **one** `:>` field to a table carrying `QueueState`.
+3. At most **one** field whose type is `Priority`.
+4. Every field other than the `QueueState` field is append-only, as `LogData` requires.
+
+Rules 2 and 3 read the field's **type**, never its name — the same structural reading that
+decides an assert's variety from its body rather than its identifier.
+
+```
+trait QueueState : Reference {
+  name        : Text unique,
+  disposition : Pending | InFlight | Done | Failed
+}
+```
+
+The `QueueState` field is the **one exemption from append-only in the whole system**, and it is
+narrow: one field, on a `Queue` table, written only by the handler bound to that queue. That
+exemption is what makes a queue row pollable by a client — it reads a domain-meaningful state
+(`Bound`, `Applied`) while the scheduler reads that state's `disposition`. Anything else needing
+a record after the fact goes in its own `LogData` table with a `:>` back to the queue row, which
+is what the [attempt history](../events.md#attempt-history) is.
+
+`handler` was previously valid on any `LogData` table and is now valid only on a `Queue`. A log
+is not a work list. Full treatment in [../events.md](../events.md#queue-tables).
+
 ## `Reference` Tables Are Code
 
 `Reference` has always been described as "code tables, treated as code, propagated
@@ -284,6 +323,36 @@ The token does not change. A field referencing a `Reference` table is still decl
 simply resolves a tag instead of a `DataId`. The
 [`:` versus `:>` rule](README.md#-versus-) is load-bearing and stays exactly as it is; every
 benefit above is a storage and checking change underneath it.
+
+### When a `Reference` Table Is Warranted
+
+> **A `Reference` table is needed exactly where a fact originates outside the schema graph.**
+
+Because a `Reference` row *is* a schema fact, it is tempting to mirror the schema into
+`Reference` tables in the name of self-hosting. That is the wrong reading:
+[self-hosting](README.md#self-hosting-principle) means system *state* is queryable, and the
+schema graph is already queryable. Restating a declaration as a row gives two authorities for
+one fact.
+
+The test is where the fact comes from:
+
+| Fact | Origin | Table? |
+|---|---|---|
+| A queue exists and binds this handler | `table … : Queue { … handler … }` | **No** — already the declaration |
+| A handler named `system.connectors.ldap.sync` exists | compiled-in Haskell | **Yes** — nothing else records it |
+| `OrderStatus.Shipped` exists | nowhere else | Yes |
+| An external code value a connector met | the external system | Yes, with `Extensible` |
+| How often to retry that queue | an operator's judgement | `Configuration`, not `Reference` |
+
+`system.events.Handler` is the case that matters: it is the bridge that makes `handler
+system.connectors.ldap.sync` resolve and compile-check against Haskell the schema graph cannot
+see. `system.events.Queue` was specified and then removed on this rule — see
+[../events.md](../events.md#system-tables).
+
+A `Reference` table may also hold **function literals**, because inserting the row is a schema
+transaction. This is what lets templates, render functions, and per-row operations be data
+without being uncompiled data. See
+[functions.md](functions.md#functions-as-column-values).
 
 ### `Extensible`
 

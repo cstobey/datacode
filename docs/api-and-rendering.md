@@ -74,6 +74,21 @@ Themes are stored as **reference data** in normal DataCode tables. They can be:
 - Defined by the application layer
 - Queried, extended, and modified through the normal schema interface
 
+A render function is a **function-valued column on a `Reference` table**, which is what makes
+"stored as reference data" work without storing uncompiled data: inserting a `Reference` row is
+a schema transaction, so the function compiles, is versioned by schema node, and replicates
+everywhere. See [schema/functions.md](schema/functions.md#functions-as-column-values).
+
+**Templates and render functions are one mechanism.** A [template](schema/templates.md) is text
+with holes; a hole with no `using` clause falls through to the active theme's render function
+for the row's type. That is why a theme swap changes every rendered value on every page with no
+template edited, and why the template language needs no formatting filters — the functions in a
+hole are the functions in the schema.
+
+Composition stays here rather than in the templates: the renderer walks the schema by PageRank
+weight and windows it by information density, and templates are the per-type fragments it
+composes. A template needs no partials, inheritance, or blocks as a consequence.
+
 ### HTML Generation Algorithm (Sketch)
 
 ```

@@ -20,13 +20,14 @@ diagrams.
 | [schema/README.md](schema/README.md) | Design philosophy, visibility layers, notation conventions (`:` vs `:>`, clause order, layout) |
 | [schema/types.md](schema/types.md) | Primitives, domain types, sum types, `Moment` and `Behavior`, absence types, `is`, `Secret` and `Hashed` |
 | [schema/tables.md](schema/tables.md) | Table bodies, fields, defaults, candidate keys, ordering, foreign keys, sub-tables |
-| [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
+| [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible`, `Queue`/`QueueState` |
 | [schema/constraints.md](schema/constraints.md) | `assert`, path constraints, presence and absence, access control |
 | [schema/documents.md](schema/documents.md) | The `Doc` type, shredding, key interning |
 | [schema/aggregates.md](schema/aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
+| [schema/templates.md](schema/templates.md) | Templates as text with holes, cardinality as control flow, `using`, escaping by type |
 | [schema/evolution.md](schema/evolution.md) | Redeclare, deprecate, prune, split, merge, ADT extension |
 | [schema/queries.md](schema/queries.md) | Filter, projection, joins, grouping, views, mutation |
-| [schema/functions.md](schema/functions.md) | Scope, Haskell functions, auto-wrapping, imports |
+| [schema/functions.md](schema/functions.md) | Scope, the effect ladder, auto-wrapping, function types, function-valued columns |
 | [schema/functors.md](schema/functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [namespaces.md](namespaces.md) | Namespace tree, visibility levels, namespace ACL |
 
@@ -55,7 +56,7 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [connectors.md](connectors.md) | External data ingestion, sync protocol, conflict resolution |
-| [events.md](events.md) | Event scheduler, queue tables, volume-based backoff, repair queues |
+| [events.md](events.md) | Event scheduler, the two trigger forms, queue tables, priority, handlers, volume-based backoff, repair queues |
 | [integrity.md](integrity.md) | Nonconformance, enforcement modes, the violations table, admin reporting |
 
 ## Status

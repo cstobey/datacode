@@ -88,8 +88,9 @@ ImportDecl   ::= 'import' ModuleName ( '(' Ident ( ',' Ident )* ')' )?
 ## Types
 
 ```ebnf
-TypeDecl     ::= 'type' Ident ( ':' TypeExpr | '=' TypeExpr ) UsingClause? WhereClause*
+TypeDecl     ::= 'type' Ident ( ':' TypeExpr | '=' TypeExpr | '=' FnType ) UsingClause? WhereClause*
 
+FnType       ::= TypeExpr ( '->' TypeExpr )+
 TypeExpr     ::= Variant ( '|' Variant )*
 Variant      ::= QName TypeArg*
                | '(' TypeExpr ( ',' TypeExpr )+ ')'
@@ -101,10 +102,18 @@ TypeSig      ::= TypeExpr ( '->' TypeExpr )*
 TypeSigDecl  ::= Ident ':' TypeSig
 ```
 
-`type A : B` declares a domain type (subtype of `B`); `type A = B | C` declares a sum type.
-`TypeSigDecl` is a top-level Haskell-style signature for a function; it is distinguished
-from `FieldDecl` by position — signatures appear at file top level, field declarations only
-inside a table, view, or trait body.
+`type A : B` declares a domain type (subtype of `B`); `type A = B | C` declares a sum type;
+`type A = B -> Read C` declares a **function type**. `TypeSigDecl` is a top-level
+Haskell-style signature for a function; it is distinguished from `FieldDecl` by position —
+signatures appear at file top level, field declarations only inside a table, view, or trait
+body.
+
+`FnType` is admissible only in `TypeDecl`. **A `FieldDecl` may not write an arrow inline; it
+names a declared function type**, which is what makes "every function in a field shares one
+signature" a property of what a field *is* rather than a rule about function columns, and what
+gives the signature a name for diagnostics to address. The rightmost `TypeExpr` names the
+effect (`Read`, `Tx`, `Effect`); omitted, the function is `Pure`. See
+[functions.md](functions.md#function-types).
 
 `UsingClause` supplies a parameter row to a parameterised type constructor. It is currently
 valid only on `Hashed`, where it names a row in `system.crypto.HashPolicy`:
@@ -129,7 +138,8 @@ RefToken     ::= ':' | ':>'
 SubTableTraits ::= ':' TraitList
 SubTableBody ::= '{' TableBody '}'
 SourceClause ::= 'rename' 'from' QName
-DefaultClause::= '=' Expr
+DefaultClause::= '=' ( Expr | SeqAlloc )
+SeqAlloc     ::= 'next' Ident
 
 WhereClause  ::= 'where' ( Expr | PredicateBlock )
 PredicateBlock ::= Expr+       /* layout block: one predicate per line, indented */
@@ -162,6 +172,19 @@ Constraints not expressible in the grammar, enforced at compile time:
   parameter, bound to a `Moment`. `SourceClause`, `unique`, `indexed`, and `WhereClause` are
   all rejected on such a field, and it may not appear in a `RecordLit`. See
   [types.md](types.md#behaviors).
+- Where the `TypeExpr` names a **function type**, `unique`, `indexed`, and `WhereClause` are all
+  rejected, because function types have no equality. A function literal in a `DefaultClause` or
+  `RecordLit` is admissible only on a `Reference` table; a `Configuration` table admits a
+  `FunctorRef` and no literal. An `Effect` function type admits a name only, never a literal.
+  See [functions.md](functions.md#functions-as-column-values).
+- `SeqAlloc` is admissible **only** in a `DefaultClause`, and only on a field named by the
+  `UniqueDecl` its `Ident` refers to. `next` is an allocation, not a value: it is rejected in a
+  `WhereClause`, a `Behavior` definition, a projection, and a view. See
+  [tables.md](tables.md#sequences).
+- A `SubTableBody` in a `DefaultClause` **constructs** the row, in the same transaction. This is
+  what distinguishes `settings :> Settings : Component = { … }` from `created_by :> User =
+  authed_user`, which references an existing one; the sub-table body is the constructor. See
+  [tables.md](tables.md#a-component-default-constructs-the-row).
 
 A `FieldDecl`'s `WhereClause` is addressed by the field's path
 (`<namespace>.<table>.<field>`), which is also the name of the field's computed type. There
@@ -199,6 +222,7 @@ AssertDecl   ::= 'assert' Ident '{' AssertBody '}'
 AssertBody   ::= Expr | Query
 
 EventDecl    ::= 'on' Expr 'emit' QName RecordLit
+               | 'every' Expr 'emit' QName RecordLit WhereClause?
 HandlerDecl  ::= 'handler' QName
 
 UiHint       ::= 'ui' '{' HintPair ( ',' HintPair )* ','? '}'
@@ -223,12 +247,24 @@ The query must be rooted at `self` and every subsequent source must be reached b
 compile-time error, because an `assert` that scans would scan on every read. See
 [constraints.md](constraints.md).
 
-`EventDecl` registers an event functor on the producing table. Its `Expr` is a condition that
-fires on a `False` → `True` transition, and its `RecordLit` is an ordinary row construction
-against the named queue table, so the payload is typed by that table's own fields. Where the
-condition mentions a `Behavior`, the transition moment is solved rather than observed. Retry
-policy is deliberately absent — it is a row in `system.events.Queue`, not part of the
-registration.
+`EventDecl` registers an event functor on the producing table, in one of two trigger forms.
+Both fire on a `False` → `True` transition of a condition, and both take a `RecordLit` that is
+an ordinary row construction against the named queue table, so the payload is typed by that
+table's own fields. Retry policy is deliberately absent — it is a `system.events.QueuePolicy`
+row, not part of the registration.
+
+- **`on`** observes the transition. Across the write for a condition over stored fields; at a
+  solved moment for a condition over a closed-form `Behavior`.
+- **`every`** samples for it. Its `Expr` is the interval — any `Read` expression of type
+  `Duration`, so a `DurationLit` (`every 15 minutes`), a field of the row (`every
+  poll_interval`), and a `Configuration` path are one production. The `WhereClause` carries the
+  sampled condition, or restricts which rows are sampled, or both. Sampling still fires only on
+  a transition, which costs a `system.events.TriggerState` row per `(trigger, row)`; schema
+  commit **warns** when the condition is one the solver could have closed.
+
+`every` is a `BodyItem` rather than a `Statement` deliberately: a timer job always has rows that
+parameterize it, and attaching the declaration to that table is what keeps the payload typed
+against a row it can name. There is no top-level cron form.
 
 `HandlerDecl` appears on a queue table and names the functor that processes dequeued rows. The
 two are separate productions because they describe opposite ends: `EventDecl` is the
@@ -236,7 +272,16 @@ producer's business, `HandlerDecl` is the queue's. See [../events.md](../events.
 
 Constraints not expressible in the grammar:
 
-- `HandlerDecl` is valid only on a table carrying `LogData`; a queue holds occurrences.
+- `HandlerDecl` is valid only on a table carrying `Queue`, and a `Queue` table declares exactly
+  one. It was previously valid on any `LogData` table; a log is not a work list.
+- A `Queue` table declares exactly one `:>` field to a table carrying `QueueState`, and at most
+  one field whose type is `Priority`. Both are recognized by *type*, not by name — the same
+  structural reading that decides an assert's variety. That `QueueState` field is the sole
+  exemption from `LogData` append-only, and only the queue's handler may write it. See
+  [../events.md](../events.md#queue-tables).
+- An `every` interval `Expr` must be `Read` and of type `Duration`. A literal below
+  `system.events.SchedulerLimit.min_interval` is rejected at commit; a computed one is clamped
+  at dispatch.
 - A `TraitList` item is a bare `QName`: **traits take no arguments.** A trait is a declaration,
   not a tuning knob, and operational values live in `Configuration` rows instead. See
   [traits.md](traits.md#traits-are-not-configuration).
@@ -253,7 +298,7 @@ Constraints not expressible in the grammar:
   and a projected expression mints a computed type named by the view field's path. See
   [queries.md](queries.md#view-field-types).
 - A `FieldPath` in a `UniqueDecl` may not name a field whose type is `Secret`, `Doc`,
-  `Behavior`, or an alternation containing a `Null`-derived variant.
+  `Behavior`, a function type, or an alternation containing a `Null`-derived variant.
 
 ```ebnf
 StandaloneAssert ::= 'assert' QName '{' Expr '}'
@@ -355,12 +400,15 @@ ValidationRef ::= QName ( '/' Ident )?
 
 `ValidationRef` addresses a validation by the path that already names it: a field path names
 the field's computed type and the predicates on it, and `/ <predicate>` selects one predicate
-from a block. An `assert` is addressed by its own name and takes no `/`.
+from a block. An `assert` is addressed by its own name and takes no `/` — including under
+`repair`, which is what lets an unsatisfiable path constraint hand the row to a functor that
+inserts the missing one, with no new syntax.
 
 ```
 enforce app.auth.User.username / minLen12 forward
 monitor app.commerce.Order.billingMatch
-repair  app.commerce.Order.total / isRoundedToCents into app.events.RepairQueue
+repair  app.crm.Contact.postal_code / isDeliverable into app.events.RepairQueue
+repair  app.pm.Document.hasSettings into app.events.DefaultRowQueue
 ```
 
 `always` is the default and need not be written. `forward` grandfathers: the predicate binds
@@ -592,6 +640,47 @@ see [queries.md](queries.md#every-query-has-a-sample-moment).
 
 ---
 
+## Templates
+
+```ebnf
+TemplateBody ::= ( TemplateText | Hole )*
+Hole         ::= '{{' Query ( 'using' QName )? '}}'
+TemplateText ::= /* any run of characters containing no '{{' */
+```
+
+That is the entire template language. There is no `if`, no `each`, and no `unless`, because the
+**result count of a `Hole`'s `Query` is the control flow**: zero rows render nothing (the
+conditional), one row renders once (plain interpolation), N rows render N times joined by the
+template's separator (the loop). `self` is a query of one row, so `{{ self.order_num }}` is the
+degenerate case of the same production rather than a second form.
+
+`using` names the template applied per row. Omitted, the active theme's render function for the
+row's type applies, which is what makes the template system and the theme system one mechanism.
+It is the existing `UsingClause` token in a wider position — same meaning, "supply this
+parameterizing thing".
+
+The separator is a field on the template's `Reference` row, not part of the `Hole`. Two
+templates differing only in separator are two rows, which is cheap, and it keeps a `Hole` at two
+parts.
+
+Constraints not expressible in the grammar:
+
+- A `Hole`'s `Query` must be rooted at `self`, every subsequent source reached along a declared
+  `:>` edge — the same anchoring rule as `AssertBody`, and for the same reason: a template
+  renders per row on every read that reaches it.
+- A `Hole` is `Read`. `Tx` and `Effect` are both rejected, so rendering cannot write or call out.
+- The negative branch has no syntax and needs none: outer-join a `Null`-derived catch-all and
+  the render function for the absence variant handles the empty case. The
+  filter-inside-the-join-term rule above applies unchanged.
+- Escaping follows the output type. Emitting unescaped markup requires an `Html` value, which
+  only a template or a render function produces, so there is no raw-output form.
+- Templates naming templates must form an acyclic graph, checked at schema commit like any other
+  function-column call graph.
+
+See [templates.md](templates.md).
+
+---
+
 ## CLI Invocation
 
 ```ebnf
@@ -711,11 +800,12 @@ DrCmd        ::= 'force' 'elect' 'primary' Host 'for' 'shard' QName
 acknowledge  add    aggregate always    as        assert    asc       at
 avg       by        bypass    connector conflict  count     DataCode  deep
 delete    demote    deprecate describe  desc      drop      elect     elevate
-else      emit      enforce   export    extend    External  False     flag
-for       force     forever   forward   from      grant     grants    group
-handler   if        import    in        indexed   into      is        issue
-key       lag       let       limit     materialized        max       merge
-migrate   min       monitor   not       on        order     otherwise pause
+else      emit      enforce   every     export    extend    External  False
+flag      for       force     forever   forward   from      grant     grants
+group     handler   if        import    in        indexed   into      is
+issue     key       lag       let       limit     materialized        max
+merge     migrate   min       monitor   next      not       on        order
+otherwise pause
 primary   prune     refresh   removing  repair    replay    replication
 resolve   resume    retain    revoke    scoped    secondary seq       servers
 set       shard     shards    show      shrink    since     split     sum
@@ -734,8 +824,8 @@ collides with a binding in scope.
 
 | Binding | Bound to | In scope |
 |---|---|---|
-| `self` | the row under evaluation | trait function bodies, `assert` bodies, `on … emit` conditions and payloads |
-| `authed_user` | the requesting user token's row | `assert` bodies |
+| `self` | the row under evaluation | trait function bodies, `assert` bodies, `on`/`every` conditions and payloads, `Hole` queries, function-column bodies |
+| `authed_user` | the requesting user token's row | `assert` bodies, field defaults |
 
 `self` has been used in trait function bodies since [traits.md](traits.md) was written without
 being listed anywhere; it is listed here now. `authed_user` replaces the earlier `user`, which
@@ -778,6 +868,27 @@ Words that were considered and deliberately **not** reserved:
 `on`, `emit`, and `handler` are the three words added for event registration. `on` is short
 and unlikely as a field name; `emit` and `handler` name the two ends of a queue and appear in
 no other position.
+
+`every` and `next` are the two words added since. `every` is the second trigger form and sits
+where `on` does, so no new position is introduced. `next` marks a sequence allocation and is
+admissible only in a `DefaultClause`; it is a plausible field name in the abstract, but a field
+named `next` would be a link in a hand-rolled linked list, which the transaction graph makes
+unnecessary.
+
+`using` gained a position rather than being added — it already parameterized `Hashed` and now
+names the template applied inside a `Hole`. Same meaning in both.
+
+Words considered and **not** reserved for these:
+
+- **`schedule`** or **`cron`**, as a top-level timer declaration. A timer job always has rows
+  that parameterize it, so `every` on the producing table covers it and the payload stays typed
+  against a row it can name. A rowless job is server maintenance, which is not user syntax.
+- **`each`**, **`if`**, and **`else`**, inside a template. A hole's query result count already
+  supplies all three, and the negative branch is a typed absence variant. See
+  [templates.md](templates.md).
+- **`sequence`** or **`serial`**, as a field modifier. The scope of a sequence is the scope of
+  the uniqueness it serves, so `next <UniqueName>` reads the scope off a declaration that
+  already exists rather than restating it.
 
 `aggregate`, `retain`, `forever`, and `otherwise` are the four added for retention.
 `otherwise` is Haskell's guard fall-through and is used here for exactly that.

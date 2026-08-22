@@ -103,7 +103,7 @@ discipline this requires, which is why it fits rather than being retrofitted:
 
 | Existing rule | What it buys |
 |---|---|
-| `a -> IO b` rejected at schema commit | No functor can read the clock. Time can only arrive as a parameter — the whole denotative discipline, already enforced. |
+| No lift from `Effect` into `Tx` | No functor can read the clock or call out. Time can only arrive as a parameter — the whole denotative discipline, already enforced. |
 | Append-only, no in-place update, idempotent records | A row's history *is* `Event a ≅ [(Time, a)]`. Not an analogy; it is the storage format. |
 | Views are queries pegged to a commit node | Materialisation is already sample-at-a-point, not cached mutable state. |
 

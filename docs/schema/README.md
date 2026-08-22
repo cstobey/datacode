@@ -15,8 +15,9 @@ than restating it.
 | [aggregates.md](aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
 | [evolution.md](evolution.md) | Redeclaration, rename, deprecate, prune, split, merge, ADT extension, visibility |
 | [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, views, mutation |
-| [functions.md](functions.md) | Scope, Haskell functions, auto-wrapping, imports |
+| [functions.md](functions.md) | Scope, the effect ladder, Haskell functions, auto-wrapping, function types, function-valued columns |
 | [functors.md](functors.md) | The four functor kinds, order of operations, enforcement modes |
+| [templates.md](templates.md) | Text with holes, cardinality as control flow, `using` and render functions |
 | [railroad.md](railroad.md) | Full EBNF grammar + railroad diagram rendering |
 
 Related documents outside this directory: [../namespaces.md](../namespaces.md) (namespace
@@ -44,7 +45,7 @@ Every system concern that can be expressed as a table, should be. This includes:
 
 - **API route registrations** — rows in `system.api.GeneratedRoute` and `system.api.CustomRoute`
 - **Connector configurations** — rows in `system.connectors.*`
-- **Event queues** — rows in `system.events.Item` (and user-defined queue tables in `app.*`)
+- **Event queues** — user-defined tables carrying the `Queue` trait, with policy in `system.events.QueuePolicy`
 - **Scheduler state** — rows in `system.events.*`
 - **Auth tokens and sessions** — rows in `system.auth.*`
 - **Schema version promotions** — rows in `system.VersionRef` (branches and tags share one table; the `VersionRef` ADT encodes which)

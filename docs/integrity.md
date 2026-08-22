@@ -138,7 +138,7 @@ Mode is declared by a **statement addressed at the validation**, not by a clause
 enforce app.auth.User.username / minLen12  always
 enforce app.auth.User.username / minLen12  forward
 monitor app.auth.User.username / minLen12
-repair  app.commerce.Order.total / isRoundedToCents into app.events.RepairQueue
+repair  app.crm.Contact.postal_code / isDeliverable into app.events.RepairQueue
 ```
 
 The address form is the one already established for validations
@@ -148,7 +148,11 @@ block. An `assert` is addressed by its own name and needs no `/`:
 
 ```
 monitor app.commerce.Order.billingMatch
+repair  app.pm.Document.hasSettings into app.events.DefaultRowQueue
 ```
+
+An `assert` under `repair` is what makes "an unsatisfiable path constraint hands the row to a
+functor that inserts the missing row" need no new syntax.
 
 Three reasons the mode is a separate statement rather than a clause on the predicate:
 

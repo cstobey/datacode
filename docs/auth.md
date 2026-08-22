@@ -164,7 +164,7 @@ retain system.auth.Challenge for 30 days, drop
 Five things fall out, and none of them is new machinery:
 
 **The send is an event on insert.** Issuing a challenge *is* inserting the row, and delivery is
-the scheduler's problem — retried under `system.events.Queue`'s policy, rate-limited, and never
+the scheduler's problem — retried under `system.events.QueuePolicy`, rate-limited, and never
 holding the commit open. This is exactly what "no external calls inside a commit"
 ([events.md](events.md)) was written for. Insert is the degenerate case of the false-to-true
 rule: before the write the row did not exist, so the condition was not true.

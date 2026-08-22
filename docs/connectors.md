@@ -186,7 +186,34 @@ All connector configuration is stored in DataCode system tables. Adding or modif
 - **Configuration changes** (credentials, latency window, authority model): update the system table row; takes effect on next sync cycle
 - **New connector type** (new Haskell package required): requires server reboot — no way around this with static compilation. New connector types that need no new packages (implemented entirely in existing DataCode machinery) can be added dynamically.
 
-The connector daemon polls `system.connectors` for changes on a short interval (configurable, default 10 seconds).
+### Polling Is a Scheduled Event
+
+A connector's loops are `every` declarations on the connector row, dispatched by the one event
+scheduler ([events.md](events.md#one-scheduler)). There is no separate connector scheduler:
+
+```
+table system.connectors.Connector : Configuration {
+  name           : Text unique,
+  kind           :> ConnectorKind,
+  poll_interval  : Duration = 10 seconds,
+  latency_window : Duration,
+  authority      : DataCode | External | Symmetric = Symmetric,
+  enabled        : Bool = True,
+
+  every poll_interval  emit system.connectors.SyncQueue   { connector = self } where enabled,
+  every latency_window emit system.connectors.VerifyQueue { connector = self } where enabled
+}
+```
+
+`every`'s interval is an expression, so the two intervals above are ordinary fields of a
+`Configuration` row — retuning either is a data write with no schema commit, which is what this
+section already promised, now with nothing bespoke behind it. The connector daemon becomes a
+handler pool rather than an independent scheduler; two schedulers would have meant two retry
+policies, two backoff states, and no way to reason about total outbound load. This narrows
+OQ-019 to worker-pool topology.
+
+Inbound direction is not scheduled at all. A webhook is a route whose functor inserts into a
+landing table — see [events.md](events.md#the-event-system-is-outbound).
 
 ---
 
