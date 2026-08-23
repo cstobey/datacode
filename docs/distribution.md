@@ -34,6 +34,68 @@ The tertiary-to-secondary elevation mechanism is explicitly designed to support 
 3. Drain and take old server offline for maintenance
 4. Repeat for primary as needed
 
+## Role Assignment Is a Coarsening of the Partition Function
+
+Two maps are defined over a shard family's placement key space, and they are deliberately not
+the same structure:
+
+| | Partition function | Range tree |
+|---|---|---|
+| Maps | placement key → shard | key range → `(primary, secondary, secondary)` |
+| Granularity | exact, total, row-level | coarse; a range covers a whole number of shards |
+| Changes when | a shard splits | a role is elevated, demoted, or moved |
+| Recorded as | a split node in the graph | `Configuration` rows |
+
+**Every range boundary is a partition boundary.** The range tree is a coarsening of the
+partition function — it never cuts through a shard, so a shard's roles are always resolved by
+exactly one range. The partition function is authoritative about *where a row lives*; the range
+tree is authoritative about *who serves it*.
+
+Keeping them separate is what keeps each one's audit trail clean. Role assignment changes for
+reasons that have nothing to do with key space — a rolling upgrade, a region outage, a
+workload that moved — and if role triples lived on the interior nodes of the placement
+structure, every `elevate secondary … to primary` would edit the structure that decides where
+rows are stored.
+
+The coarsening also removes a failure mode rather than merely detecting it:
+
+| Operation | Partition function | Range tree |
+|---|---|---|
+| `split shard … at key` | refined | **untouched** — the children resolve through the unchanged covering range |
+| `elevate` / `demote` | untouched | edited |
+| Move authority for a key region | untouched | edited, usually after a split |
+
+Because a split needs no assignment write at all, there is no window in which a new child
+shard has no roles or inherits stale ones. A per-shard assignment table would have required
+that write and would therefore have had that window.
+
+### Layering
+
+Ranges nest, and resolution is **most-specific-match wins** — the rule already used for
+`system.shards.ExtentPolicy` / `ExtentOverride` and for namespace access inheritance (OQ-024).
+A family-wide default sits at the root, coarse regions below it, and a single shard may be
+pinned by a maximally-specific range whose bounds are that shard's own partition interval.
+
+Ranges at one level must be **non-overlapping, and each must be wholly contained in its
+parent**. Overlap with a priority tie-break was rejected: two rows could then claim one shard,
+which is split-brain arriving by configuration rather than by failure, and OQ-006's constraint
+forbids it. Nested intervals make "most specific" a total function, so a shard's primary is a
+deterministic function of its key.
+
+This is also why assignment is expressed as ranges rather than per shard. The table must be
+`Configuration` — every server needs it to route — and a per-shard table would be
+`Configuration` at `UserData` cardinality, which is exactly what
+[schema/traits.md](schema/traits.md#traits-are-not-configuration) forbids. Ranges are what keep
+routing metadata inside its cardinality budget.
+
+A **shard group** falls out with no additional concept: sibling leaves under a range with no
+override share that range's triple, which is the definition of sharing a primary. See OQ-035.
+
+The key that ranges are expressed over differs per family, exactly as placement does — the root
+table's candidate key for `UserData`, the segment boundary for `LogData`, `DataId` as a last
+resort (see [transaction-graph.md](transaction-graph.md#placement-keys-are-not-identity-keys)).
+Since `DataId` is time-major, a range over it is a time range.
+
 ## Replication Protocol
 
 ### Transaction Propagation
@@ -42,13 +104,55 @@ The tertiary-to-secondary elevation mechanism is explicitly designed to support 
 - Secondaries must acknowledge receipt before a transaction is considered committed
 - Tertiaries receive transactions asynchronously — eventual consistency for reads, no durability guarantee
 
-### Peer-to-Peer Propagation (BitTorrent Model)
-Instead of all nodes pulling from the primary directly (MySQL-style with explicit replication routes), DataCode uses a **gossip/swarm model**:
-- Each server announces what sequence numbers it has to its neighbors
-- Servers fetch missing sequences from any neighbor that has them (not only from the primary)
-- This distributes the replication bandwidth and avoids single points of saturation
-- Network paths between servers may be pre-declared as an optimization hint (not a requirement)
-- Secondaries are expected to be fully caught up; tertiaries may lag
+### Push for Liveness, Fetch for Resume
+
+Both directions exist and they answer different questions. Push is already mandatory for the
+authoritative three — a secondary must ACK before the primary commits, so the commit fan-out is
+a push — and the design extends that same fan-out to tertiaries and subscribed clients rather
+than introducing a second mechanism.
+
+| Mechanism | Who | Carries |
+|---|---|---|
+| **Commit fan-out** (push) | secondaries, then subscribed tertiaries and clients | the delta, or an invalidation |
+| **Announce / fetch** (swarm) | any peer that has fallen behind | missing sequence ranges, pulled from any neighbour that has them |
+
+The swarm is the catch-up path: each server announces which sequence numbers it holds, and a
+peer fetches what it lacks from whoever has it rather than from the primary alone, which
+distributes replication bandwidth and avoids saturating a single node. Network paths between
+servers may be pre-declared as an optimization hint, not a requirement. Secondaries are
+expected to be fully caught up; tertiaries may lag.
+
+A client that was offline and a tertiary that lagged want the same thing — "deltas since
+sequence N" — so resumption is one protocol serving both.
+
+### What Gets Pushed Depends on Who Is Listening
+
+> **Payload between servers. Invalidation to clients.**
+
+A server-to-server push carries the delta: a tertiary already holds the whole shard and
+presents a server token, so there is nothing to filter.
+
+A client push carries `(shard, sequence, affected table paths and row identifiers)` and nothing
+more. The client re-reads through the ordinary query path, where its access asserts are
+evaluated by the code that already evaluates them. Pushing payloads to clients would require
+the commit path to evaluate every subscriber's access asserts per row — an access decision on
+the write path, which this design deliberately does not have anywhere else.
+
+**Push is not faster than a parked keep-alive.** A held long-poll, an SSE stream, and an HTTP/2
+server push are the same thing on the wire: the connection is open and the server writes when
+it has news, one way, about half a round trip. What costs latency is *periodic* polling, which
+averages half the interval. So there is no latency argument for a bespoke push protocol — the
+real constraints are how many parked connections a node can hold, and that an HTTP/1.1 client
+needs a second connection so a parked subscription does not head-of-line its requests.
+
+Subscriptions are **in-memory per-server state, not rows.** Making connect and disconnect
+commits would put a write in the connection path. What may be durable is a client's declared
+interest set, for resumption — and resumption is the sequence-fetch path above.
+
+**A `Behavior` cannot be pushed.** Its value changes with no write, so there is no commit to
+trigger a notification. A client watching `balance >= credit_limit` is asking the scheduler to
+solve for a crossing (OQ-034) or to sample it with `every`; it is not a replication question,
+and a subscription that treats it as one receives silence.
 
 ### Shard Splits
 When a shard's data volume crosses a threshold, it splits:
@@ -84,15 +188,100 @@ The operations are not equally disruptive, so they are not equally automatic:
 | Trigger | Action | Authority |
 |---|---|---|
 | An extent fills | Allocate the next; repartition in the background | Automatic and invisible — no locator changes, no graph node, nothing replicates |
-| A `LogData` period closes, or its segment exceeds the size threshold | Seal the segment and start a new one | Automatic — sealing moves no data |
+| A `LogData` segment's grain bucket closes, or its segment exceeds the size threshold | Seal the segment and start a new one | Automatic — sealing moves no data |
 | A `UserData` shard exceeds the size threshold | Report; wait for `split shard … at key` | Operator — a split redistributes roots and moves authority |
 
 The line is mechanical rather than a matter of taste: an operation that moves no data and
 writes no graph node can be automatic, and one that moves authority cannot. Thresholds and the
-segment period are `Configuration` rows (`system.shards.ExtentPolicy`, with a per-server
+segment grain are `Configuration` rows (`system.shards.ExtentPolicy`, with a per-server
 `system.shards.ExtentOverride`), not syntax and not trait parameters — see
 [schema/traits.md](schema/traits.md#traits-are-not-configuration). This answers OQ-007; the
 default values are OQ-035.
+
+## Schema Shards Are Rooted at a Branch
+
+The schema is data, so it is sharded like data: **one shard per branch**, rooted at the branch
+row. The branch name is that root's candidate key, which makes OQ-026's "all branches must be
+named" load-bearing rather than a policy — a root table's key is the cluster-wide shard
+directory ([transaction-graph.md](transaction-graph.md#shard-roots)), so an anonymous fork would
+be a shard nobody can route to.
+
+Branches therefore get independent primaries. Schema work on two branches does not contend, and
+a merge to `main` serializes at `main`'s primary, which is the only place it could.
+
+| Lives on the branch shard | Lives elsewhere |
+|---|---|
+| Schema nodes: types, tables, traits, functors, routes | `Configuration` rows — operator tuning that must survive a merge |
+| `Reference` rows, because inserting one *is* a schema transaction ([schema/traits.md](schema/traits.md#reference-tables-are-code)) | Table-wide `unique` value indexes (below) |
+
+That split is the existing trait/configuration line ([schema/traits.md](schema/traits.md#traits-are-not-configuration)) doing the work: a branch may change what a table *is*, and must not silently
+change how a deployment *treats* it.
+
+### Local Branches
+
+An administrator can create a branch on a workstation, work in it, and upload it — with no user
+data present. Three consequences fall out, and the first is the useful one:
+
+- **A local branch needs the schema graph to the branch point, plus its `Reference` rows, and
+  nothing else.** `Reference` is low-to-medium cardinality, so the clone is bounded. "Without
+  user data" is achievable; "without reference data" is not, because reference rows are code.
+- **A new constraint cannot be validated locally**, since the rows it would be validated against
+  are not there. Conformance is established per shard **at merge**, which is the bulk-mutation
+  path below, reporting per shard. `enforce forward` is what keeps that merge non-blocking.
+- **A local branch is not durable until uploaded.** It has no secondaries. This is the unpushed
+  git branch and behaves like one; uploading is role assignment on a shard that already exists,
+  which is the ordinary elevation machinery.
+
+Validation reads merged nodes only, so a local branch is inert with respect to the cluster for
+the same structural reason a prepared transaction node is.
+
+## Constraint Shards
+
+A table-wide `unique` is the one constraint whose scope is the whole cluster
+([schema/tables.md](schema/tables.md#candidate-keys-are-mandatory)). Its value index does **not**
+live on the schema shard, and it is not branch-versioned.
+
+Putting it on the schema shard was considered and rejected: the index holds every value of the
+column across the cluster — user-data volume in the shard that also holds DDL — it cannot split,
+and one primary would then serialize writes to every table in the cluster that declares such a
+constraint. The consequence that decided it: schema-shard unavailability would stop all writes
+rather than only DDL.
+
+Instead, a table-wide `unique` is served by a shard **rooted at that constraint's schema-node
+row**, splittable by value range, with its primary placeable near the writers and movable by
+ordinary elevation. This also answers OQ-035's open question about where a table-wide `next`
+counter lives: it is a row in that constraint's shard.
+
+### Constraint Groups
+
+A transaction touching two table-wide constraints in different shards is a two-participant
+cross-shard transaction, which costs a second hop. Constraints that tend to be touched together
+should therefore share a primary.
+
+"Together" has to be **declared**, because inferring which constraints an interactive or API
+transaction might touch is not decidable. The default grouping is **one constraint shard per
+namespace subtree** — namespaces are already the grouping axis with inheritance semantics
+(OQ-024), and a transaction spanning namespaces is already the unusual case. An explicit
+`Configuration` row reassigns a constraint to another group, resolved most-specific-first.
+
+**Colocation is an optimization, not a correctness requirement.** A transaction spanning two
+groups is an ordinary multi-participant prepared-node transaction: it costs hops and nothing
+breaks. Schema commit therefore *warns* where the touched set is static — generated routes,
+declared functors — and stays silent where it cannot know. A hard rule here would be
+unenforceable and would need exceptions immediately.
+
+### Constraints Span Branches
+
+The value index is shared across branches while the constraint's *declaration* is
+branch-versioned. Two consequences follow:
+
+- **An unmerged branch's table-wide `unique` has a partial index**, since only writes routed
+  through that branch's version token are checked against it. The index is backfilled at merge —
+  another bulk mutation with a per-shard report — and pre-merge the constraint is
+  `enforce forward` by construction rather than by declaration.
+- **A branch cannot change the value set of a table-wide `unique`**, only whether one is
+  declared. Which is the same fact as "a local branch holds no user data", seen from the
+  constraint's side.
 
 ## Materialized View Distribution
 
@@ -123,6 +312,124 @@ Primary (async) → Tertiaries: propagate via peer swarm
 
 The primary does not wait for tertiary acknowledgment. Tertiaries are eventually consistent.
 
+## Cross-Shard Transactions
+
+There is no distributed lock. A cross-shard transaction is a **prepared node per participant
+plus one commit node**, which is the graph's existing branch-and-merge shape applied at
+transaction scale:
+
+```
+1. A validates against pinned graph point P_A; appends a PREPARED node (operation + P_A).
+   Invisible to reads. A keeps accepting unrelated writes.
+2. A sends (operation, P_A, prepared id) to B's primary.
+3. B validates against its own pinned point; appends its PREPARED node; answers yes or no.
+4. yes → A appends the COMMIT node; both sides become visible, B learns through the
+          ordinary commit fan-out.
+   no  → A appends an ABORT node; nothing was ever visible.
+```
+
+What crosses the wire is the **operation**, not a row set, and each participant validates once,
+locally, against a point it pinned itself. There is no global coordinator — the coordinator is
+whichever server accepted the mutation.
+
+This replaces the cross-server lock on a `transaction_id` held until all operations complete
+(OQ-027). A prepared node is not a lock: it excludes nothing, and A serializes only its own
+writes, as it always did.
+
+**Validation reads merged nodes only.** This one invariant does three jobs — it is why a
+prepared node is invisible, why an unmerged schema branch does not affect the cluster, and why
+an administrator's local branch is inert until uploaded. It is also what makes deadlock
+unrepresentable: concurrent `A → B` and `B → A` chains cannot wait on each other's prepared
+nodes, because neither can see them. The only outcome is an abort.
+
+Prepared nodes are named by their own `DataId`, which satisfies OQ-026's prohibition on
+anonymous DAG forks without a carve-out for transaction-scoped branches.
+
+### Why Re-validation Rarely Fails
+
+The optimism is derived rather than hoped for. An assert's query must be rooted at `self`
+([schema/constraints.md](schema/constraints.md#anchoring)), so its predicate depends only on
+the subject row's connected component. B's re-validation can therefore fail only if something
+committed at B between the pin and the handoff that touched those same rows — which is a
+genuine write conflict and has to fail regardless of how the transaction was coordinated.
+
+### Constraints That Cross Shards Cannot Promise `enforce always`
+
+Anchoring bounds *work*, not *locality*: an FK may point into another shard, and a negative
+assertion's revalidation set is the FK chain traversed backwards
+([schema/constraints.md](schema/constraints.md#anchoring)). So a write in shard C can invalidate
+an assert on a row in shard A, and no amount of pinning at A and B observes it. That guarantee
+is unachievable without exactly the lock this design removes.
+
+An attachment whose revalidation set crosses a shard boundary is therefore restricted to
+`enforce forward`, `monitor`, or `repair into` — never `enforce always`
+([integrity.md](integrity.md#enforcement-modes)) — and the breach surfaces as a
+`system.integrity.Violation` rather than as a rejected write.
+
+Schema commit **names the crossing edge and reports the coercion**. An author who wrote
+`enforce always` and silently received `forward` would be facing exactly the sort of
+read-behaviour change that OQ-005 already requires be surfaced in the commit diff.
+
+## Bulk and Cluster-Wide Mutations
+
+A mutation whose predicate is not anchored to a single shard cannot be executed by one primary.
+It becomes a node on the schema shard that every shard primary applies to its own shard.
+
+**The gate is structural, not a role check.** What makes such a mutation dangerous is its
+*scope*, which is readable off the query — the same discipline by which an assert's variety is
+read off its body rather than its name (OQ-005). An ordinary grant on the system table controls
+who may use the path; privilege is a consequence of the rule, not the rule.
+
+**Application is per shard, independent, and may be partial.** Each primary validates every
+affected row against the full constraint set — a bulk mutation is subject to the same rules as
+any other write — and records what it did in its own shard. The initiator's report is a
+distributed query merged from every participating shard, exactly as integrity reporting already
+works, and **it names which shards contributed, so a partial result is never mistaken for a
+complete one** (see [integrity.md](integrity.md)).
+
+Three consequences worth stating:
+
+- **The initiator subscribes; it does not block.** A synchronous "wait for all primaries" return
+  value cannot express "shard 47 is down". A per-shard application record can, and does so
+  permanently.
+- **It is restartable by construction.** A shard that was unreachable applies the node when it
+  returns, because the node is in the graph and its application is a per-shard fact rather than
+  a message that was missed.
+- **Records stay in the shard.** One row per (operation, shard) written to the schema shard
+  would make every bulk mutation a fan-in burst on the one node least able to absorb one.
+
+The one case that resists independent per-shard validation is a bulk mutation touching a
+table-wide `unique` column, whose authority lives outside every data shard (see
+[Constraint Shards](#constraint-shards)).
+
+## Deferral: Reads and Mutations Are Different Problems
+
+**Global reads need no deferral.** A query is pegged to a `(commit node, sample moment)` pair
+([schema/queries.md](schema/queries.md#every-query-has-a-sample-moment)) and never blocks a
+writer. What an analytical scan can do is starve local work of I/O, which is a resource budget,
+and the answer is the one already in this document: dedicated tertiary servers, with a budget.
+
+**Global mutations queue.** They are queue rows processed by the event scheduler under a
+`Configuration` policy, which already carries `backoff_base` and `aging_rate`
+([events.md](events.md)). Cross-shard prepares and cluster-wide mutations are the same kind of
+work item: a verified operation pinned to a graph point, admitted by a shard primary when its
+queue position comes up. One mechanism, two callers.
+
+Admission is on a condition readable off data, not off a clock: **the shard's write queue
+reaches zero, or the item's age exceeds the aging threshold.** The first gives local work
+precedence and lets global work resolve while a shard is quiet. The second is what prevents a
+steady local stream from starving it forever — "wait for the server to be idle" alone has no
+guarantee of progress on a busy server, and inactivity is a clock property besides.
+
+Which yields the property the whole arrangement exists for:
+
+> **No operation waits on another operation. It waits on a queue position, and queue positions
+> age.** There is no wait-for edge, so deadlock is unrepresentable rather than avoided.
+
+That holds only alongside "validation reads merged nodes only" — a validation permitted to
+observe a prepared node would reintroduce the wait-for edge this removes. The two are one
+decision.
+
 ## Geo-Diversity Goals
 
 | Role | Target placement |
@@ -136,5 +443,10 @@ The primary does not wait for tertiary acknowledgment. Tertiaries are eventually
 
 - What is the failure detection mechanism? Heartbeats? Lease-based? (Affects elevation latency)
 - How long can a primary be unreachable before a secondary auto-elevates vs. requiring manual intervention?
-- What are the default extent size and segment period, and is a shard group formed automatically or by an operator? (OQ-035 — the split *trigger* itself is settled above)
+- What are the default extent size and segment grain, and is a shard group formed automatically or by an operator? (OQ-035 — the split *trigger* itself is settled above)
 - How are network path hints declared and stored? (Likely a `system` shard table)
+- How many parked client subscriptions should a node hold, and what is the eviction policy when
+  that ceiling is reached? The latency question is settled — a parked connection is a push
+  channel — but the capacity question is not.
+- What is the I/O budget mechanism for analytical reads on a tertiary, and is it expressed per
+  connection, per token, or per query?

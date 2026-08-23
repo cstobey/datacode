@@ -125,15 +125,24 @@ schema graph already captures when a custom route existed.
 ## Transaction Semantics
 
 Reads and writes share the same transaction graph snapshot. The primary server linearizes
-and executes transactions one at a time. Cross-shard transactions require all shard
-primaries to agree: a cross-server lock is taken on a `transaction_id` across the involved
-shards and held until all operations complete. Consequence: group related shards on the same
-server, and prefer placing the primary close to the users making requests.
+and executes transactions one at a time. **Cross-shard transactions take no lock**: each
+participant validates against a graph point it pins and appends a prepared node, and the
+coordinating primary — whichever accepted the mutation — appends a single commit node that
+makes every participant's work visible at once, or an abort node that makes none of it
+visible. Consequence unchanged: group related shards on the same server, and prefer placing
+the primary close to the users making requests. See
+[distribution.md](distribution.md#cross-shard-transactions).
 
 The transaction is atomic — it either fully commits or fully fails. On failure, only the
 HTTP request log is written (to a per-server system shard that always succeeds
 independently). The error is returned to the client. 500s should be avoided; all known
 failure modes return 4xx.
+
+Atomicity holds per transaction, which is why a **cluster-wide mutation is not one
+transaction**. A mutation whose predicate is not anchored to a single shard is applied by each
+shard primary independently and may be partial; its result is a per-shard report naming which
+shards contributed, not an all-or-nothing status code. See
+[distribution.md](distribution.md#bulk-and-cluster-wide-mutations).
 
 Internal event functors (index updates, view refresh) resolve within the transaction as they
 occur. External side effects are never executed inline — see [events.md](events.md).

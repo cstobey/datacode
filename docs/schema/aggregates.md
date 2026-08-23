@@ -19,9 +19,9 @@ aggregate RequestRollup = system.logs.HttpRequest
 
 retain system.logs.HttpRequest as RequestRollup
   for 1 day
-  , by hour  for 1 month
-  , by day   for 6 months
-  , by month forever
+  , by Hour  for 1 month
+  , by Day   for 6 month
+  , by Month forever
 ```
 
 Full-resolution rows for a day, hourly summaries for a month, daily for six months, monthly
@@ -63,13 +63,50 @@ of the row, and costs no bytes — the same way `created_at` is derived from the
 than stored (see [tables.md](tables.md)). It is nonetheless queryable:
 
 ```
-system.logs.RequestRollup where grain == hour
+system.logs.RequestRollup where grain == Month
 ```
 
 There is no `by` clause in query position. `by` declares a grain in a `retain` chain; `where`
 selects one, using the query language that already exists. Because `grain` is constant per
 table, that predicate is a table selection rather than a row filter, and the optimizer treats
 it as one.
+
+`grain`'s type is `Grain` and `Month` is one of its variants, so this is an ordinary comparison
+between a column and a variant — the capitalization is the ordinary variant-naming rule, not a
+signal to the parser. `Hour` the grain and `hour` the `Duration` are different types and the
+case is what tells them apart. See [types.md](types.md#three-kinds-of-time-quantity).
+
+### Grain Order
+
+A chain coarsens along declared **alignment** edges, not by comparing bucket widths. Every
+grain names the grain whose buckets its own tile exactly:
+
+```
+Minute → Hour → Day → Month → Quarter → Year
+                Day → IsoWeek → IsoYear
+```
+
+Two roots, and the second one is the reason alignment is the rule rather than coarsening. ISO
+weeks tile ISO years exactly by construction, and tile nothing on the calendar side: the week
+of January 29 straddles two months, so `by IsoWeek , by Month` would merge a bucket into a
+month it is only partly inside. That step is **rejected** — not because the grain fails to
+coarsen, but because it fails to align. An ISO chain runs to `IsoYear` or stops.
+
+Alignment also decides what a width comparison could not. `IsoWeek` is coarser than `Day` and
+finer than `Month` while dividing neither evenly, so its position in the order is declared
+rather than computed.
+
+Two further consequences:
+
+- **Retention is compared against the successor grain's maximum span.** A step must cover at
+  least one complete bucket of the step after it, and `Month` spans 28–31 days, so
+  `for 30 day , by Month` is rejected while `for 31 day , by Month` is accepted. Conservative
+  by construction, which is what keeps the check decidable.
+- **An `IsoWeek` level is labelled by ISO year.** December 29–31 can belong to week 1 of the
+  following ISO year and January 1–3 to week 52 or 53 of the previous one, so a calendar-year
+  label would collide two distinct weeks in one bucket. `bucket_start` is the Monday, which is
+  unambiguous on its own; the label an operator reads is the `(isoYear, week)` pair that
+  `isoWeekOf` returns.
 
 ### Aggregates in a Chain Must Merge
 
@@ -112,7 +149,7 @@ A table with no rollup needs no aggregate:
 
 ```
 retain system.logs.Debug
-  for 7 days
+  for 7 day
   , drop
 ```
 
@@ -137,13 +174,13 @@ Several retentions on one table are written as ordered branches in a single bloc
 ```
 retain system.logs.HttpRequest as RequestRollup
   where status >= 500
-    for 30 days
-    , by hour for 1 year
+    for 30 day
+    , by Hour for 1 year
   otherwise
     for 1 day
-    , by hour  for 1 month
-    , by day   for 6 months
-    , by month forever
+    , by Hour  for 1 month
+    , by Day   for 6 month
+    , by Month forever
 ```
 
 One block rather than several statements, because order is load-bearing and separate
@@ -167,8 +204,8 @@ The bucket is cut on `created_at`, which for a native table is derived from the 
 
 ```
 retain connectors.mariadb.production.Order as OrderRollup using order_date
-  for 90 days
-  , by day forever
+  for 90 day
+  , by Day forever
 ```
 
 `using` already means "supply a parameter to this construct" on `Hashed`; `on` and `by` are
@@ -194,7 +231,7 @@ The aggregate's plain name is a view unioning every level:
 
 ```
 system.logs.RequestRollup                      -- all levels, transparently
-system.logs.RequestRollup where grain == hour  -- one level
+system.logs.RequestRollup where grain == Hour  -- one level
 ```
 
 The transparent case is the default name and reaching into a level is the marked one. Because
@@ -228,7 +265,7 @@ adding a predicate to a populated field must state a mode
 
 ```
 datacode[system.logs]> :commit
-error: retain system.logs.HttpRequest shortens raw retention from 7 days to 1 day.
+error: retain system.logs.HttpRequest shortens raw retention from 7 day to 1 day.
        2 140 883 rows (6.2 GB) become immediately prunable.
        Re-issue with `confirm` to proceed.
 ```
@@ -310,7 +347,7 @@ rather than purely by age, because its rows are not equally reconstructible:
 ```
 retain system.integrity.Violation
   where origin is Derived && state is Repaired
-    for 90 days
+    for 90 day
     , drop
   otherwise
     forever

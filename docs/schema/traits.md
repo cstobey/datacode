@@ -404,7 +404,7 @@ trait Accruing {
   rate      : Rate,
   opened_at : Timestamp,
 
-  balance : Behavior Amount = \t -> principal * (1 + rate * days (t - opened_at))
+  balance : Behavior Amount = \t -> principal * (1 + rate * (t - opened_at) / day)
 }
 
 table app.billing.Loan       : Accruing, UserData { customer :> Customer, ... }

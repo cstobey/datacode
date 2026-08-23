@@ -18,7 +18,7 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [schema/README.md](schema/README.md) | Design philosophy, visibility layers, notation conventions (`:` vs `:>`, clause order, layout) |
-| [schema/types.md](schema/types.md) | Primitives, domain types, sum types, `Moment` and `Behavior`, absence types, `is`, `Secret` and `Hashed` |
+| [schema/types.md](schema/types.md) | Primitives, domain types, sum types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret` and `Hashed` |
 | [schema/tables.md](schema/tables.md) | Table bodies, fields, defaults, candidate keys, ordering, foreign keys, sub-tables |
 | [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible`, `Queue`/`QueueState` |
 | [schema/constraints.md](schema/constraints.md) | `assert`, path constraints, presence and absence, access control |
@@ -37,7 +37,7 @@ diagrams.
 |---|---|
 | [transaction-graph.md](transaction-graph.md) | Append-only DAG, branches and tags, shards, `DataId`, component ordinals, `PhysicalLocator` |
 | [storage.md](storage.md) | Append-only log, LMDB indexes, Cap'n Proto, zero-copy reads, materialized views |
-| [distribution.md](distribution.md) | Server roles, replication protocol, shard splits, geo-diversity |
+| [distribution.md](distribution.md) | Server roles, the range tree, push/fetch replication, schema and constraint shards, cross-shard transactions, bulk mutations, shard splits, geo-diversity |
 | [tech-stack.md](tech-stack.md) | Library and format decisions, with the OQ and spike that settled each |
 | [dynamic-loading.md](dynamic-loading.md) | GADT DSL + `Data.Dynamic`; full addendum of options considered |
 

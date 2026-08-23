@@ -135,7 +135,7 @@ declares the sampling interval:
 table app.ingest.Feed : UserData {
   vendor        :> Vendor,
   url           : URL,
-  poll_interval : Duration = 15 minutes,
+  poll_interval : Duration = 15 minute,
   active        : Bool = True,
 
   unique feedOf { vendor, url },
@@ -147,7 +147,7 @@ table app.ingest.Feed : UserData {
 Five properties, none of which needed a new construct:
 
 **The interval is an expression, not a literal.** Any `Read` expression of type `Duration`
-serves: a `DurationLit` (`every 15 minutes`), a field of the row (`every poll_interval`), or a
+serves: a `LengthLit` (`every 15 minute`), a field of the row (`every poll_interval`), or a
 `Configuration` path (`every system.config.Ingest.interval`). This is what makes an interval
 tunable without an override mechanism — point the expression at wherever the tuning should
 live. It is re-read each tick, so a `Configuration` write takes effect on the next one.
@@ -165,7 +165,7 @@ predicate. A deactivated feed is not sampled. This is the same clause that carri
 condition in the open-form behavior case:
 
 ```
-every 30 seconds emit app.events.OverlimitQueue { account = id } where balance >= credit_limit
+every 30 second emit app.events.OverlimitQueue { account = id } where balance >= credit_limit
 ```
 
 **There is no standalone or top-level cron form, and none is needed.** A timer job always has
@@ -176,7 +176,7 @@ than a `Statement` is what keeps the payload typed against a row it can name.
 
 **False-to-true still holds.** `every` samples the condition at each tick and fires only on a
 transition — observed between ticks instead of across a write. A credit line that stays over
-limit enqueues once, not once every 30 seconds. This costs a stored last-tick bit per
+limit enqueues once, not once every 30 second. This costs a stored last-tick bit per
 `(trigger, row)`:
 
 ```
@@ -193,7 +193,7 @@ commit warns when `every` carries a condition the solver could have closed**, an
 
 ```
 datacode[app.billing]> :commit
-  app.billing.CreditLine: `every 30 seconds … where balance >= credit_limit` samples a
+  app.billing.CreditLine: `every 30 second … where balance >= credit_limit` samples a
   condition the solver can close (balance is linear in Moment). Drop `every` to solve it.
 ```
 
@@ -207,7 +207,7 @@ loops are two `every` statements on the connector row:
 table system.connectors.Connector : Configuration {
   name           : Text unique,
   kind           :> ConnectorKind,
-  poll_interval  : Duration = 10 seconds,
+  poll_interval  : Duration = 10 second,
   latency_window : Duration,
   enabled        : Bool = True,
 

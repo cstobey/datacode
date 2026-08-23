@@ -256,7 +256,7 @@ row, not part of the registration.
 - **`on`** observes the transition. Across the write for a condition over stored fields; at a
   solved moment for a condition over a closed-form `Behavior`.
 - **`every`** samples for it. Its `Expr` is the interval — any `Read` expression of type
-  `Duration`, so a `DurationLit` (`every 15 minutes`), a field of the row (`every
+  `Duration`, so a `LengthLit` (`every 15 minute`), a field of the row (`every
   poll_interval`), and a `Configuration` path are one production. The `WhereClause` carries the
   sampled condition, or restricts which rows are sampled, or both. Sampling still fires only on
   a transition, which costs a `system.events.TriggerState` row per `(trigger, row)`; schema
@@ -281,7 +281,10 @@ Constraints not expressible in the grammar:
   [../events.md](../events.md#queue-tables).
 - An `every` interval `Expr` must be `Read` and of type `Duration`. A literal below
   `system.events.SchedulerLimit.min_interval` is rejected at commit; a computed one is clamped
-  at dispatch.
+  at dispatch. A `Period` interval (`every 1 month`) is **rejected**: sampling compares an
+  interval against elapsed time since the last fire, and a `Period` has no elapsed length to
+  compare. A monthly job is `every 1 day` with a `where` on the day of month, which also says
+  what should happen when a month has no 31st.
 - A `TraitList` item is a bare `QName`: **traits take no arguments.** A trait is a declaration,
   not a tuning knob, and operational values live in `Configuration` rows instead. See
   [traits.md](traits.md#traits-are-not-configuration).
@@ -320,28 +323,45 @@ RetainBranch  ::= 'where' Expr Chain
                 | 'otherwise'  Chain
 
 Chain         ::= ChainStep ( ',' ChainStep )*
-ChainStep     ::= ( 'by' Ident )? ( 'for' DurationLit | 'forever' )
+ChainStep     ::= ( 'by' GrainRef )? ( 'for' LengthLit | 'forever' )
                 | 'drop'
 
-DurationLit   ::= NumLit Ident
+GrainRef      ::= UpperIdent
+LengthLit     ::= NumLit Ident
 ```
 
 `AggregateDecl` binds a name to an ordinary query — source, optional `group`, projection with
 aggregate functions. It is a template, not a view: a view has one extent, while an aggregate is
 instantiated once per grain by the chain that names it.
 
-`DurationLit` is a numeric literal juxtaposed with an identifier naming a `Duration` constant
-(`7 days`, `1 month`). No unit words are reserved, and no ambiguity arises with function
-application, because a numeric literal is not applicable — `NumLit Ident` can only be a
-duration. The same identifiers are ordinary `Duration` values elsewhere, which is what makes
-`grain == hour` an ordinary comparison.
+`LengthLit` is a numeric literal juxtaposed with an identifier naming a `Duration` or `Period`
+constant (`7 day`, `6 hour`, `1 month`). It **desugars to multiplication** — `7 day` is
+`7 * day` — so the unit is an ordinary value and the factor exists in one place. No unit words
+are reserved, and no ambiguity arises with function application, because a numeric literal is
+not applicable: `NumLit Ident` can only be a length. The same identifiers are ordinary
+`Duration` and `Period` values everywhere else.
+
+A `GrainRef` is a `Grain` variant and so is `UpperIdent` — `by Hour`, `by IsoWeek`, `by Month`.
+The capitalization is what distinguishes the bucket size from the retention length beside it in
+the same step, and it is the ordinary variant-naming rule rather than a special one. This is
+also what keeps `grain == Month` an ordinary comparison: `grain` is a virtual column of type
+`Grain` and `Month` is one of its variants.
 
 Constraints not expressible in the grammar:
 
 - The **first** `ChainStep` of a chain carries no `by` — it is the source table's own
   retention. Every later step must carry one.
-- Grain must strictly coarsen along a chain, and a step's retention must cover at least one
-  complete bucket of its successor, or that successor's first bucket is truncated.
+- Each step's grain must be the **alignment parent** of its predecessor's, transitively —
+  `Minute → Hour → Day → Month → Quarter → Year` or `Day → IsoWeek → IsoYear`. Coarsening
+  alone is insufficient: `IsoWeek → Month` is coarser and misaligned, and merging across it
+  would place a straddling week in a month it is only partly inside. See
+  [types.md](types.md#grains-align-they-do-not-merely-coarsen).
+- A step's retention must cover at least one complete bucket of its successor, or that
+  successor's first bucket is truncated. The comparison is against the successor grain's
+  **maximum** span (`Month` is 28–31 days, so `for 30 day` does not cover one), which keeps the
+  check decidable and conservative.
+- `for` takes a length, never a grain — a `Grain` has no count, so `for Day` cannot say how
+  many. Both `Duration` and `Period` lengths are admitted, so a raw step may be `for 6 hour`.
 - The **last** `ChainStep` must be `forever` or `drop`. A chain that merely runs out is
   rejected, so discarding data is always something someone wrote.
 - `as` is required if the chain has more than one step, and forbidden if it has one. A chain
@@ -893,9 +913,16 @@ Words considered and **not** reserved for these:
 `aggregate`, `retain`, `forever`, and `otherwise` are the four added for retention.
 `otherwise` is Haskell's guard fall-through and is used here for exactly that.
 
-Duration unit names (`day`, `hour`, `month`, …) are **not** reserved. They are ordinary
-identifiers bound to `Duration` constants in the standard library, which is what lets
-`grain == hour` be an ordinary comparison rather than a special form.
+Unit names (`day`, `hour`, `week`, `month`, `year`, …) are **not** reserved. They are ordinary
+identifiers bound to `Duration` and `Period` constants in the standard library, which is what
+lets `7 day` desugar to a multiplication rather than needing a special form. Grain variants
+(`Hour`, `IsoWeek`, `Month`, …) are likewise ordinary identifiers — variants of the `Grain` sum
+type — which is what keeps `grain == Month` an ordinary comparison.
+
+**No unit name is bound in the plural**, as a constant or a function. The plural forms were
+previously bound to `Duration -> Decimal` conversions *and* used as the unit word in `7 days`,
+which put one identifier on two meanings; conversion is now `/ day` and the plural namespace is
+kept empty so the collision cannot recur.
 
 - **`access`**, as the assert name selecting the access-control variety. It was never a
   reserved word — it was a magic `Ident` that the compiler treated specially, which is the
@@ -911,7 +938,7 @@ identifiers bound to `Duration` constants in the standard library, which is what
 reserved against future admin syntax but currently have no production — those operations are
 ordinary mutations against `system.integrity.Violation`.
 
-Type and trait names (`Text`, `Int`, `Null`, `NotFound`, `Doc`, `Duration`, `Moment`,
+Type and trait names (`Text`, `Int`, `Null`, `NotFound`, `Doc`, `Duration`, `Period`, `Grain`, `Moment`,
 `Behavior`, `Reference`, `UserData`, `LogData`, `Configuration`, `Component`, `Extensible`,
 `Keyless`, `DocKeys`, …) are ordinary identifiers resolved through the namespace tree, not
 reserved words.

@@ -158,7 +158,7 @@ table system.auth.Challenge : LogData {
   }
 }
 
-retain system.auth.Challenge for 30 days, drop
+retain system.auth.Challenge for 30 day, drop
 ```
 
 Five things fall out, and none of them is new machinery:

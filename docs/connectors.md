@@ -195,7 +195,7 @@ scheduler ([events.md](events.md#one-scheduler)). There is no separate connector
 table system.connectors.Connector : Configuration {
   name           : Text unique,
   kind           :> ConnectorKind,
-  poll_interval  : Duration = 10 seconds,
+  poll_interval  : Duration = 10 second,
   latency_window : Duration,
   authority      : DataCode | External | Symmetric = Symmetric,
   enabled        : Bool = True,

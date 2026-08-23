@@ -353,7 +353,7 @@ form in [schema/aggregates.md](schema/aggregates.md#branches):
 ```
 retain system.integrity.Violation
   where origin is Derived && state is Repaired
-    for 90 days
+    for 90 day
     , drop
   otherwise
     forever

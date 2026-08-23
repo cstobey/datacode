@@ -133,14 +133,30 @@ So a computation that needs the current time takes it as a parameter. Queries su
 the sample moment ([queries.md](queries.md#every-query-has-a-sample-moment)); behaviors take
 it as their `Moment` argument.
 
-`Duration` conversions are ordinary stdlib functions:
+Unit names are `Duration` **constants**, so converting is division rather than a function
+call:
 
 ```
-days, hours, minutes, seconds, millis :: Duration -> Decimal
+rate * (t - opened_at) / day
 ```
 
-Write them at the use site — `rate * days (t - opened_at)` — so the unit a rate is expressed
-in is visible next to the rate.
+The unit stays visible next to the rate, and the factor lives in exactly one place. This
+replaced a family of `Duration -> Decimal` conversions (`days`, `hours`, …) that bound the
+plural unit names a second time; see [types.md](types.md#units-are-values).
+
+Calendar arithmetic uses `Period`, which has no millisecond count. `+` adds from the origin;
+`stepMonth :: Int -> Timestamp -> Timestamp` accumulates a month at a time, clamping at each
+step:
+
+```
+signed_at + 3 * month     -- Dec 31 → Mar 31
+stepMonth 3 signed_at     -- Dec 31 → Mar 28 or 29
+```
+
+`Data.Time`'s calendar functions are available on the same terms as the rest of it — pure
+only, no clock. `isoWeekOf :: Timestamp -> (Int, Int)` returns an ISO year and week number,
+which is not derivable from the calendar year (see
+[types.md](types.md#grains-align-they-do-not-merely-coarsen)).
 
 Extra packages require `import` at the schema file level. The allowed package list is
 managed by admins in `system.config.AllowedPackage`.

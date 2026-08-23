@@ -16,6 +16,8 @@ Standard scalar types:
 | `Date` | Calendar date |
 | `Timestamp` | A stored point in time |
 | `Duration` | Signed elapsed time; canonical unit is the millisecond |
+| `Period` | A calendar offset (`month`, `quarter`, `year`); no millisecond count |
+| `Grain` | A truncation of the time axis into labelled buckets (`Hour`, `IsoWeek`, `Month`, …) |
 | `Moment` | A point in the observation continuum — the parameter of a `Behavior` |
 | `Bytes` | Opaque byte string |
 | `DataId` | 12-byte globally unique identifier (see [../transaction-graph.md](../transaction-graph.md)) |
@@ -121,7 +123,7 @@ table app.billing.Loan : UserData {
 
   unique loanRef { customer, account },
 
-  balance : Behavior Amount = \t -> principal * (1 + rate * days (t - opened_at))
+  balance : Behavior Amount = \t -> principal * (1 + rate * (t - opened_at) / day)
 }
 ```
 
@@ -156,28 +158,126 @@ evaluates one at future moments to find when a condition *will* become true. Nei
 | `Timestamp - Timestamp` | `Duration` |
 | `Timestamp + Duration` | `Timestamp` |
 | `Moment + Duration` | `Moment` |
+| `Timestamp + Period` | `Timestamp` |
+| `Moment + Period` | `Moment` |
+| `Duration / Duration` | `Decimal` |
+| `Duration * Decimal` | `Duration` |
+| `Period * Int` | `Period` |
 
 `Moment` resolves to millisecond resolution on observation, matching `DataId`. The
 *denotation* must not depend on that: a behavior meaningful only at millisecond boundaries is
 a discrete signal and belongs in a stored field.
 
-### Units
+### Three Kinds of Time Quantity
 
-`Duration`'s canonical unit is the millisecond. Conversions are ordinary standard-library
-functions, not a dimensional type system:
+Elapsed time, calendar offsets, and bucket sizes are three different things. They were one
+thing while `Duration` was the only type, and that hid two errors: a "month" with a fixed
+millisecond count, and a bucket size that has no count at all.
+
+| Type | Job | Constants |
+|---|---|---|
+| `Duration` | elapsed time; divisible, millisecond-canonical | `milli`, `second`, `minute`, `hour`, `day`, `week` |
+| `Period` | a calendar offset added to a `Timestamp`; integer-scaled | `month`, `quarter`, `year` |
+| `Grain` | a truncation of the time axis into labelled buckets | `Minute`, `Hour`, `Day`, `IsoWeek`, `Month`, `Quarter`, `Year`, `IsoYear` |
+
+Capitalization carries the distinction where two of them would otherwise want the same word:
+`hour` is an elapsed `Duration`, `Hour` is a `Grain`. This is the ordinary type/value case
+rather than a special rule — `Grain`'s inhabitants are variants of a sum type, so they are
+`UpperCamelCase` like every other variant ([README.md](README.md)).
+
+### Units Are Values
+
+`Duration`'s canonical unit is the millisecond, and unit names are **constants**, not
+conversion functions. Converting is division:
 
 ```
-days, hours, minutes, seconds, millis :: Duration -> Decimal
+rate * (t - opened_at) / day        -- "per day", because `day` is visible beside the rate
+(closed_at - opened_at) / hour      -- Decimal hours
 ```
 
-Write the conversion at the use site — `rate * days (t - opened_at)` — rather than folding a
-factor into the expression. `rate` then means "per day" because `days` is visible beside it,
-and the factor is written once in the standard library instead of once per behavior.
+`Duration / Duration` is the one division that yields a dimensionless `Decimal`, which is what
+makes this work without a dimensional type system. `*` and `/` are both `infixl 7`, so the
+expression above needs no parentheses.
+
+This replaced a family of conversion functions (`days`, `hours`, `minutes`, `seconds`,
+`millis :: Duration -> Decimal`). Three reasons:
+
+- **A factor existed in two places.** The constant `day` and the function `days` were
+  independent sources of the same number, which is the defect canonical-millisecond exists to
+  prevent. Division derives the conversion from the constant.
+- **One name was bound twice.** `7 days` is a duration literal and `days x` was an
+  application, so `days` meant a scale word in one position and a function in another.
+- **Units now compose.** `7 * day`, `2 * week`, and a user-defined `fortnight` in a
+  `Reference` table all work with no standard-library entry each.
+
+Consequently **no unit name is ever bound in the plural**, for a constant or a function. The
+plural namespace is kept empty so the collision cannot recur.
+
+### Calendar Arithmetic Is Not Elapsed Arithmetic
+
+A `Period` has no millisecond count and no conversion to `Duration` in either direction. That
+is the entire point: `now + 3 * month` is a type error away from being wrong, because it is
+`Period` arithmetic and gets calendar semantics rather than a 30-day approximation.
+
+`Period` scales by `Int` only. A non-integral literal against a `Period` unit is rejected at
+compile time rather than rounded — `2.5 month` denotes nothing.
+
+**Calendar addition is not associative**, which is why one operator cannot cover both readings.
+Take December 31 plus three months:
+
+| | Result | Why |
+|---|---|---|
+| `d + 3 * month` | Mar 31 | one clamp, applied once from the origin |
+| `stepMonth 3 d` | Mar 28 or 29 | Jan 31 → Feb 28/29 → Mar 28/29; the day-of-month never recovers |
+
+`+` is the from-origin reading. `stepMonth :: Int -> Timestamp -> Timestamp` accumulates one
+month at a time, clamping at each step, so a value that lands on a short month stays there.
+Both are wanted — the first for "three months from signup", the second for a schedule anchored
+to a day-of-month that must not jump back out once it has been reduced.
+
+`stepMonth` is singular for the same reason the plural namespace is empty. Rollover semantics
+(Jan 31 + 1 month = Mar 3, as in `Data.Time`'s `addGregorianMonthsRollOver`) is deliberately
+not provided.
 
 Domain types carry validation, not dimensional algebra: `type Rate : Decimal` narrows the
 value set, but arithmetic operates on `Decimal` and the result widens back to it. Canonical
-`Duration` is what keeps that safe — every conversion pivots through one unit, so there is
-exactly one place a factor can be wrong.
+`Duration` is what keeps that safe — every elapsed conversion pivots through one unit, so
+there is exactly one place a factor can be wrong. `Period` sidesteps the question by having no
+factor at all.
+
+`week` is a `Duration` (`7 * day`), not a `Period`. On an unzoned `Timestamp` the two would be
+indistinguishable — the calendar reading of "a day" only diverges from 86 400 000 ms once a
+zone is in play, where "same wall-clock time tomorrow" crosses a DST boundary. `Period`
+spellings of `day` and `week` are therefore **reserved rather than bound**: binding them now
+would put one name on two types with no behavioural difference to justify it. They arrive with
+zoned timestamps or not at all.
+
+### Grains Align, They Do Not Merely Coarsen
+
+A `Grain` truncates the time axis and labels the result. Every grain declares the grain it
+**aligns into** — the one whose buckets its own buckets tile exactly — and that forms a forest
+rather than a total order:
+
+```
+Minute → Hour → Day → Month → Quarter → Year
+                Day → IsoWeek → IsoYear
+```
+
+Two roots, because ISO weeks tile ISO years exactly by construction and tile nothing on the
+calendar side. `IsoWeek → Month` looks like coarsening and is not: the week of January 29
+straddles two months, so merging week buckets into month buckets would put a bucket in a
+month it is only partly inside. Following alignment edges makes that unrepresentable instead
+of a rounding error nobody notices.
+
+This is also what a millisecond comparison could never decide. `IsoWeek` is coarser than `Day`
+and finer than `Month` while dividing neither evenly, so its position is *declared*, not
+computed. See [aggregates.md](aggregates.md#grain-order) for the retention consequence.
+
+**An `IsoWeek` bucket is labelled by ISO year, not calendar year.** December 29–31 can fall in
+week 1 of the following ISO year, and January 1–3 in week 52 or 53 of the previous one, so a
+calendar-year label would collide two different weeks. `bucket_start` is the Monday;
+`isoWeekOf :: Timestamp -> (Int, Int)` returns the pair for anyone who wants the number
+directly.
 
 ### Restrictions
 

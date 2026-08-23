@@ -140,6 +140,19 @@ special node in the transaction graph so the history of which data lived in whic
 always recoverable. The replication mechanics of a split are in
 [distribution.md](distribution.md).
 
+The table above is about *replication*, and two shards sit outside it because they hold
+authority rather than a class of rows. Both are ordinary shards with an ordinary root row:
+
+| Shard | Rooted at | Holds |
+|---|---|---|
+| **Schema shard** | a branch row, one shard per branch | schema nodes and the branch's `Reference` rows |
+| **Constraint shard** | a table-wide `unique`'s schema-node row | that constraint's cluster-wide value index and its `next` counter |
+
+The schema shard is where the "schema is data" principle stops being a slogan: schema commits
+are serialized by a branch's primary the same way row writes are serialized by a data shard's
+primary, and a branch is therefore the unit of schema authority. See
+[distribution.md](distribution.md#schema-shards-are-rooted-at-a-branch).
+
 ### Shard Roots
 
 A shard is rooted at a **row**, not at a table. `DataId 'Shard` is defined above as the
@@ -168,8 +181,13 @@ The asymmetry that follows is worth stating, because it inverts the obvious expe
 | Cost | None extra — this index *is* the shard directory (`username → DataId → shard`), which is the lookup that routes a request to the right server | None — the shard primary linearizes its own writes |
 
 So the one key that must be globally unique is also the one the system already needs a global
-index for. Every other uniqueness check is local, and no candidate key requires the
-cross-shard lock that a distributed transaction would (see OQ-027).
+index for. Every other uniqueness check is local, and no candidate key requires the second
+participant that a cross-shard transaction would (see OQ-027 — the coordination is a prepared
+node plus a commit node, not a lock).
+
+A **table-wide `unique`** is the exception and is not a candidate key: its scope is the cluster
+and its value index lives in a shard of its own, rooted at the constraint's schema-node row.
+See [distribution.md](distribution.md#constraint-shards).
 
 `Component` is the degenerate case of the same rule: the parent supplies placement and the
 `Ordinal` supplies uniqueness within it, which is why component tables need no declared key at
@@ -226,13 +244,13 @@ This is the general rule, and the key is where it earns out.
 registered server, carrying the 2-byte node id assigned at registration (see
 [Globally Unique Identifiers](#globally-unique-identifiers)).
 
-`period_start` *is* declared, and the asymmetry is the point: `period` is a `Configuration`
-value that may be retuned, and routing is decided when a row is written and never revised. A
-truncation under a mutable policy has to be pinned at write time or an operator changing
-`period` would retroactively re-route sealed segments. Bytes 6–7 cannot be retuned, so
-`origin_server` needs no pinning.
+`period_start` *is* declared, and the asymmetry is the point: `segment_grain` is a
+`Configuration` value that may be retuned, and routing is decided when a row is written and
+never revised. A truncation under a mutable policy has to be pinned at write time or an
+operator changing `segment_grain` would retroactively re-route sealed segments. Bytes 6–7
+cannot be retuned, so `origin_server` needs no pinning.
 
-One row per (server, period, retention branch); each roots the shard holding that segment's
+One row per (server, bucket, retention branch); each roots the shard holding that segment's
 log rows. `LogData` exempts a table from *needing* a key and does not forbid one — the same
 point that lets a rollup level declare one
 ([schema/aggregates.md](schema/aggregates.md#what-gets-generated)). The root row lives in the
@@ -245,7 +263,7 @@ Four properties earn the shape:
   with no identity beyond its occurrence; a segment is an entity and has one. The
   root-key-is-the-shard-directory invariant above is restored without weakening the exemption.
 - **Routing costs zero stored bytes.** A log row's server is bytes 6–7 of its own `DataId` and
-  its period is bytes 0–5 truncated — so a row's segment is computed from the identifier it
+  its bucket is bytes 0–5 truncated — so a row's segment is computed from the identifier it
   already carries, with no lookup and no stored parent reference. `origin_server` is a foreign
   key to a `Configuration` table, which does not participate in placement rooting
   ([schema/tables.md](schema/tables.md#keys-must-be-rooted)), so `LogSegment` is a root rather
@@ -257,9 +275,9 @@ Four properties earn the shape:
 - **Retention aligns to segments.** A closed segment is a whole retention unit, which turns
   pruning into an unlink rather than a row scan (below).
 
-`period` is a `Configuration` value, not syntax — day by default. It has to be tunable,
-because a retention chain whose raw step is shorter than the period would not align, and
-because a low-volume server should not accumulate a million near-empty segments.
+`segment_grain` is a `Configuration` value, not syntax — `Day` by default. It has to be
+tunable, because a retention chain whose raw step is shorter than the segment grain would not
+align, and because a low-volume server should not accumulate a million near-empty segments.
 
 `branch` is the index of the matching `retain` branch, or `0` where the table has no `retain`
 statement or an unbranched one. It belongs in the key because branch predicates may reference
@@ -268,7 +286,7 @@ only group fields and the time source
 row is written. Without it a segment could hold rows with two different expiries and would not
 be prunable as a unit.
 
-The current segment accepts writes; when its period closes it is **sealed** and a new one
+The current segment accepts writes; when its bucket closes it is **sealed** and a new one
 starts. Sealing moves no data, which is why it can be automatic where a `UserData` split
 cannot ([distribution.md](distribution.md#shard-splits)).
 
@@ -300,14 +318,14 @@ Sizing is a `Configuration` row, not syntax and not a trait parameter
 table system.shards.ExtentPolicy : Configuration {
   table_path  : Text unique,        -- default for every server
   extent_size : Int,                -- unit is OQ-035
-  period      : Duration = day      -- LogData segment period; ignored otherwise
+  segment_grain : Grain = Day       -- LogData segment grain; ignored otherwise
 }
 
 table system.shards.ExtentOverride : Configuration {
   table_path  : Text,
   server     :> system.shards.Node,
   extent_size : Int,
-  period      : Duration,
+  segment_grain : Grain,
   unique overrideRef { table_path, server }
 }
 ```
@@ -317,6 +335,13 @@ because a `Null`-derived variant in a key is rejected
 ([schema/tables.md](schema/tables.md#ineligible-key-fields)). Resolution is
 most-specific-first. `table_path` rather than `table`, which is a reserved word — the same
 reason `system.integrity.Violation` spells it `subject_table`.
+
+`segment_grain` is a `Grain` rather than a `Duration`, so a segment may seal on a calendar
+boundary — `Month` closes at month ends of unequal length, which a millisecond interval cannot
+express. It also makes OQ-035's requirement that the segment grain divide the retention grains
+in use a check over declared alignment edges
+([schema/aggregates.md](schema/aggregates.md#grain-order)) rather than an arithmetic one.
+Sealing still moves no data, so it stays automatic.
 
 ### Splitting a Shard With One Root Row
 
@@ -362,7 +387,7 @@ pruned that no longer holds.
 Because a `LogData` shard is rooted at a segment whose key carries the retention branch, an
 expiring step usually covers a **whole sealed segment**. Pruning it is then an unlink of that
 segment's extents plus one prune node, rather than a row scan. Row-level pruning remains the
-fallback for a segment written before a branch was added or the period changed: routing is
+fallback for a segment written before a branch was added or the segment grain changed: routing is
 decided when a row is written and is never revised, which is the same forward-only rule that
 governs every other retention edit.
 

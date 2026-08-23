@@ -7,7 +7,7 @@ than restating it.
 
 | Document | Covers |
 |---|---|
-| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, absence types, `is`, `Secret`, `Hashed` |
+| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret`, `Hashed` |
 | [tables.md](tables.md) | Table bodies, field declarations, defaults, candidate keys, ordering, foreign keys, sub-tables |
 | [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
 | [constraints.md](constraints.md) | `assert`, path constraints, presence and absence, access control |
