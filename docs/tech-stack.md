@@ -121,10 +121,51 @@ Full detail in [storage.md](storage.md).
 
 ## Dynamic Loading
 
-**Decided (OQ-001).** GADT DSL as the primary functor mechanism, with `Data.Dynamic` as the
-type registry substrate. Zero runtime GHC dependency. See
-[dynamic-loading.md](dynamic-loading.md) for the decision, the spike results, and the full
-list of options considered.
+**Decided (OQ-001).** Two mechanisms for two questions.
+
+Functors are terms in an **effect-indexed GADT DSL**, interpreted, with `Data.Dynamic` as
+the type registry substrate. Zero runtime GHC dependency; 0.07–0.8 µs per application,
+against an 11 µs LMDB read. Compiled-in Haskell — handlers, primitive types, the
+interpreter itself — changes by **generation swap behind a stable router**. A schema
+change touches only the first and needs no swap at all.
+
+Confirmed in `spikes/functor-dsl/output.txt`, which supersedes
+`spikes/dynamic-loading/output.txt` for every DSL claim. See
+[dynamic-loading.md](dynamic-loading.md) for the process topology, build-then-merge, the
+remaining ceilings, and the full list of options considered.
+
+`Text.Regex.TDFA` is the settled engine for `=~` but is **unvalidated** — it cannot be
+installed in the development sandbox, so the spike uses a stand-in matcher and validates
+the primitive's provenance restriction and compiled-pattern cache instead.
+
+## Process Topology
+
+**Decided (OQ-001).** Four processes per host. The governor is per host and holds no data
+authority; cluster role assignment stays with the range tree (OQ-007).
+
+| Process | Restarts when |
+|---|---|
+| Router — route trie, generation table, version-token resolution | never, for a schema or handler change |
+| Data workers — serve every live ref, functors interpreted | a new build lands |
+| Handler workers — `Effect` only, HEAD only, separate pool | a new build lands |
+| Governor — registers generations, sequences swaps, recycles on interval | host maintenance |
+
+The handler pool is separate because the data plane serves N refs and a queue is processed
+at exactly one, so the two have different versioning requirements. It also puts the
+`Effect` boundary on a process boundary, which lets a `Configuration` capability grant be
+enforced by the OS rather than by convention.
+
+**Write authority handover needs no new mechanism**: LMDB's writer lock is cross-process
+and OS-enforced, so the incoming generation blocks on it while the outgoing one finishes
+its in-flight transaction. Reads never stall — LMDB is MVCC and multi-process. Recycling
+on a `Configuration` interval is deliberate, to keep the swap path exercised.
+
+Adding GHC to every node is accepted and has two costs worth recording: a node becomes a
+provisioned host rather than a dropped binary, and the GHC version joins the compatibility
+surface, so a generation artifact is valid only for its
+`(schema node, DataCode version, GHC version, arch)` tuple. Content-addressing the
+generation registry on that tuple makes cross-host artifact sharing a later cache lookup
+rather than a redesign.
 
 ## Concurrency
 
@@ -161,7 +202,11 @@ LMDB system library.
 
 The stack decisions above are settled. Still open:
 
-- **Connector daemon architecture** (OQ-019) — separate supervised process vs. thread pool in the main server
-- **Multi-daemon supervision** — the schema daemon must restart when compiled-in types change (see [dynamic-loading.md](dynamic-loading.md)); the supervisor design is not specified
 - **Graph layout library for the IDE** (OQ-021) — ELK.js client-side vs. `graphviz` server-side
-- **`hint` as an escape hatch** — failed to compile in the spike; revisit if user-defined functors outgrow the GADT DSL
+- **Generation swap and build latency** — the mechanism is settled; the numbers are not. What is the write stall at writer-lock handover under load, what drain deadline avoids LMDB free-list growth from a long-lived reader, and what does a realistic handler build actually cost against the accepted 30 s budget?
+
+Closed since the last revision:
+
+- **Connector daemon architecture** (OQ-019) — there is no connector daemon. Connector polling is a scheduled event, so it is `every` on the connector's own table and runs under the one scheduler
+- **Multi-daemon supervision** — replaced by the generation pool above. Schema changes need no restart, so the supervisor's job is registering artifacts and sequencing swaps rather than draining the schema daemon
+- **`hint` as an escape hatch** — abandoned rather than deferred. The requirement was arbitrary Haskell for integrations; handlers get it from a compiled pool with no in-process GHC

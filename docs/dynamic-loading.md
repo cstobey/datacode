@@ -2,200 +2,291 @@
 
 ## The Problem
 
-DataCode must be able to absorb schema changes at runtime — new tables, new types, new
-functors — and immediately behave as if those changes were compiled into the system. This is
-the single hardest technical challenge in the project.
+DataCode must absorb schema changes at runtime — new tables, new types, new functors —
+and immediately behave as if those changes were compiled in. This is the single hardest
+technical challenge in the project.
 
-The tension: Haskell's type safety comes from compile-time type checking. Runtime dynamic
-loading inherently escapes the type system. The goal is to recover as much safety as
-possible while retaining dynamism.
+The tension: Haskell's type safety comes from compile-time type checking, and runtime
+dynamic loading inherently escapes the type system. The goal is to recover as much
+safety as possible while retaining dynamism.
 
 ## Decision
 
-**OQ-001 is answered: GADT DSL + `Data.Dynamic` hybrid.** Validated in
-`spikes/dynamic-loading/output.txt`.
+**OQ-001 is answered in two halves, because there are two questions.**
 
-| Layer | Mechanism | Role |
-|---|---|---|
-| Functor representation | **GADT DSL** | Primary mechanism. Every functor is a value in a strongly-typed embedded DSL, interpreted by statically-typed Haskell |
-| Type registry | **`Data.Dynamic`** | The registered type library the DSL references by name. `TypeRep`-based type checking is O(1) |
-| Operational restarts | **Multi-daemon** | Needed only when compiled-in types must change; schema daemon restarts are coordinated by a supervisor |
+| Question | Answer |
+|---|---|
+| How is a functor represented, and how does a new business rule take effect with no restart? | **Effect-indexed GADT DSL** + `Data.Dynamic` type registry. Validated in `spikes/functor-dsl/output.txt` |
+| How does *compiled-in* Haskell change without downtime? | **Generation pool behind a stable router**, governed per host. See [Process Topology](#process-topology) |
 
-**Zero runtime GHC dependency.** ~0µs functor apply latency.
+The two are not competing. The first is the semantics of a schema change; the second is
+the deployment mechanism for the three things that genuinely need compiled Haskell —
+handlers, primitive types, and the interpreter itself. **A schema change never touches
+the second**, which is what makes zero-downtime schema evolution structural rather than
+carefully engineered.
 
-**The DSL should be indexed by effect.** Every term is `Read` or `Tx` — a validation, an assert,
-and a template hole are `Read`; a field default is `Tx` — and **nothing in the DSL is `Effect`**,
-because effectful code is compiled-in Haskell that lives outside it. That is the shape "no
-arbitrary IO" now takes: not a rejected signature, but an absent lift. See
+### Why functors are interpreted and not compiled
+
+Generating Haskell per schema version and compiling it was considered seriously and
+rejected on three counts. The performance argument for compiling is empty: the spike
+measures interpretation at 0.07–0.8 µs per functor application against an 11 µs LMDB
+read (`spikes/storage/output.txt`), so functor evaluation is one to two orders of
+magnitude below the storage floor and is dominated by lookups the engine performs
+anyway.
+
+- **Transparency.** Four consumers need the functor's *structure*, not its behaviour:
+  the query optimizer, static access analysis, `evolution.md`'s coercion-path
+  derivation, and the IDE's ER diagram. Compiled code answers none of these questions.
+  `spikes/functor-dsl` implements the analyses as pure walks over the term to show what
+  is being bought — assert-variety classification, the `bypass access` exemption set,
+  anchoring, shard-crossing detection, revalidation sets, filter placement,
+  call-graph acyclicity, and the `every`-was-unnecessary classifier.
+- **Replay.** `enforce forward` compares against the predicate *as it was*, and
+  re-deriving a `Derived` violation needs the predicate as of the violation. A DSL term
+  is a content-addressed node in the graph; a retired binary is not, so compiling would
+  mean retaining every historical binary.
+- **The commit path.** Compilation is an external call, so by the effect ladder it
+  cannot happen inside a commit. A schema change would become commit-then-build, and
+  the REPL's `:commit` (`cli.md`) would be followed by waiting on GHC.
+
+**What compiling would *not* have cost, contrary to a first reading.** The schema graph
+is one DAG and all branches are simultaneously present in it, so a compiled artifact
+would hold the schema at every live named ref — one binary whose size is
+O(named refs × schema), not one binary per version. And historical `at` reads need only
+the historical row *shape*, which is graph data, plus **current** access rules (see
+OQ-027), so arbitrary-moment sampling would have cost the compiled path nothing. The
+three reasons above stand on their own; this one does not.
+
+### The DSL is indexed by effect
+
+Every term is `Pure`, `Read`, or `Tx` — a validation, an assert, a behavior, a template
+hole, and an `every` interval are `Read`; a field default and a sequence allocation are
+`Tx` — and **nothing in the DSL is `Effect`**, because effectful code is compiled-in
+Haskell living outside it.
+
+That is the shape "no arbitrary IO" now takes: not a rejected signature, but an absent
+constructor. The spike makes it literal — `data Eff = Pure | Read | Tx` has no `Effect`
+rung, so `Term '[] 'Effect Int` fails with *"Not in scope: data constructor Effect"*,
+and there is no `Sub 'Tx 'Read` instance, so `Lift` has no downward direction. See
 [schema/functions.md](schema/functions.md#the-effect-ladder).
 
-This is the *Typed DSL* approach (Option A in the addendum) taken as the foundation, with
-the multi-daemon architecture (Option C) covering the cases the DSL cannot absorb. The
-runtime-Haskell escape hatch (Option E) is deferred, not adopted — see below.
+### What the DSL encodes
 
-### What the DSL must encode
+All four functor kinds (see [schema/functors.md](schema/functors.md)), each now
+exercised rather than asserted:
 
-All four functor kinds (see [schema/functors.md](schema/functors.md)):
-
-| Kind | Spike status |
+| Kind | Status |
 |---|---|
-| Validation | ✓ Validated |
-| Foreign key | ✓ Validated |
-| Path constraint — data | ✓ Validated, for the equality shape only |
-| Path constraint — access | ✓ Validated, for the equality shape only (same DSL construct; differs only in whether a term is the token) |
-| Event | ✗ **Not validated.** Requires a DSL extension producing an `EventRef` — a queue-table row insert — rather than `Either Error a`. Surface syntax is now settled (OQ-030) and has **two** trigger forms: `on`, and `every` with a per-row `Read` interval expression |
+| Validation | ✓ Validated, including `=~` with all three admissible right operands |
+| Foreign key | ✓ Validated, including the head rule for a `Null`-derived alternative |
+| Path constraint — data | ✓ Validated in all three shapes: expression, presence, absence |
+| Path constraint — access | ✓ Validated; the variety is read off the body, and the `bypass access` set is computed |
+| Event | ✓ Validated, **both** trigger forms, producing an `EventRef` rather than `Either Error a` |
 
-Collapsing data constraints and access control into a single path-constraint functor means
-the DSL needs one construct where it previously appeared to need two.
-
-**The spike validated equality, and the kind has since widened.** A path constraint's body may
-now be a query rooted at `self`, asserted non-empty, or the negation of one (OQ-005), and the
-spike encoded neither. Both are anchored traversals over declared `:>` edges rather than
-arbitrary queries, so the construct they need is a bounded walk with a non-emptiness test —
-plausibly reachable, but unvalidated. Add it to the list below until a spike says otherwise.
+Also encoded and exercised: typed absence and outer-join guards; the
+`Duration`/`Period`/`Grain` split with units as values and both calendar additions;
+behaviors as `Moment -> a`, sampled in past and future; function-typed columns with a
+static signature and an acyclicity check; template holes where cardinality is the
+control flow; `let … in`, `is`/`is not`, the virtual columns, `next`, and `Component`
+construction.
 
 ### Known ceilings
 
-The DSL is a ceiling by construction. Four limits are already identified:
+Three remain, and the list is shorter than it was:
 
-- **Regex** requires a DSL extension (or a registered primitive). This one is no longer
-  hypothetical: `=~` is a `CmpOp` and may appear in any constraint body
-  ([schema/railroad.md](schema/railroad.md#functions-and-expressions)), so the primitive is
-  needed rather than merely anticipated. Its right operand is restricted to a literal, a
-  `Reference` path, or a `Configuration` path, which is what keeps the pattern a constant the
-  DSL can hold rather than an arbitrary expression it would have to evaluate.
-- **Anchored subquery with a non-emptiness test** — the presence and absence shapes above
-- **Recursive types** require a DSL extension
-- **User-defined functions** require new DSL constructors — they cannot be arbitrary Haskell.
-  **This ceiling has since split in two, and only half of it still binds.** *Handlers* escape it
-  on their merits: a handler runs in `Effect`, outside the commit, and needs none of
-  transparency, static access analysis, or replayability, so it is compiled-in Haskell
-  registered in `system.events.Handler` rather than a DSL term. *Functors* do not escape it —
-  they are `Read` or `Tx` DSL terms, and a new business rule must need no restart. The cost
-  moved rather than vanishing: adding an **integration** now sits on the multi-daemon restart
-  path, which makes restart latency a number this design owes rather than an unrun spike. See
-  [events.md](events.md#handlers).
-- **An interval expression per row per tick.** `every`'s interval is any `Read` expression of
-  type `Duration`, evaluated per row on every tick, so the event extension is not just a
-  constant-carrying `EventRef` producer.
-- **A stored DSL term as a typed column value.** A function-typed column is a `FunctorRef` whose
-  signature the type checker knows ([schema/functions.md](schema/functions.md#functions-as-column-values)).
-  Mostly a typing change over what `FunctorRef` already does, but it makes acyclicity over the
-  function call graph a schema-commit obligation, and it puts template holes in the same
-  encoding as assert bodies.
+- **Recursive types** require a DSL extension. Unchanged.
+- **A closed-form crossing solver** for behavior-triggered conditions (OQ-034). The
+  *classifier* that decides whether the solver could have closed a condition is
+  implemented in the spike, because the `every`-was-unnecessary warning needs it; the
+  solver is not.
+- **Mergeable sketch types** (t-digest, HyperLogLog) for `percentile` in a multi-step
+  retention chain (OQ-034).
 
-Hitting any of these is the trigger to revisit the addendum below.
+Three former ceilings are closed. **Regex** is a primitive, with provenance carried in
+the effect index — a `StringLit` or `Reference` pattern is `Pure` and interned at schema
+commit, a `Configuration` pattern is `Read` and cached on the config row version, and
+nothing had to state that difference because the index derives it. **Anchored subqueries
+with a non-emptiness test** are the `Exists`/`Not Exists` pair over a query whose only
+root constructor is `self`. **User-defined functions** split in two: handlers escaped
+the ceiling on their merits (below), and functors are terms in a context of their
+parameters — no Haskell closure, so a function stays inspectable.
 
-### `hint` status
+## Process Topology
 
-`hint` (Option B) **failed to compile in the spike** — GHC not on PATH, or a version
-mismatch. It is not ruled out on the merits; it was not evaluated. Revisit it as an escape
-hatch for advanced user-defined functors if and when the GADT DSL's ceiling is actually hit.
-Any adoption must compile asynchronously and sandbox the result.
+Four processes per host. The **governor** is per host and holds no data authority:
+cluster role assignment stays with the range tree (`distribution.md`).
+
+| Process | Count | Restarts when |
+|---|---|---|
+| **Router** | one | never, for a schema or handler change |
+| **Data workers** | several, generation-tagged | a new build lands |
+| **Handler workers** | several, generation-tagged, separate pool | a new build lands |
+| **Governor** | one | host maintenance |
+
+The router holds the route trie (OQ-029) and the generation table, and resolves version
+tokens (OQ-026). Data workers serve every live ref, with functors interpreted, so a
+schema commit repoints the router and needs no swap at all.
+
+### Handler workers are a separate pool
+
+The decisive asymmetry: **the data plane serves N refs; the handler pool serves exactly
+one.** There is no such thing as processing an event queue "at a branch" — a queue is
+processed at HEAD. Different versioning requirements, therefore a separate and
+independently shippable artifact. Three further reasons:
+
+- Handlers are the only place arbitrary Haskell runs, so the only place a crash, leak,
+  or hang originates in operator code. Isolation keeps a bad handler off the data plane.
+- It makes the `Effect` boundary a **process** boundary and not only a type boundary.
+  The missing lift is the load-bearing invariant in the design; having the OS enforce it
+  too is cheap defense in depth.
+- `Effect`'s capabilities come from a `Configuration` row — reachable hosts,
+  credentials, timeouts. A separate process lets that be enforced at the OS level
+  (network namespace, distinct service account) rather than by convention.
+
+### Generation swap
+
+The router opens generation *N+1*, stops routing new work to *N*, drains *N* to a
+bounded deadline, and kills it. Recycling on a `Configuration` interval with a
+per-server override is deliberate: it keeps the swap path exercised so it is never cold
+at deploy time.
+
+**Write authority handover needs no new mechanism.** LMDB's writer lock is
+cross-process and enforced by the OS, so the incoming generation opens the environment
+and blocks on the lock while the outgoing one finishes its in-flight transaction and
+releases. The stall is one batched transaction. Reads never stall — LMDB is MVCC and
+multi-process, so readers never block writers.
+
+Two obligations the drain deadline exists for. A long-lived LMDB read transaction pins
+the free list and grows the file, so a draining worker must be killed rather than waited
+on indefinitely. And a worker killed mid-prepare leaves an unresolved prepared node,
+which a rolling swap makes routine rather than exceptional — recoverable, since a
+prepared node is invisible to validation and excludes nothing (OQ-006), but the
+recovery path is now on the common path and must be treated as such.
+
+### Build-then-merge
+
+Adding a handler *is* a schema commit: `system.events.Handler` is a `Reference` table,
+so `handler foo.bar` compile-checks against the compiled-in registry. That commit
+cannot complete before the build exists, and the graph already has the shape for it.
+
+1. The schema commit appends the node. Durable, replicated, recorded.
+2. The build is a queued `Effect` — observable and retryable like any other queue row.
+3. On success the merge node lands and the ref advances.
+4. On failure the node stays **unmerged and inert**, and the failure is a queue row
+   carrying the compiler output.
+
+"Live" is defined by ref position, and refs are data, so there is never a window in
+which the graph and the enforced schema disagree. A failed build needs no rollback in a
+system where nothing is destroyed — it is the same invisibility that makes an unmerged
+schema branch and a prepared node inert (OQ-027).
+
+**DataCode does not build a build farm.** A generation is an artifact; registering one
+is a queue row. Whether the artifact was produced on that host or elsewhere is an
+operational choice, and content-addressing the generation registry on
+`(schema node, DataCode version, GHC version, arch)` makes cross-host sharing a cache
+lookup later rather than a redesign. Running GHC on a data node has a real cost worth
+recording: it is memory-hungry and will evict the page cache that the zero-copy read
+path depends on.
 
 ## Constraints on Dynamic Code
 
-Regardless of the mechanism, dynamically loaded code must obey:
-
-- **No arbitrary IO** — functors are `Read` or `Tx`. Enforced by a missing lift rather than a signature check: `commit :: Tx a -> Effect a` exists and nothing takes an `Effect a` to a `Tx a`, so a functor cannot reach an external call even through `traverse` or a type alias (see [schema/functions.md](schema/functions.md#the-effect-ladder)). External side effects go through the event queue, whose handlers run in `Effect` and are compiled-in rather than DSL terms (see [events.md](events.md#handlers))
+- **No arbitrary IO** — functors are `Read` or `Tx`, enforced by an absent constructor
+  rather than a signature check. A signature check does not close `traverse` over an
+  effectful function inside a validation, or one hidden behind a type alias; an
+  unconstructible type does. External side effects go through the event queue, whose
+  handlers run in `Effect` (see [events.md](events.md#handlers))
 - **No FFI** — prevents sandbox escape
-- **Transparent** — all behavior must be inspectable by the runtime for optimization and access control analysis
-- **Versioned** — every loaded code unit references a schema graph node; the runtime knows which version of each functor is active
+- **Transparent** — all behavior must be inspectable by the runtime for optimization and
+  access-control analysis. This is the invariant that decides functors are interpreted
+- **Versioned** — every loaded code unit references a schema graph node
 
 ## Feasibility Studies
 
 | Spike | Status |
 |---|---|
-| GADT DSL for all functor kinds | ✓ Done — every kind validated except the event functor |
+| Effect-indexed GADT DSL, all four kinds, full current syntax | ✓ Done — `spikes/functor-dsl/output.txt` |
+| Structural analyses over DSL terms | ✓ Done — same spike, section 8 |
 | `Data.Dynamic` type registry | ✓ Done — O(1) `TypeRep` checking confirmed |
-| `hint` for user-defined functors | ✗ Did not run — failed to compile (GHC not on PATH / version mismatch) |
-| Servant + dynamic dispatch | ✓ Done — OQ-002 answered; see [tech-stack.md](tech-stack.md) |
-| GHC dynamic linking | ⬚ Not run — only needed if the DSL ceiling is hit |
-| Multi-daemon restart latency | ⬚ Not run — what is the minimum downtime for a schema daemon restart with in-flight query draining? Is sub-100ms achievable? |
+| `Text.Regex.TDFA` as the `=~` engine | ⬚ **Not run** — cannot be installed in this sandbox. The primitive's shape, provenance restriction, and cache are validated; the engine is not |
+| Servant + dynamic dispatch | ✓ Done — OQ-002; see [tech-stack.md](tech-stack.md) |
+| Generation swap latency | ⬚ **Not run** — what is the write stall at LMDB writer-lock handover under load, and what drain deadline avoids free-list growth? |
+| Build latency for a handler generation | ⬚ **Not run** — 30 s is the accepted budget; measure against a realistic handler set |
+| Closed-form crossing solver | ⬚ Not run — OQ-034 |
+| `hint` for runtime Haskell | ✗ **Abandoned.** Superseded rather than deferred: the case that wanted arbitrary Haskell is handlers, and handlers get it from the generation pool without a runtime GHC dependency or a sandbox problem |
 
 ---
 
 # Addendum: Options Considered
 
-Retained in full. The chosen approach is A as the foundation plus C for operational
-reliability; B, D, and E remain live if the GADT DSL's ceilings (regex, recursive types,
-user-defined functions) turn out to bind in practice.
+The chosen approach is A for functors plus C for compiled-in Haskell. B and E are
+**abandoned**, not deferred — the generation pool covers what they existed to cover.
+D was reconsidered at length and rejected on transparency, replay, and the commit path.
 
-## Option A: Custom DSL with Typed Interpreter — **CHOSEN (foundation)**
+## Option A: Custom DSL with Typed Interpreter — **CHOSEN (functors)**
 
 **Model**: project-m36, DDlog, Datalog engines
 
-Define a strongly-typed DataCode schema DSL that is interpreted at runtime. The interpreter
-is statically typed Haskell; only the schema expression language is dynamic.
+A strongly-typed DataCode schema DSL interpreted at runtime. The interpreter is
+statically typed Haskell; only the schema expression language is dynamic.
 
-- **Pro**: Type-safe interpreter; no GHC dependency at runtime; well-understood pattern
-- **Pro**: Can embed the DSL as a proper GADT — type safety propagates into schema expressions
-- **Con**: The DSL is a ceiling — any capability not in the DSL requires a runtime update
-- **Con**: User-defined functions (custom validation functors) cannot be arbitrary Haskell; they must be DSL expressions
-- **Verdict**: Adopted. Sufficient for all built-in functor kinds. Insufficient alone for arbitrary user-defined functors, which is an accepted limitation for now
+- **Pro**: type-safe interpreter; no GHC dependency at runtime; well-understood pattern
+- **Pro**: a proper GADT propagates type safety into schema expressions — and, indexed
+  by effect, makes the effect ladder a typing property
+- **Pro**: transparent, which four separate consumers require
+- **Pro**: a term is a graph node, so every live ref and every historical predicate is
+  simultaneously available at no cost
+- **Con**: the DSL is a ceiling — three limits remain, listed above
+- **Verdict**: Adopted, and validated over the full current syntax rather than a subset
 
-## Option B: `hint` / GHC API (Runtime Haskell Evaluation) — deferred
+## Option B: `hint` / GHC API (Runtime Haskell Evaluation) — abandoned
 
-**Model**: GHCi, some plugin systems
+- **Con**: constrained to `IO`; requires GHC in-process on every server; arbitrary code
+  execution needs a sandbox; compilation latency on the schema-change path
+- **Spike result**: failed to compile in `spikes/dynamic-loading` — GHC not on PATH or a
+  version mismatch. Never evaluated on the merits
+- **Verdict**: Abandoned. The demand was arbitrary Haskell for integrations, and
+  handlers now get that from a separate compiled pool — no in-process GHC, and no
+  sandbox problem, because the code is built ahead of time rather than evaluated
 
-Use the `hint` library (or GHC API directly) to compile and evaluate Haskell expressions at
-runtime.
-
-- **Pro**: Full Haskell expressiveness for user-defined types and functors
-- **Pro**: project-m36 has explored this path — prior art exists
-- **Con**: `hint` is constrained to `IO`; extracting pure values requires careful design
-- **Con**: Requires GHC to be present on every DataCode server (runtime dependency)
-- **Con**: Security surface — arbitrary code execution is a serious concern; must sandbox
-- **Con**: Compilation latency on schema changes (seconds, not milliseconds)
-- **Con**: Type checking is still compile-time within each evaluated snippet — inter-snippet type checking is lost
-- **Spike result**: Failed to compile — GHC not on PATH or version mismatch. Not evaluated on the merits
-- **Verdict**: Deferred. The escape hatch of last resort if the DSL ceiling binds
-
-## Option C: Multi-Daemon Architecture — **CHOSEN (operational layer)**
+## Option C: Multi-Daemon Architecture — **CHOSEN (compiled-in Haskell)**
 
 **Model**: Erlang hot-code-loading; microkernel architecture
 
-Separate the runtime into multiple daemons:
+Adopted and substantially revised. The earlier form was "the schema daemon restarts on
+schema changes, in-flight queries drain", which conceded "must design for zero-downtime
+restarts" and left the supervisor unspecified. Both are now closed:
 
-- **Schema daemon**: manages the schema graph and query optimizer; reboots on schema changes
-- **Data daemon(s)**: manage actual data storage and query execution; do not need to reboot on schema changes
-- **Query broker**: routes queries to the appropriate daemon; remains stable
+- Schema changes need **no restart at all**, because the GADT DSL absorbs them
+- Compiled-in changes go through generation swap behind a stable router, with the LMDB
+  writer lock as the handover primitive and per-host governance
 
-Schema changes trigger a graceful restart of the schema daemon only. In-flight queries drain
-before the restart.
+See [Process Topology](#process-topology).
 
-- **Pro**: Each daemon is statically compiled; full Haskell type safety within each
-- **Pro**: Bounded restart scope — only the schema daemon restarts
-- **Pro**: Well-understood operational model
-- **Con**: Schema daemon restart is still a brief interruption; must design for zero-downtime restarts
-- **Con**: Inter-daemon communication requires a stable wire protocol that can carry dynamic types
-- **Con**: Complexity of coordinating multiple daemons
-- **Verdict**: Adopted, but narrowed. Because the GADT DSL absorbs ordinary schema changes with no restart, the multi-daemon path is needed only when *compiled-in types* change. Supervisor design is still open
+## Option D: GHC Plugins / Dynamic Linking — reconsidered, not pursued
 
-## Option D: GHC Plugins / Dynamic Linking — not pursued
+Compile schema modules as shared libraries and load them via GHC's dynamic linker; or,
+in the form reconsidered here, generate Haskell per schema version and swap whole worker
+processes.
 
-Compile schema modules as shared libraries (`.so` / `.dylib`) and load them via GHC's
-dynamic linker.
+- **Pro**: removes the DSL ceiling entirely; real compiled performance
+- **Pro**: one binary covers all live refs, so the concurrency cost is smaller than it
+  first appears
+- **Con**: destroys transparency, which four consumers require
+- **Con**: replay needs retired predicates, so every historical binary must be retained
+- **Con**: puts GHC on the commit path, making a schema change commit-then-build
+- **Con**: no performance case — interpretation is far below the storage floor
+- **Verdict**: Not pursued for functors. The generation-pool half of the idea *was*
+  adopted, for compiled-in Haskell, where it is the right answer
 
-- **Pro**: Full Haskell type safety within each module; real compiled performance
-- **Pro**: No GHC needed at runtime — just a linker
-- **Con**: Requires a build system on the schema change path (compilation step before loading)
-- **Con**: Dynamic linking in GHC has historically been fragile; symbol conflicts, ABI issues
-- **Con**: Still need a compiled GHC toolchain for schema changes
-- **Verdict**: Not pursued. The GADT DSL removed the need. Requires investigation if revisited; GHC's dynamic linker has improved in recent versions
+## Option E: Typed DSL + Escape Hatch — abandoned as originally framed
 
-## Option E: Typed DSL + Escape Hatch — deferred
+A typed DSL covering most cases, with a controlled escape hatch to runtime-evaluated
+Haskell for advanced user-defined functors.
 
-A hybrid: define a typed DSL (Option A) that covers 90% of use cases, with a controlled
-escape hatch to runtime-evaluated Haskell (Option B) for advanced user-defined functors.
-
-The escape hatch would:
-
-- Be sandboxed (no IO, no FFI, pure computation only — enforced by type)
-- Be compiled asynchronously (background compilation queue)
-- Fall back to the DSL interpreter until compilation completes
-- Be audited and stored in the schema transaction graph
-
-- **Verdict**: Still likely the right long-term architecture. Deferred rather than rejected —
-  Option A is in place, and the escape hatch is added incrementally if and when user-defined
-  functors demand it
+- **Verdict**: Abandoned. The escape hatch was for arbitrary user Haskell, and the
+  requirement it served — integrations — is met by compiled-in handlers. If the
+  interpreter ever becomes a measured bottleneck (it is not), the remedy is a code
+  generator from DSL terms into the next generation, HEAD only, with non-HEAD refs
+  falling back to the interpreter and observational equivalence with the interpreter as
+  the invariant under test. That is an optimization with a defined shape, not an
+  expressiveness escape hatch

@@ -72,7 +72,8 @@ cabal project whose `output.txt` holds the recorded run cited by the answered OQ
 
 | Spike | Settles | Result |
 |---|---|---|
-| `spikes/dynamic-loading` | OQ-001 | GADT DSL + `Data.Dynamic`; `hint` failed to compile |
+| `spikes/functor-dsl` | OQ-001 | Effect-indexed GADT over the full current syntax; all four kinds, both event forms, the structural analyses |
+| `spikes/dynamic-loading` | OQ-001 | Superseded for its DSL claims by `functor-dsl`. Remains the record for ruling out `hint` and for the option comparison |
 | `spikes/servant-warp` | OQ-002 | Servant static frame + `Raw` delegating to a WAI dispatch table |
 | `spikes/capnproto` | OQ-003, OQ-004 | Cap'n Proto wire format, mmap zero-copy, LMDB threading fix |
 | `spikes/storage` | OQ-004 | Append-only log + two LMDB indexes; locator sort order |

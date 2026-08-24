@@ -5,8 +5,9 @@ variety of path constraint rather than a kind of its own, see
 [../category-model.md](../category-model.md).
 
 DataCode has four functor kinds. All four are first-class schema objects — defined as rows
-in system tables, referenced by `FunctorRef`, and encoded in the GADT DSL (confirmed in
-`spikes/dynamic-loading/output.txt`).
+in system tables, referenced by `FunctorRef`, and encoded in the effect-indexed GADT DSL
+(all four confirmed in `spikes/functor-dsl/output.txt`, which supersedes the earlier
+`spikes/dynamic-loading` for every DSL claim).
 
 | # | Kind | Signature | When it runs | Purpose |
 |---|---|---|---|---|

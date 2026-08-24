@@ -587,8 +587,11 @@ settled — see OQ-034 in [open-questions.md](open-questions.md).
 
 **Solving.** The crossing moment must be derived in closed form, which is what restricts
 behaviors to an analyzable class. The class, the solver per class, and the encoding of both
-in the GADT DSL are open. This is also the one functor kind the dynamic-loading spike never
-validated (OQ-001), so nothing here rests on evidence yet.
+in the GADT DSL are open. The event functor itself is no longer the unvalidated kind it was
+— `spikes/functor-dsl` encodes both trigger forms, producing an `EventRef` rather than an
+`Either`, and implements the classifier that decides whether a sampled condition is one the
+solver *could* have closed, since the `every`-was-unnecessary warning needs it. What has no
+evidence behind it yet is the solver, not the kind.
 
 **Re-solving on write.** A behavior closes over stored fields, so writing the row changes the
 function and moves the crossing. Every pending wake-up derived from a behavior on that row

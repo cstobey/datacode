@@ -1,0 +1,55 @@
+cabal-version:      3.0
+name:               functor-dsl
+version:            0.1.0.0
+synopsis:           OQ-001 revisit: effect-indexed GADT DSL over the full DataCode syntax
+description:
+  Supersedes the DSL half of spikes/dynamic-loading. That spike's "GADT DSL" was a plain
+  untyped ADT whose type errors surfaced at eval time; this one is a real GADT indexed by
+  a typed de Bruijn context, an effect, and a result type, so a DSL term that does not
+  typecheck cannot be built at all.
+  .
+  Covers every construct the schema language has acquired since: regex with a
+  trait-restricted right operand, both event trigger forms, anchored presence/absence
+  subqueries, the Duration/Period/Grain split, behaviors, function-typed columns,
+  sequence allocation, component construction, and template holes. Also exercises the
+  structural analyses the transparency invariant promises.
+
+license:            MIT
+author:             DataCode Contributors
+build-type:         Simple
+
+common warnings
+  ghc-options: -Wall -Wno-unused-top-binds -Wno-name-shadowing
+
+executable functor-dsl-spike
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app, src
+  default-language: GHC2021
+
+  other-modules:
+    Spike.Core
+    Spike.Eval
+    Spike.Schema
+    Spike.Analysis
+
+  build-depends:
+    base       >= 4.14 && < 5,
+    containers >= 0.6  && < 0.8,
+    text       >= 1.2  && < 2.2,
+    time       >= 1.9  && < 2
+
+  default-extensions:
+    GADTs
+    DataKinds
+    KindSignatures
+    TypeFamilies
+    TypeOperators
+    RankNTypes
+    ScopedTypeVariables
+    LambdaCase
+    OverloadedStrings
+    FlexibleContexts
+    FlexibleInstances
+    UndecidableInstances
+    StandaloneKindSignatures

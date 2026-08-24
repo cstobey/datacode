@@ -1,0 +1,333 @@
+==========================================================================
+  DataCode Functor DSL Spike -- OQ-001 revisit
+==========================================================================
+Effect-indexed GADT over the full current schema syntax.
+Supersedes the DSL half of spikes/dynamic-loading (see output.txt).
+
+--- 1. What the type indices rule out -----------------------------------
+  The old spike's Expr was a plain ADT, so a type error surfaced at eval
+  time as ValidationError "... type mismatch". Two of the three wrong
+  answers in its recorded run were that leak. Each row below is a term
+  this DSL rejects at DataCode compile time; every GHC error quoted was
+  produced by compiling the term, not written by hand.
+
+  Concat (Lit TText "amount was ") (Var TAmt IZ)
+      Couldn't match Amount with Text            the old spike's actual bug
+  Cmp OrdInt CmpGt (Lit TText "x") (Lit TInt 1)
+      Expected Ty Int, actual Ty Text            no cross-type comparison
+  Eq_ EqFun (FnLit ...) (FnLit ...)
+      Data constructor not in scope: EqFun       function types have no equality
+  KValidation "t.f" TInt (... Next "orderRef" ...)
+      Couldn't match Tx with 'Read               next is not a predicate
+  Behavior (Next "orderRef")
+      Couldn't match Tx with 'Read               a behavior may not mutate
+  Lift (Next "orderRef") :: Term '[] 'Read Int
+      No instance for Sub Tx 'Read               the ladder has no downward lift
+  bad :: Term '[] 'Effect Int
+      Not in scope: data constructor Effect      no Effect rung exists at all
+  Var TAmt (IS IZ) :: Term '[Amount] 'Pure Amount
+      Expected Idx '[] Amount                    cannot name a slot the context lacks
+  Var TText IZ :: Term '[Amount] 'Pure Text
+      Expected Idx '[Amount] Text                cannot name a slot at the wrong type
+  TsAddPeriod ts (Lit TDur day)
+      Couldn't match Duration with Period        no Period/Duration conversion
+  Arith NumInt OpAdd (Lit TPer ...) (Lit TPer ...)
+      Expected NumT Period, actual NumT Int      a Period has no ms count
+
+  What typing does NOT catch, checked structurally instead (section 8):
+    an unanchored join                 QSelf is the only root, but a join along an
+                                         undeclared edge compiles -- anchorCheck rejects it
+    a filter outside a guard           shape check, not a type: filterPlacement
+    a cyclic call graph                callGraphAcyclic, at schema commit
+    a bypassed conjunct                a warning, so it must not be a type error
+
+--- 2. The four functor kinds -------------------------------------------
+  Kind 1 -- validation (a -> Either Error a, on commit)
+  Customer.email ada@example.com                 => admitted
+  Customer.email notanemail                      => REJECTED: app.commerce.Customer.email: not a valid email address
+  Address.postal_code 80301                      => admitted
+  Address.postal_code 80301-1234                 => admitted
+
+  Kind 2 -- foreign key (DataId -> Either Error Row, on commit)
+  Order.customer -> c-1                          => admitted
+  Order.customer -> c-404                        => REJECTED: app.commerce.Order.customer: no row in app.commerce.Customer
+  Order.courier -> NotDispatched (head rule)     => admitted
+
+  Kind 3 -- path constraint, data variety (Row -> Either Error ())
+  billingMatch, addresses agree                  => admitted
+  billingMatch, addresses differ                 => REJECTED: billingMatch: path constraint
+
+  Kind 3 -- path constraint, access variety (read AND write)
+  ownerAccess as the owner                       => admitted
+  ownerAccess as another user                    => REJECTED: ownerAccess: path constraint
+  (on a read the failure resolves to Redacted, not an abort)
+
+  Kind 3 -- presence and absence, the shapes equality could not express
+  memberAccess (query non-empty) as owner        => admitted
+  memberAccess as another user                   => REJECTED: memberAccess: path constraint
+  notSuspended, only a lifted suspension         => admitted
+  notSuspended, an unlifted suspension exists    => REJECTED: notSuspended: path constraint
+
+--- 3. Regex: provenance decides the effect -----------------------------
+  The right operand is restricted by trait. Two constructors, so the
+  effect index derives the difference instead of restating it:
+    MatchK <StringLit>                     Pure -- checked at schema commit
+    MatchK <Reference path>                Pure -- a Reference insert IS a commit
+    MatchC <Configuration path>            Read -- resolves at runtime, cached
+
+  Order.sku SKU-4471 vs configured pattern       => admitted
+  Order.sku SKU-44 vs configured pattern         => REJECTED: app.commerce.Order.sku: sku does not match the configured pattern
+
+  Cache is keyed on the Configuration row version:
+    after two matches: 1 compile, 1 cache hit
+  Order.sku SKU-44 after retuning to ^SKU-[0-9]{2}$ => admitted
+    after retune:      2 compile, 1 cache hit
+
+  A malformed pattern fails where its provenance implies:
+  Configuration pattern ^SKU-[0-9 (unterminated) => REJECTED: malformed pattern from system.regex.SkuPattern.pattern: ^SKU-[0-9
+    a StringLit or Reference pattern is rejected at schema commit instead,
+    so it never reaches a row at all
+
+--- 4. Event functors: both trigger forms -------------------------------
+  Both forms fire on a False -> True transition, never on merely being
+  true. The state is a TriggerState bit per (trigger, row).
+
+  on status is Shipped emit app.events.EmailQueue { … }
+  tick 1: status Pending                         => Nothing
+  tick 2: status Shipped (transition)            => Just (EventRef {erQueue = "app.events.EmailQueue", erPayload = [("recipient","ada@example.com"),("order_num","o-1")], erScheduled = t1700000006000})
+  tick 3: still Shipped (no transition)          => Nothing
+
+  every poll_interval emit … where balance >= credit_limit
+  (the interval is a field of the row, evaluated per row per tick)
+  tick 1: 500 >= 400, transition                 => Just (EventRef {erQueue = "app.events.SyncQueue", erPayload = [("customer","c-1")], erScheduled = t1700000038000})
+  tick 2: still true, no transition              => Nothing
+
+  queue depth after five ticks: 2
+  each entry is a row in an ordinary LogData queue table, not a blob:
+    app.events.EmailQueue      scheduled t1700000006000  [("recipient","ada@example.com"),("order_num","o-1")]
+    app.events.SyncQueue       scheduled t1700000038000  [("customer","c-1")]
+  an event functor produces an EventRef, never Either Error a -- inserting
+  the queue row IS the commit, so it can abort nothing
+
+--- 5. Behaviors --------------------------------------------------------
+  accrued : Behavior Amount = \m -> rate * (m - opened_at) / day
+  Nothing is stored. Moment arrives as an argument, so there is no clock
+  to read -- the missing Effect lift rather than a convention.
+
+  sample at +0 day                               => 0.0
+  sample at +1 day                               => 12.0
+  sample at +7 day                               => 84.0
+  sample at +30 day                              => 360.0
+  sample at +365 day                             => 4380.0
+  the same term sampled in the past and the future, unchanged: Moment
+  ranges over both, which is why it is not called CurrentTime
+
+--- 6. Function-typed columns -------------------------------------------
+  type Renderer = Amount -> Read Text; a field names it and may not
+  write an arrow inline. Storage is unchanged -- it is a FunctorRef --
+  and what is new is that the compiler knows the signature.
+
+  style s-1 -> render (registered)               => "$99.99"
+  style s-2 -> render (unregistered)             => REJECTED: no term registered for function column value nosuch
+
+  The call graph must be acyclic -- decidable, because it is in the
+  schema graph, and a schema-commit obligation rather than a runtime guard.
+    money -> round2                        => admitted
+    money -> round2 -> fmt -> money        => REJECTED: money -> round2 -> fmt -> money
+
+  Restrictions that fall out of function types having no equality:
+    unique, order by, group by, ==, indexed, candidate key, field where
+    -- all closed by the absence of an EqT/OrdT instance, not by a rule
+
+--- 7. Templates: cardinality is the control flow -----------------------
+  One production, and the result count of a hole's query is the control
+  flow: 0 rows renders nothing, 1 renders once, N renders N joined by the
+  template's separator. No if, no each, no else.
+
+  order with a courier                           => "Order <app.commerce.Order> for <customerCard:app.commerce.Customer> courier=<app.commerce.Courier>"
+  courier hole returns zero rows                 => "Order <app.commerce.Order> for <customerCard:app.commerce.Customer> courier="
+  the second is the conditional, and it is just the query's where clause
+  holes are Read and rooted at self, the same anchoring rule as an assert
+
+--- 8. Structural analyses (the transparency invariant) -----------------
+  Every answer below is a pure walk over the term. This is what the
+  transparency invariant is for, and what compiled code cannot answer.
+
+  Assert variety, read off the body (never the name):
+    billingMatch     DataConstraint     0 mention(s) of authed_user
+    ownerAccess      AccessConstraint   1 mention(s) of authed_user
+    memberAccess     AccessConstraint   1 mention(s) of authed_user
+    notSuspended     DataConstraint     0 mention(s) of authed_user
+    mixedAccess      AccessConstraint   1 mention(s) of authed_user
+
+  grant <role> on <ns> bypass access skips exactly:
+    skipped:  ownerAccess, memberAccess, mixedAccess
+    enforced: billingMatch, notSuspended
+    an administrator is exempt from access control, never from integrity
+
+  Warning: a conjunct of an access assert that does not mention the token
+  is bypassed with it, which is almost never intended.
+    mixedAccess: conjunct(s) [2] have no token mention
+
+  Anchoring: every join must follow a declared :> edge.
+    memberAccess       3 hop(s)  => anchored
+    notSuspended       2 hop(s)  => anchored
+    warehouseStocked   1 hop(s)  => REJECTED: join along undeclared edge app.commerce.Order.warehouse :> logistics.Warehouse
+
+  Anchoring bounds work; it does not buy locality:
+    edge app.commerce.Order.warehouse :> logistics.Warehouse leaves the shard family
+    consequence: this attachment cannot be `enforce always`; it is
+    coerced to `enforce forward` and the commit reports the crossing
+
+  Revalidation set -- the FK chain traversed backwards. Writing a
+  Suspension row obliges revisiting asserts on:
+    app.commerce.Suspension
+  and writing an Address:
+    app.commerce.Address, app.commerce.Customer, app.commerce.Member, app.commerce.Order, app.commerce.Project, app.commerce.Suspension
+
+  Filter placement (SQL's ON-versus-WHERE trap, closed structurally):
+    filter outside the outer join term => REJECTED
+      filter applied outside an outer join term; move it inside: Account >< (Suspension where …) | NoSuspension
+    filter inside the join term        => admitted
+
+  Could the solver have closed this condition instead of sampling it?
+  (OQ-034 wants the classifier even for conditions the solver declines)
+    orderShipped   CLOSABLE  -- warn: transition observed across the write; no sampling at all
+    creditWatch    sampled   -- both sides move with the row's stored fields
+    trialExpiry    CLOSABLE  -- warn: condition is a comparison against a value fixed at the write; a crossing moment is derivable
+
+  Retention chain checks (grains align, they do not merely coarsen):
+    Minute->Hour->Day->Month   => admitted
+    for 30 day , by Month      => REJECTED: retention 2592000000ms at GDay is shorter than the maximum span of GMonth (2678400000ms)
+    by IsoWeek , by Month      => REJECTED: GIsoWeek does not tile GMonth — the two are on different roots or skip a level
+
+  Static cost and feature inventory per functor:
+    app.commerce.Customer.email        validation       =~ StringLit (compile time), bound variable
+    app.commerce.Address.postal_code   validation       =~ Reference system.regex.UsPostal (compile time), bound variable
+    app.commerce.Order.sku             validation       =~ Configuration (runtime, cached), bound variable
+    app.commerce.Order.total           validation       bound variable
+    auth.Credential.password           validation       bound variable
+    app.commerce.Order.customer        foreign key      :> resolve
+    app.commerce.Order.courier         foreign key      :> resolve, absence alternative (NotDispatched)
+    billingMatch                       path constraint  :> deref
+    ownerAccess                        path constraint  :> deref, authed_user
+    memberAccess                       path constraint  anchored subquery (presence), authed_user, filter inside join term
+    notSuspended                       path constraint  anchored subquery (absence), filter inside join term
+    mixedAccess                        path constraint  :> deref, authed_user, is
+    orderShipped                       event            on (transition), is, :> deref
+    creditWatch                        event            every (sampled), :> deref
+    trialExpiry                        event            every (sampled), unit as value
+
+--- 9. let, virtual columns, next, Component construction ---------------
+  let … in -- one binding, scoped to the body:
+  let window = expires_at - created_at in window / hour => 720.0
+
+  Virtual columns are projections of the row identifier (bytes 0-5,
+  6-7, and the component suffix), declared nowhere:
+  created_at  (bytes 0-5)                        => t1700000002000
+  ordinal     (component suffix)                 => 0
+  origin_server.hostname (a reference)           => "node-a"
+    origin_server is the one virtual column that is a reference, so it
+    is the only one costing a Read -- and the effect index says so
+    the sequence counter (bytes 8-11) has no constructor at all
+
+  next <UniqueName> -- an allocation, and therefore Tx:
+  allocation 1                                   => 1
+  allocation 2                                   => 2
+  allocation 3                                   => 3
+    gaps are guaranteed (an aborted transaction burns a value); gapless
+    numbering is a reporting requirement served by a view over the log
+    it is Tx, so `where next orderRef > 0` does not typecheck
+
+  A Component default constructs the row, in the same transaction:
+  construct app.commerce.OrderSettings           => app.commerce.OrderSettings
+      digest       : Duration
+      seq          : Int
+      theme        : Variant
+    deleting the parent deletes it, mechanically over Component edges --
+    no cascade declaration, because the edges ARE the ownership
+
+--- 10. Duration / Period / Grain ---------------------------------------
+  Three types, because they were one while Duration was the only one --
+  which hid a `month` with a fixed millisecond count and a bucket size
+  with no count at all.
+
+  Units are values, so `7 day` IS `7 * day` and units compose:
+  7 day                                          => 604800000ms
+  2 * week                                       => 1209600000ms
+  90 minute                                      => 5400000ms
+
+  Duration / Duration is the one dimensionless division, which is what
+  makes units work as values without dimensional typing:
+  36 hour / day                                  => 1.5
+
+  Calendar addition is not associative, so one operator cannot cover
+  both readings. Dec 31 2024 with 3 months:
+  + 3 * month  (from-origin)                     => "2025-03-31 00:00"
+  stepMonth 3  (accumulating)                    => "2025-03-28 00:00"
+    the second clamps at each step, so the day-of-month never recovers
+    -- the semantics a schedule anchored to a late day-of-month needs
+
+  Grain truncation into labelled buckets:
+  truncate to GMinute                            => "2025-01-29 13:47"
+  truncate to GHour                              => "2025-01-29 13:00"
+  truncate to GDay                               => "2025-01-29 00:00"
+  truncate to GIsoWeek                           => "2025-01-27 00:00"
+  truncate to GMonth                             => "2025-01-01 00:00"
+  truncate to GQuarter                           => "2025-01-01 00:00"
+  truncate to GYear                              => "2025-01-01 00:00"
+    IsoWeek is coarser than Day and finer than Month while dividing
+    neither, which is why its position is declared and not computed
+
+  No conversion exists between Period and Duration in either direction,
+  so `now + 3 * month` gets calendar semantics because the type system
+  decided it, not because of a rule to remember.
+
+--- 11. Apply latency ---------------------------------------------------
+  Interpreting a term, per application, over 20k iterations.
+
+  validation (regex, Configuration)           0.308 us/apply  (6.2 ms total)
+  validation (regex, StringLit)               0.793 us/apply  (15.9 ms total)
+  path constraint, data (1 deref)             0.142 us/apply  (2.8 ms total)
+  path constraint, access (1 deref)           0.147 us/apply  (2.9 ms total)
+  anchored subquery, absence (2 hops)         0.254 us/apply  (5.1 ms total)
+  event, on (transition + state bit)          0.072 us/apply  (1.4 ms total)
+  behavior sample                             0.078 us/apply  (1.6 ms total)
+
+  derefs: 40002, pattern compiles: 2, cache hits: 40000
+  For scale: the storage spike measured an LMDB read at 11us/op. Functor
+  interpretation is one to two orders of magnitude below that floor, and
+  every figure here is dominated by the store lookups the real engine
+  would be doing anyway.
+
+  One finding worth acting on: the StringLit regex is the slowest row, and
+  it is not the matching -- it is the cache being keyed on the pattern Text
+  itself. A compile-time-provenance pattern should be interned to an integer
+  id at schema commit, which is the same interning `Doc indexed` keys already
+  use. Nothing in the design forbids it; the spike simply did not do it.
+
+--- 12. Ceiling ---------------------------------------------------------
+  Encoded and exercised above:
+    + all four functor kinds, with the path kind in all three shapes
+    + both event trigger forms, with `every`'s interval a per-row Read expr
+    + =~ with all three admissible right operands, cached on config version
+    + typed absence, the head rule, and outer-join guards
+    + Duration / Period / Grain, units as values, both calendar additions
+    + behaviors as Moment -> a, sampled past and future
+    + function-typed columns with a static signature and an acyclicity check
+    + template holes, where cardinality is the control flow
+    + let, is / is not, virtual columns, next, Component construction
+
+  Still not encoded:
+    - Recursive types. Unchanged from the original spike.
+    - A closed-form crossing solver for behavior-triggered conditions (OQ-034).
+      The classifier that decides whether one COULD close a condition is
+      implemented above; the solver itself is not.
+    - Mergeable sketch types (t-digest, HyperLogLog) for percentile in a
+      multi-step retention chain (OQ-034).
+    - The regex engine. Text.Regex.TDFA could not be installed in this
+      sandbox, so the matcher here is a stand-in -- what is validated is
+      the primitive's shape, the provenance restriction, and the cache.
+
+  Nothing above needed a runtime GHC dependency, and nothing above is
+  expressible at effect Effect, because the ladder has no such rung.

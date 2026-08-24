@@ -5,44 +5,94 @@ Questions that need answers before or during implementation. Grouped by urgency.
 ## Must Resolve Before Writing Core Code
 
 ### OQ-001: Dynamic Loading Mechanism ✓ ANSWERED
-**Answer**: GADT DSL + Data.Dynamic hybrid. See `spikes/dynamic-loading/output.txt`.
-- **GADT DSL** (Approach 2): primary functor mechanism. All four functor kinds must be encodable: validation, foreign key, path constraint (in both its data and access varieties), and event (the event functor enqueues a work item rather than executing immediately — see `events.md`). Spike validated the first three; the event functor requires a DSL extension that produces an `EventRef` (queue table row insert) instead of `Either Error a`. Zero runtime GHC dependency. ~0µs apply latency. Ceiling: regex and recursive types require DSL extensions; user-defined functions require new DSL constructors. **Two of these have since become load-bearing rather than anticipated** (OQ-005): the path-constraint kind widened past equality to anchored presence/absence subqueries, which the spike did not encode, and `=~` became a real operator admissible in any constraint body, so the regex primitive is now required rather than merely possible. See `dynamic-loading.md`.
-- **Data.Dynamic** (Approach 3): type registry substrate. TypeRep-based type checking is O(1). Serves as the "registered type library" that the DSL references by name.
-- **hint** (Approach 1): failed to compile in the spike — GHC not on PATH or hint version mismatch. Revisit as an escape hatch for advanced user-defined functors; compile async and sandbox the result.
-- **Multi-daemon**: needed when compiled-in types must change (requires server restart to load new Haskell modules); the schema daemon restarts are coordinated by a supervisor.
+**Answer**: Two mechanisms, because there were two questions. Functors are
+**effect-indexed GADT DSL terms**, interpreted, never compiled. Compiled-in Haskell
+changes by **generation swap behind a stable router**, governed per host. A schema change
+touches only the first, which is what makes zero-downtime schema evolution structural
+rather than carefully engineered. See `dynamic-loading.md` and
+`spikes/functor-dsl/output.txt`.
 
-**Requirements accumulated for the architecture revisit.** OQ-005 and OQ-030 settled the event
-and function-column syntax, and doing so put four loads on this answer that it was not written
-against. Recorded here so the revisit starts from them rather than rediscovering them:
+- **Effect-indexed GADT DSL**: the functor mechanism. Indexed by a typed de Bruijn
+  context, an effect, and a result type. `data Eff = Pure | Read | Tx` has **no `Effect`
+  rung** and there is no `Sub 'Tx 'Read` instance, so "no external calls in a commit" and
+  "a behavior may not mutate" are both absent constructors rather than rules. Zero runtime
+  GHC dependency; 0.07–0.8 µs per application.
+- **`Data.Dynamic`**: type registry substrate. O(1) `TypeRep` checking. The registered
+  type library the DSL references by name.
+- **Generation pool**: router + data workers + a separate handler pool + a per-host
+  governor. Replaces "the schema daemon restarts, coordinated by a supervisor", which
+  conceded it had no zero-downtime story and left the supervisor unspecified.
+- **`hint` is abandoned**, not deferred. The demand was arbitrary Haskell for
+  integrations; handlers get it from the generation pool, with no in-process GHC and no
+  sandbox problem.
 
-- **The DSL's "user-defined functions" ceiling is now split in two, and only one half still
-  binds.** Handlers escape it on their merits — they run in `Effect`, outside the commit, and
-  need none of transparency, static access analysis, or replayability — so they are compiled-in
-  Haskell registered in `system.events.Handler`, and the ceiling costs a build and a
-  schema-daemon restart per new *integration*. Functors do not escape it: they are `Read` or
-  `Tx`, they are DSL terms, and a new business rule must need no restart. **This is what makes
-  the multi-daemon layer load-bearing rather than contingent** — the restart path is now on the
-  documented route for adding an integration, so its latency is a real number the revisit owes
-  rather than a "not run" spike. Option E (the `hint` escape hatch) stays deferred, and the
-  handler split is the reason it can: the case that wanted arbitrary Haskell got it somewhere
-  the DSL does not have to reach.
-- **The DSL must encode two things it was not sized for.** The **event functor** was already
-  unvalidated; it now has two trigger forms, and `every` needs an interval that is a `Read`
-  expression evaluated per row per tick, not a constant. Separately, **function-typed columns**
-  mean a DSL term is now a stored *value* whose signature the type checker knows — which is
-  mostly a typing change over the existing `FunctorRef`, but it makes the acyclicity check over
-  the function call graph a schema-commit obligation and puts template holes (anchored queries
-  with a non-emptiness-shaped result count) in the same encoding as assert bodies.
-- **The effect ladder replaces the signature blacklist**, so "no arbitrary IO" is enforced by
-  the absence of an `Effect a -> Tx a` lift rather than by rejecting `a -> IO b`. The revisit
-  should confirm the GADT DSL can be *indexed by effect* — a validation term and a template hole
-  are both `Read`, a field default is `Tx`, and nothing in the DSL is `Effect` at all, since
-  effectful code lives outside it.
-- **One scheduler, not two.** Connector polling is a scheduled event (OQ-019), so the process
-  topology question is scheduler + worker pools + schema daemon + data daemons, not that plus a
-  connector daemon with its own timing. This is a simplification, but it means the scheduler is
-  on the critical path for ingest as well as egress and its failure domain is correspondingly
-  larger.
+**The previous answer's evidence was weaker than its claim, and this is the correction.**
+`spikes/dynamic-loading` recorded "all four functor types encodable in the DSL". Its
+`Expr` was a **plain ADT, not a GADT** — the module says so — so type errors surfaced at
+eval time as `ValidationError "… type mismatch"`, and "type safety propagates into schema
+expressions" was never tested. Two of the three wrong answers in its recorded run were
+that defect leaking (a validation message masked by a `Text`-plus-`Int` concatenation; a
+valid email reported invalid because `EContains` compared suffixes), and its "compose all
+four functors" test composed two. `spikes/functor-dsl` supersedes it for every DSL claim;
+the old spike remains the record for ruling out `hint` and for the option comparison.
+
+**Why functors are interpreted.** The performance argument for compiling is empty —
+interpretation is one to two orders of magnitude below the 11 µs LMDB read floor. Three
+arguments decide it:
+
+- **Transparency.** The query optimizer, static access analysis, `evolution.md`'s
+  coercion-path derivation, and the IDE's ER diagram all consume the functor's
+  *structure*. The spike implements each analysis as a pure walk over the term to show
+  what is bought: assert-variety classification, the `bypass access` exemption set,
+  anchoring, shard-crossing detection, revalidation sets, filter placement, call-graph
+  acyclicity, and the `every`-was-unnecessary classifier.
+- **Replay.** `enforce forward` compares against the predicate as it was, and re-deriving
+  a `Derived` violation needs the predicate as of the violation. A term is a
+  content-addressed graph node; a retired binary is not.
+- **The commit path.** Compilation is an external call, so the effect ladder puts it
+  outside the commit. Schema changes would become commit-then-build, and the REPL's
+  `:commit` would wait on GHC.
+
+Two arguments *against* compiling were examined and do not hold, recorded so they are not
+raised again. The schema graph is one DAG with all branches present, so a compiled
+artifact would hold every live named ref in **one binary** sized O(refs × schema), not one
+binary per version. And historical `at` reads need only the historical row *shape* (graph
+data) plus **current** access rules (OQ-027), so arbitrary-moment sampling costs the
+compiled path nothing.
+
+**Ceilings, now three rather than four.** Recursive types; a closed-form crossing solver
+for behavior-triggered conditions (OQ-034 — the *classifier* is implemented, the solver is
+not); and mergeable sketch types for `percentile` past one chain step (OQ-034). Closed
+since the last answer: **regex** is a primitive whose provenance the effect index derives
+(`StringLit`/`Reference` are `Pure` and interned at commit, `Configuration` is `Read` and
+cached on the row version); **anchored presence/absence subqueries** are `Exists` over a
+query whose only root constructor is `self`; and **user-defined functions** split, with
+handlers escaping to the generation pool and functors becoming terms in a context of their
+parameters rather than Haskell closures.
+
+**Requirements this answer was written against**, carried over from OQ-005 and OQ-030 and
+now all discharged: both event trigger forms with `every`'s interval a per-row `Read`
+expression; function-typed columns with a static signature and a commit-time acyclicity
+obligation; template holes in the same encoding as assert bodies; and the effect ladder as
+an index rather than a signature blacklist. **One scheduler, not two** also survives —
+connector polling is a scheduled event (OQ-019), so the topology is router + data workers +
+handler workers + governor, with no connector daemon keeping its own time. The consequence
+stands: the scheduler is on the critical path for ingest as well as egress.
+
+**Open with the topology, not with the mechanism:**
+
+- **Generation swap latency.** The handover primitive needs no invention — LMDB's writer
+  lock is cross-process and OS-enforced, so the incoming generation blocks on it while the
+  outgoing one finishes its in-flight transaction, and reads never stall at all under
+  MVCC. What is unmeasured is the write stall under load and the drain deadline that
+  avoids free-list growth from a long-lived reader.
+- **Build latency for a handler generation.** 30 s is the accepted budget; measure it.
+- **Unresolved prepared nodes become routine.** A worker killed mid-prepare leaves one,
+  which is recoverable (OQ-006) but was sized as exceptional. A rolling swap puts it on
+  the common path.
+- **`Text.Regex.TDFA` is unvalidated as an engine.** It cannot be installed in the
+  development sandbox, so the spike validates the primitive's shape and cache with a
+  stand-in matcher.
 
 ### OQ-002: Servant + Dynamic Schema ✓ ANSWERED
 **Answer**: Servant + Warp works. The pattern is `"schema" :> Capture "ns" String :> Capture "name" String :> Raw`. Servant handles the static URL structure; the `Raw` endpoint delegates to an IORef-backed WAI dispatch table for runtime-dynamic routing. No Yesod needed for the data plane. See `spikes/servant-warp/output.txt`.
@@ -92,6 +142,31 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 - **Error signaling**: The transaction is atomic — it either fully commits or fully fails. On failure, only the HTTP request log is written (to a per-server system shard that always succeeds independently). The error is returned to the client. 500s should be avoided; all known failure modes return 4xx.
 - **Event functors**: Internal events (e.g., index updates, view refresh) resolve within the transaction as they occur. External side effects (email, webhooks, etc.) are never executed inline — they are written to a queue table and processed asynchronously by the event scheduler functor. No external calls from within a transaction.
 - **A mutation not anchored to one shard becomes a node on the schema shard that every primary applies locally.** The gate is **structural, not a role check**: what makes such a mutation dangerous is its scope, which is readable off the query, exactly as an assert's variety is read off its body rather than its name. An ordinary grant on the system table controls the path, so privilege is a consequence of the rule rather than the rule itself; "admins only" was rejected for the same reason naming conventions were rejected for access asserts. Application is **per shard, independent, and may be partial** — each primary validates every affected row against the full constraint set and records what it did in its own shard, and the initiator's report is a distributed query merged from every participating shard that **names which shards contributed**, the pattern `integrity.md` already established for the same reason (a single global table would be a cluster-wide write hotspot). Three properties follow: the initiator subscribes rather than blocking, since a "wait for all primaries" return value cannot express "shard 47 is down"; the operation is restartable by construction, because an unreachable shard applies the node when it returns; and records stay in their shard, since one row per (operation, shard) written to the schema shard would make every bulk mutation a fan-in burst on the least suitable node. All-or-nothing across every shard was rejected — it needs cluster-wide two-phase commit, which is the thing being removed. The one case resisting independent per-shard validation is a bulk mutation touching a table-wide `unique`, whose authority is a constraint shard (OQ-007).
+- **A read at a historical moment is checked against HEAD's access rules, not the moment's.**
+  A query with an `at` clause samples the past for *data*; the question of who may see it is
+  answered now. The reason is one-directional: an access rule that was removed must not still
+  be granting access, and a rule that was added must not be evadable by sampling a moment
+  before it existed. So `at` needs the historical row **shape** — which fields existed, how to
+  decode them — and that is graph data rather than code, while the asserts it runs are the
+  current ones. Data constraints, foreign keys, and event functors do not enter into it, since
+  none of them evaluate on a read. **Tightening an access rule is therefore retroactive**, which
+  is a change in read behaviour without touching a field, so it falls under the existing rule
+  that the commit diff must report it: schema commit **warns** and names every assert whose
+  variety or predicate changed, and because both the old and new predicates are content-addressed
+  nodes, "which reads would this have redacted" is an ordinary query over the transaction graph
+  rather than a report someone has to build. This is what makes functor **transparency**
+  load-bearing for auditing and not only for optimization (OQ-001).
+- **A schema commit requiring a build advances its ref only when the build lands.** Adding a
+  handler *is* a schema commit — `system.events.Handler` is a `Reference` table, so
+  `handler foo.bar` compile-checks against the compiled-in registry — and that commit cannot
+  complete before the artifact exists. The graph already had the shape: the commit appends the
+  node, the build is a queued `Effect`, and on success a merge node lands and the ref advances.
+  On failure the node stays **unmerged and inert**, which is the same invisibility that makes an
+  unmerged schema branch and a prepared node inert, so a failed build needs no rollback in a
+  system where nothing is destroyed. The property this buys: **"live" is ref position and refs
+  are data**, so there is never a window in which the graph and the enforced schema disagree —
+  which matters most for an access tightening, where such a window is a security lag rather than
+  a delay. Ordinary schema changes never reach this path at all, because functors are interpreted.
 - **Deferred work waits on a queue position, never on another operation.** Global mutations are queue rows under the event scheduler's existing `Configuration` policy (`backoff_base`, `aging_rate`), so cross-shard prepares and cluster-wide mutations are one mechanism with two callers rather than two deferral systems. Admission is on a condition readable off data rather than off a clock: the shard's write queue reaches zero, **or** the item's age exceeds the aging threshold. The first gives local work precedence and lets global work resolve while a shard is quiet; the second is what guarantees progress, since "wait for server inactivity" alone never arrives on a busy server and inactivity is a clock property besides. The result is the property the arrangement exists for — **no operation waits on another operation, so there is no wait-for edge and deadlock is unrepresentable rather than avoided** — and it holds only alongside "validation reads merged nodes only", since a validation permitted to observe a prepared node would reintroduce the edge. Global *reads* are excluded from all of this and need no deferral at all; see OQ-012.
 
 ### OQ-028: Route Conflict Resolution ✓ ANSWERED
@@ -463,9 +538,14 @@ open:
 **Solving.** The crossing moment must be derivable in closed form, which is what restricts
 behaviors to an analyzable class (constant, linear, piecewise-linear, exponential decay are
 the obvious candidates). The class, the solver per class, and the encoding of both in the
-GADT DSL are unspecified. Note this compounds OQ-001: the event functor is the one kind the
-dynamic-loading spike never validated, and a crossing solver is strictly harder than the
-`EventRef` production that spike would have tested.
+GADT DSL are unspecified. **This no longer compounds OQ-001, and the residue is sharper for
+it.** The event kind is validated — `spikes/functor-dsl` encodes both trigger forms producing
+an `EventRef`, so the `EventRef` production is no longer a hypothetical the solver would have
+had to be built on top of. What is left is exactly the solver, plus the classifier it shares
+with the `every` warning. The classifier **is implemented** in that spike, because the warning
+needs it whether or not the solver exists, so the open work is narrower than it was: a solver
+per analyzable class, against a classifier that already partitions conditions into closable
+and not.
 
 **Re-solving on write.** A behavior closes over stored fields, so writing the row changes the
 function and moves the crossing. Every pending wake-up derived from a behavior on that row
@@ -744,10 +824,18 @@ identity living in the same tables and obeying the same asserts as a human's. Se
 ### OQ-018: Redis CDC Approach ✗ NOT DOING
 **Decision**: Deprioritized for v1. No viable transparent Haskell library; Redis Streams requires source changes; sidecar adds operational complexity. Not worth it for v1. Revisit post-v1 if needed.
 
-### OQ-019: Connector Daemon Architecture
-**Question**: Is the connector daemon a separate process (separate daemon alongside the schema and data daemons) or a thread pool within the main DataCode server process?
-**Notes**: Separate process allows independent restart; same process is simpler. Connector failures should not crash the main server.
-**Action**: Decide during core architecture design; likely a separate supervised process.
+### OQ-019: Connector Daemon Architecture ✓ ANSWERED
+**Answer**: There is no connector daemon, in either sense. Polling is a scheduled event under
+the one scheduler, and the outbound work runs in `Effect` — which makes it a handler, and
+handlers are the **separate handler worker pool** (OQ-001). So the answer to "separate process
+or pool inside the server" is *separate process*, but not because connectors are special: they
+land there by being effectful, alongside SMTP and S3 and every other integration.
+
+Three properties come free rather than being designed for. A connector cannot crash the data
+plane, which was the original concern. Its reachable hosts, credentials, and timeouts come from
+a `Configuration` row and are enforceable at the OS level, because the pool is a distinct
+process. And a new connector integration ships as a generation swap on the handler pool alone,
+never touching the data workers.
 
 **Narrowed to worker-pool topology.** There is **one scheduler**, and connector polling is a
 scheduled event under it rather than an independent loop: a connector's CDC sync and its state
@@ -756,7 +844,7 @@ verification are two `every` declarations on the connector row, with the interva
 two backoff states, and no way to reason about total outbound load — the thing to avoid before
 writing code rather than after. What remains open is only whether the connector *workers* are a
 separate supervised process or a pool inside the server, which is the original question minus
-the scheduling half. The inbound direction is not scheduled at all (OQ-005, arrival is a write),
+the scheduling half — and is now answered above by the handler pool. The inbound direction is not scheduled at all (OQ-005, arrival is a write),
 so a connector's failure surface is a handler's failure surface and is bounded by
 `HandlerConfig`.
 
