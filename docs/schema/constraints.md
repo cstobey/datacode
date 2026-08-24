@@ -158,7 +158,7 @@ assert payable {
 ```
 
 Both are correct. **Prefer `not` in an assert.** The guard form earns its length in a query or
-a view, where the absence is a value you want to project or branch on; in an assert nothing
+a query, where the absence is a value you want to project or branch on; in an assert nothing
 consumes the variant, and the guard form invites the one mistake that matters:
 
 ```
@@ -269,7 +269,7 @@ See [../auth.md](../auth.md) and
 ## Standalone Form
 
 Both varieties may be added after the table is already defined, and this is the **only** form
-available for a view, which has no body to hold one:
+available for a derived table, which has no body to hold one:
 
 ```
 assert Order.billingMatch { customer.billing_address == bill_addr }

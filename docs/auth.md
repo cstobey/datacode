@@ -51,7 +51,7 @@ Server tokens:
 ```
 
 The credential presented at login is method-agnostic: password, API key, and — once
-[OQ-011](open-questions.md#oq-011-fido2webauthn-for-long-lived-credentials) is taken up —
+[OQ-011](open-questions.md#oq-011-fido2webauthn-for-long-lived-credentials--answered) is taken up —
 hardware key. The identity model does not change to accommodate a new one, which is the point
 of the `User`/`Credential` split below.
 
@@ -367,19 +367,19 @@ table system.auth.AccountKind : Configuration {
   unique kindOf { user }
 }
 
-view system.auth.ServiceAccount = User >< AccountKind { User.*, AccountKind.purpose }
+system.auth.ServiceAccount = User >< AccountKind { User.*, AccountKind.purpose }
   where kind is Service
 ```
 
-Because the join is along a `:>` edge and the derived key is meaningful, the view is
+Because the join is along a `:>` edge and the derived key is meaningful, the derived table is
 **writable**, and this is the point of the pattern rather than a bonus: inserting a service
 account through it creates the `User` row and the `AccountKind` row, with `kind = Service`
-supplied by the view's own filter. The call site never names the linking table. See
-[schema/queries.md](schema/queries.md#writing-through-a-view).
+supplied by the filter. The call site never names the linking table. See
+[schema/queries.md](schema/queries.md#writing-through-a-derived-table).
 
 A trait was rejected for this. A trait is a declaration on a table, so `User : ServiceAccount`
 would make every user a service account; the thing being described is a set of rows, which is
-a view's job.
+what a query names.
 
 The base system tables stay protected by system-level access constraints that prevent
 destructive modification by non-system tokens.
@@ -393,7 +393,7 @@ designed for: the connector authenticates as a service account whose credentials
 `ApiKey`-method rows, and every row it writes is attributable to an identity that appears in
 the same tables and obeys the same asserts as a human's.
 
-Answers [OQ-015](open-questions.md#oq-015-service-accounts).
+Answers [OQ-015](open-questions.md#oq-015-service-accounts--answered).
 
 ## Device Registration
 

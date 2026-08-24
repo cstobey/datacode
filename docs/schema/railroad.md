@@ -41,7 +41,7 @@ Comment      ::= '--' [^#xA]*
 **Capitalization is a convention, not a grammar rule.** `Ident` admits either case in every
 position, and the resolver distinguishes a type from a field by position, not by initial
 letter. The convention is nonetheless normative style and is checked by the linter: types,
-traits, tables, views, and sum-type variants are `UpperCamelCase` and singular; fields are
+traits, tables, derived tables, and sum-type variants are `UpperCamelCase` and singular; fields are
 `lower_snake_case`; functions, predicates, and constraint names are `lowerCamelCase`;
 namespace segments are `lowercase`. See [README.md](README.md#capitalization).
 
@@ -70,8 +70,7 @@ Statement    ::= ImportDecl
                | TypeDecl
                | TraitDecl
                | TableDecl
-               | ViewDecl
-               | AggregateDecl
+               | Binding
                | RetainDecl
                | StandaloneAssert
                | StandaloneUnique
@@ -105,8 +104,7 @@ TypeSigDecl  ::= Ident ':' TypeSig
 `type A : B` declares a domain type (subtype of `B`); `type A = B | C` declares a sum type;
 `type A = B -> Read C` declares a **function type**. `TypeSigDecl` is a top-level
 Haskell-style signature for a function; it is distinguished from `FieldDecl` by position —
-signatures appear at file top level, field declarations only inside a table, view, or trait
-body.
+signatures appear at file top level, field declarations only inside a table or trait body.
 
 `FnType` is admissible only in `TypeDecl`. **A `FieldDecl` may not write an arrow inline; it
 names a declared function type**, which is what makes "every function in a field shares one
@@ -132,12 +130,11 @@ See [types.md](types.md#hashed-types).
 
 ```ebnf
 FieldDecl    ::= Ident RefToken TypeExpr SubTableTraits? SubTableBody?
-                 SourceClause? 'unique'? 'indexed'? DefaultClause? WhereClause?
+                 'unique'? 'indexed'? DefaultClause? WhereClause?
 
 RefToken     ::= ':' | ':>'
 SubTableTraits ::= ':' TraitList
 SubTableBody ::= '{' TableBody '}'
-SourceClause ::= 'rename' 'from' QName
 DefaultClause::= '=' ( Expr | SeqAlloc )
 SeqAlloc     ::= 'next' Ident
 
@@ -145,12 +142,10 @@ WhereClause  ::= 'where' ( Expr | PredicateBlock )
 PredicateBlock ::= Expr+       /* layout block: one predicate per line, indented */
 ```
 
-`SourceClause` lost its bare `'from' QName` alternative, and `WildcardField
-::= '*' 'from' QName` is gone entirely. Both existed only to let a view body name the table a
-field or a wildcard was drawn from. A view is now a named `Query`, so its source is the query
-and the two field-level spellings had nothing left to do — `ProjItem`'s `User.*` is what
-replaced them. `rename from` stays: it is an evolution hint on a table field and never had
-anything to do with views.
+`SourceClause` (`rename from QName`, and earlier a bare `from QName`) and `WildcardField`
+(`'*' 'from' QName`) are gone. A rename is a projection that mentions the source field under a
+new name, which is both shorter and the same mechanism used for every other reshaping. See
+[evolution.md](evolution.md#rename-a-field).
 
 At most **one** `WhereClause` per declaration. Its body is a single predicate on the same
 line, or a `PredicateBlock` — an indented run of predicates delimited by the layout rule,
@@ -158,9 +153,9 @@ implicitly conjoined. There is no repeated `where` and no `and` between block en
 
 Constraints not expressible in the grammar, enforced at compile time:
 
-- `:` — no `Variant` in the `TypeExpr` may name a table or view.
-- `:>` — the **first** `Variant` must name a table or view. Later variants may name further
-  tables/views or `Null`-derived types. See the head rule in [README.md](README.md).
+- `:` — no `Variant` in the `TypeExpr` may name a table.
+- `:>` — the **first** `Variant` must name a table or derived table. Later variants may name
+  further tables or `Null`-derived types. See the head rule in [README.md](README.md).
 - `SubTableBody` and `SubTableTraits` are only valid with `:>`. `SubTableTraits` mirrors
   `TableDecl`'s trait list and is how an inline sub-table declares `Component`.
 - `indexed` is valid only where the `TypeExpr` is `Doc`. See
@@ -169,8 +164,8 @@ Constraints not expressible in the grammar, enforced at compile time:
   because per-row salts make the constraint unenforceable in principle.
 - Where the `TypeExpr` head is `Behavior`, the `DefaultClause` is **mandatory** and is the
   behavior's definition rather than a default — its `Expr` must be a `Lambda` of one
-  parameter, bound to a `Moment`. `SourceClause`, `unique`, `indexed`, and `WhereClause` are
-  all rejected on such a field, and it may not appear in a `RecordLit`. See
+  parameter, bound to a `Moment`. `unique`, `indexed`, and `WhereClause` are all rejected on
+  such a field, and it may not appear in a `RecordLit`. See
   [types.md](types.md#behaviors).
 - Where the `TypeExpr` names a **function type**, `unique`, `indexed`, and `WhereClause` are all
   rejected, because function types have no equality. A function literal in a `DefaultClause` or
@@ -179,7 +174,7 @@ Constraints not expressible in the grammar, enforced at compile time:
   See [functions.md](functions.md#functions-as-column-values).
 - `SeqAlloc` is admissible **only** in a `DefaultClause`, and only on a field named by the
   `UniqueDecl` its `Ident` refers to. `next` is an allocation, not a value: it is rejected in a
-  `WhereClause`, a `Behavior` definition, a projection, and a view. See
+  `WhereClause`, a `Behavior` definition, a projection, and a `Binding`. See
   [tables.md](tables.md#sequences).
 - A `SubTableBody` in a `DefaultClause` **constructs** the row, in the same transaction. This is
   what distinguishes `settings :> Settings : Component = { … }` from `created_by :> User =
@@ -192,11 +187,11 @@ is no production for naming it — see [README.md](README.md#addressing-validati
 
 ---
 
-## Tables, Views, Traits
+## Tables, bindings, traits
 
 ```ebnf
 TableDecl    ::= 'table' QName ( ':' TraitList )? '{' TableBody '}'
-ViewDecl     ::= 'view'  QName ( ':' TraitList )? '=' Query
+Binding      ::= Ident ( ':' TraitList )? Param* '=' Query
 TraitDecl    ::= 'trait' Ident ( ':' TraitList )? '{' TraitBody '}'
 
 TraitList    ::= QName ( ',' QName )*
@@ -205,6 +200,7 @@ TableBody    ::= ( BodyItem ( ',' BodyItem )* ','? )?
 TraitBody    ::= ( TraitItem ( ',' TraitItem )* ','? )?
 
 BodyItem     ::= FieldDecl
+               | '*'
                | UniqueDecl
                | AssertDecl
                | EventDecl
@@ -229,10 +225,19 @@ UiHint       ::= 'ui' '{' HintPair ( ',' HintPair )* ','? '}'
 HintPair     ::= Ident '=' Literal
 ```
 
+`Binding` names a query. It replaces `ViewDecl` and `AggregateDecl`, which named one each. A
+zero-parameter binding is a derived table; a binding with parameters is a template that a
+`RetainDecl` instantiates. `TableDecl` keeps its keyword because it declares storage and
+constraints, which a binding declares neither of. See
+[queries.md](queries.md#local-bindings).
+
+`'*'` as a `BodyItem` carries forward every field of the previous version of the table that the
+body does not mention. See [evolution.md](evolution.md#redeclare-a-table).
+
 A `WhereClause` is only ever a field validation attached to a `FieldDecl`. It was previously
-also a `BodyItem`, standing alone as a view-level row filter; a view is now a named `Query`
-and carries its filter there, so the standalone form is gone and with it the rule that
-position disambiguated the two.
+also a `BodyItem`, standing alone as a view-level row filter; a binding carries its filter in
+its `Query`, so the standalone form is gone and with it the rule that position disambiguated
+the two.
 
 `AssertDecl` covers both varieties of path-constraint functor. **The variety is decided by
 the body, not by the name**: an `AssertBody` that mentions `authed_user` is an access
@@ -291,15 +296,16 @@ Constraints not expressible in the grammar:
 - A `TableDecl` must declare a `UniqueDecl`, a `'unique'`-marked `FieldDecl`, or inherit one
   from a trait, unless it carries `LogData`, `Component`, or `Keyless`. See
   [tables.md](tables.md#candidate-keys-are-mandatory).
-- A `ViewDecl` has no body in which to declare one, which is the grammar enforcing the rule
-  rather than a check: a view's candidate key is derived from its sources and the operators
-  applied to them, never written. Every view has one — at worst all of its attributes — and
-  `:describe` reports it, marking the all-attributes case as degenerate. See
-  [queries.md](queries.md#view-keys-are-computed-never-declared).
-- A `ViewDecl`'s `assert`s are written standalone, since there is no body to hold them. A
-  view's field types come from its `Query`: a projected `FieldPath` keeps the source's type,
-  and a projected expression mints a computed type named by the view field's path. See
-  [queries.md](queries.md#view-field-types).
+- A `Binding` has no body in which to declare one, which is the grammar enforcing the rule
+  rather than a check: a derived key comes from the sources and the operators applied to them,
+  never written. Its asserts and uniqueness constraints are consequently standalone, and its
+  field types come from its `Query`. See
+  [queries.md](queries.md#keys-are-computed-never-declared).
+- A `Binding`'s `TraitList` overrides the replication trait it would otherwise inherit from its
+  sources; sources that disagree are an error.
+- `'*'` is admissible in a `TableBody` only where a previous version of the table exists. In a
+  body containing `'*'`, an omitted field is carried forward rather than deprecated; use
+  `DeprecateStmt` to drop one.
 - A `FieldPath` in a `UniqueDecl` may not name a field whose type is `Secret`, `Doc`,
   `Behavior`, a function type, or an alternation containing a `Null`-derived variant.
 
@@ -312,11 +318,9 @@ In the standalone forms the `QName` is `<table>.<constraint-name>`.
 
 ---
 
-## Aggregates and Retention
+## Retention
 
 ```ebnf
-AggregateDecl ::= 'aggregate' Ident '=' Source QueryClause*
-
 RetainDecl    ::= 'retain' QName ( 'as' QName )? ( 'using' FieldPath )? RetainBody
 RetainBody    ::= RetainBranch+ | Chain
 RetainBranch  ::= 'where' Expr Chain
@@ -330,9 +334,9 @@ GrainRef      ::= UpperIdent
 LengthLit     ::= NumLit Ident
 ```
 
-`AggregateDecl` binds a name to an ordinary query — source, optional `group`, projection with
-aggregate functions. It is a template, not a view: a view has one extent, while an aggregate is
-instantiated once per grain by the chain that names it.
+`RetainDecl`'s `as` names a **one-parameter `Binding`** whose parameter is a `Grain`. The chain
+applies it once per level, so the grain is an argument rather than an injected column. There is
+no `aggregate` keyword. See [aggregates.md](aggregates.md#a-rollup-is-a-parameterized-binding).
 
 `LengthLit` is a numeric literal juxtaposed with an identifier naming a `Duration` or `Period`
 constant (`7 day`, `6 hour`, `1 month`). It **desugars to multiplication** — `7 day` is
@@ -365,13 +369,14 @@ Constraints not expressible in the grammar:
 - The **last** `ChainStep` must be `forever` or `drop`. A chain that merely runs out is
   rejected, so discarding data is always something someone wrote.
 - `as` is required if the chain has more than one step, and forbidden if it has one. A chain
-  never reshapes; naming the aggregate once on the header is what makes a differing step
+  never reshapes; naming the binding once on the header is what makes a differing step
   unrepresentable rather than merely rejected.
-- An aggregate used in a chain of more than one step must declare an associative merge with an
-  identity. `count`, `sum`, `min`, and `max` do; `avg` is rewritten to `(sum, count)`
-  silently; `percentile` does not and is rejected past one step.
-- A `RetainBranch` predicate may reference only the aggregate's `group` fields and the time
-  source, so that no bucket can straddle two branches with different retentions.
+- The named `Binding` takes exactly one parameter, of type `Grain`.
+- Every aggregate function it applies must declare an associative merge with an identity if the
+  chain has more than one step. `count`, `sum`, `min`, and `max` do; `avg` is rewritten to
+  `(sum, count)` silently; `percentile` does not and is rejected past one step.
+- A `RetainBranch` predicate may reference only the binding's group keys and the time source, so
+  that no bucket can straddle two branches with different retentions.
 - At most one `otherwise`, and it comes last.
 
 See [aggregates.md](aggregates.md).
@@ -381,16 +386,11 @@ See [aggregates.md](aggregates.md).
 ## Schema Evolution
 
 ```ebnf
-EvolutionStmt   ::= DeprecateStmt | PruneStmt | SplitStmt | MergeStmt
+EvolutionStmt   ::= DeprecateStmt | PruneStmt
                   | ExtendStmt | ShrinkStmt | VisibilityStmt
 
 DeprecateStmt   ::= 'deprecate' QName
 PruneStmt       ::= 'prune' QName
-
-SplitStmt       ::= 'split' QName 'into' '{' SplitTarget ( ',' SplitTarget )* ','? '}'
-SplitTarget     ::= Ident '{' TableBody '}'
-
-MergeStmt       ::= 'merge' QName ( ',' QName )+ 'into' QName '{' TableBody '}'
 
 ExtendStmt      ::= 'extend' QName 'with' Variant
 ShrinkStmt      ::= 'shrink' QName 'removing' Variant 'migrate' '(' Expr ')'
@@ -399,7 +399,11 @@ VisibilityStmt  ::= 'set' 'visibility' NamePattern VisibilityLevel
 VisibilityLevel ::= 'system' | 'connector' | 'internal' | 'standard' | 'featured'
 ```
 
-`SplitStmt` and the CLI's `split shard` are disambiguated by the `shard` keyword.
+`SplitStmt` and `MergeStmt` are gone. A split is a set of `Binding`s projecting one source, and
+a merge is a `Binding` joining them — both are ordinary queries, so the derived-key rules check
+losslessness that the dedicated statements could only assert. `split` and `merge` stay reserved
+for `split shard` and `resolve conflict ... using merge`. See
+[evolution.md](evolution.md#split-and-merge-a-table).
 
 `PruneStmt` removes a **schema object** or an orphaned branch. It does not remove log rows:
 those are discarded only by a `retain` chain, and a `LogData` table with no chain is never
@@ -452,7 +456,7 @@ and for the rule that adding a predicate to a populated field requires stating o
 FunctionDecl ::= Ident Param* '=' Expr
 Param        ::= Ident
 
-Expr         ::= OrExpr ( '$' Expr )?
+Expr         ::= OrExpr ( '$' ( Expr | Query ) )?
 OrExpr       ::= AndExpr ( '||' AndExpr )*
 AndExpr      ::= NotExpr ( '&&' NotExpr )*
 NotExpr      ::= 'not' '$' Expr
@@ -523,9 +527,17 @@ The compiled-pattern cache therefore keys on the `Configuration` row's version. 
 engine, so a pathological pattern costs no more than a linear scan — the restriction exists to
 keep patterns out of untrusted hands, not to bound backtracking.
 
-**A parenthesized `Atom` is a `Query` if it contains a `QueryClause`** and an `Expr`
-otherwise. The two cannot both apply: an `Expr` has no production admitting `where`, `><`,
-`group`, `order by`, `at`, `limit`, or a bare `Projection` at that position.
+**A right-hand side is a `Query` if it contains a `QueryClause`** and an `Expr` otherwise. The
+two cannot both apply: an `Expr` has no production admitting `where`, `><`, `group`,
+`order by`, `at`, `limit`, or a bare `Projection` at that position. The rule applies in three
+places — inside parentheses, on the right of `$`, and on the right of a `Binding`'s `=`:
+
+```
+count (Orders group { customer })
+count $ Orders group { customer }
+ActiveOrder = Order where status is Active     -- Query
+taxRate     = 0.07                             -- Expr
+```
 
 **Backtick infix.** Any named function may be written infix by enclosing it in backticks, as
 in Haskell, with Haskell's default fixity for the form: `infixl 9`, tighter than every
@@ -593,18 +605,18 @@ QueryClause  ::= JoinClause
                | AtClause
                | LimitClause
 
-JoinClause   ::= '><' JoinSource ( 'via' FieldPath )? ( 'as' Ident )?
+JoinClause   ::= '><' JoinSource ( 'via' QName )? ( 'as' Ident )?
 JoinSource   ::= TypeExpr
                | '(' Query ')' ( '|' TypeExpr )*
-GroupClause  ::= 'group' FieldPath
+GroupClause  ::= 'group' Projection
 AtClause     ::= 'at' StringLit
 LimitClause  ::= 'limit' NumLit
 
 Projection   ::= '{' ProjItem ( ',' ProjItem )* '}'
-ProjItem     ::= FieldPath Aggregate? ( 'as' Ident )?
-               | Expr 'as' Ident
+ProjItem     ::= FieldPath NameClause?
+               | Expr NameClause
                | ( QName '.' )? '*'
-Aggregate    ::= 'sum' | 'count' | 'min' | 'max' | 'avg'
+NameClause   ::= 'as' Ident ( ':' TraitList )? ( 'via' Ident )?
 
 LetBinding   ::= 'let' Ident '=' Query
 
@@ -619,38 +631,40 @@ remains readable at every earlier sample moment — see
 [queries.md](queries.md#delete-appends-a-version) for why the `delete!` variant was withdrawn.
 
 `JoinClause`'s `JoinSource` is a `TypeExpr` so that outer joins are written with the same `|`
-alternation as a nullable `:>` field: `Order >< Customer | MissingCustomer`. The parenthesized
-`Query` alternative exists for one purpose: **an outer-joined source must carry its own filter
-inside the join term.**
+alternation as a nullable `:>` field. The parenthesized `Query` alternative exists so that an
+outer-joined source can carry its own filter inside the join term, which is mandatory. See
+[queries.md](queries.md#filter-before-guard).
 
-```
--- WRONG: an account whose every suspension is lifted yields zero rows, not a
--- NoSuspension row, so an absence test on this reports the opposite of the truth
-Account >< Suspension | NoSuspension where lifted is NotLifted
+`GroupClause` takes a `Projection`, whose items are the group keys. Every column they do not
+mention collapses into a generated table-valued column named `rows`, which the following
+`Projection` shapes and aggregates. See [queries.md](queries.md#grouping).
 
--- RIGHT: filter before the guard
-Account >< (Suspension where lifted is NotLifted) | NoSuspension as suspension
-```
+`NameClause` covers three jobs at once, because all three name the same thing:
 
-A `WhereClause` at the outer level that references a field of an outer-joined source is
-consequently a **compile-time error**, and the diagnostic names the parenthesized form as the
-fix. This is SQL's `ON`-versus-`WHERE` trap, which is worth closing structurally here because
-the same expression appears inside `assert`, where the symptom is not missing rows but an
-inverted constraint.
+| Part | Applies to | Effect |
+|---|---|---|
+| `as Ident` | any `ProjItem` | Names the column |
+| `: TraitList` | a table-valued column | Overrides its inherited traits |
+| `via Ident` | a table-valued column | Names its FK back to the containing row |
 
-`JoinClause`'s `as` names the joined source in the result. It is **mandatory when a source
-joined against the reference direction is named anywhere in the query** — in a `where`, a
-`Projection`, or a variant test. Joining `Account` to the `Suspension` rows that reference it
-produces a column with no `:>` field to name it, and falling back to the bare table name
-would read as though the table itself were the value. A reverse join whose source is never
-named needs no `as`; in the forward direction the `:>` field already names the column and `as`
-is always optional.
+There is no `Aggregate` production. Aggregate functions are ordinary functions applied to a
+table-valued column (`count rows`, `sum rows.bytes_sent`), so a user-defined one is admissible
+wherever the built-in ones are, and `sum`, `count`, `min`, `max`, and `avg` are not reserved.
 
-`ProjItem`'s three forms: a bare `FieldPath` keeps the source field's name and type; an `Expr`
-requires `as`, since a computed column has no name to inherit; and `*` copies every field of
-its source, qualified (`User.*`) to pick one side of a join. `*` binds at query time, so new
-source fields appear automatically, while a named field binds stably — see
-[queries.md](queries.md#the--selector-and-field-propagation).
+Constraints not expressible in the grammar:
+
+- `via` in a `JoinClause` resolves to a declared `:>` field, or to a `Null`-derived **type**,
+  which means the join has no condition. `A >< B` where no `:>` edge connects the two is a
+  compile-time error naming both fixes. See [queries.md](queries.md#cross-products).
+- `JoinClause`'s `as` is **mandatory when a source joined against the reference direction is
+  named anywhere in the query** — in a `where`, a `Projection`, or a variant test. Such a column
+  has no `:>` field to name it, and the bare table name would read as though the table were the
+  value. In the forward direction `as` is always optional.
+- A `ProjItem` naming a source field removes that field from any `*` in the same `Projection`.
+  This is what makes `{ *, status as account_status }` a rename. See
+  [queries.md](queries.md#the--selector).
+- `: TraitList` and `via` are admissible only where the item is table-valued.
+- A group key named `rows` is rejected.
 
 `AtClause`'s `StringLit` is a version token (graph node hash prefix, tag, or branch name) or
 an ISO-8601 moment; the two are told apart at resolution, not by the grammar. Where it is
@@ -779,6 +793,7 @@ GrantCmd     ::= 'show' 'grants' ( 'for' QName )?
                | 'revoke' 'grant' QName 'on' QName
 
 MatViewCmd   ::= 'show' 'materialized' 'views' ( 'shard' QName )?
+               | 'materialize' QName
                | 'refresh' 'view' QName ( 'at' StringLit )?
                | 'drop' 'materialized' 'view' QName
 
@@ -817,23 +832,29 @@ DrCmd        ::= 'force' 'elect' 'primary' Host 'for' 'shard' QName
 ## Reserved Words
 
 ```
-acknowledge  add    aggregate always    as        assert    asc       at
-avg       by        bypass    connector conflict  count     DataCode  deep
-delete    demote    deprecate describe  desc      drop      elect     elevate
-else      emit      enforce   every     export    extend    External  False
-flag      for       force     forever   forward   from      grant     grants
-group     handler   if        import    in        indexed   into      is
-issue     key       lag       let       limit     materialized        max
-merge     migrate   min       monitor   next      not       on        order
-otherwise pause
-primary   prune     refresh   removing  repair    replay    replication
-resolve   resume    retain    revoke    scoped    secondary seq       servers
-set       shard     shards    show      shrink    since     split     sum
-sync      table     tertiary  then      to        token     tokens
-transaction  transactions     trait     True      type      ui        unique
-using     verify    via       view      views     violations  visibility
+acknowledge  add    always    as        assert    asc       at        by
+bypass    connector conflict  DataCode  deep      delete    demote    deprecate
+describe  desc      drop      elect     elevate   else      emit      enforce
+every     export    extend    External  False     flag      for       force
+forever   forward   from      grant     grants    group     handler   if
+import    in        indexed   into      is        issue     key       lag
+let       limit     materialize         materialized        merge     migrate
+monitor   next      not       on        order     otherwise pause     primary
+prune     refresh   removing  repair    replay    replication         resolve
+resume    retain    revoke    scoped    secondary seq       servers   set
+shard     shards    show      shrink    since     split     sync      table
+tertiary  then      to        token     tokens    transaction
+transactions        trait     True      type      ui        unique    using
+verify    via       view      views     violations          visibility
 waive     where     with
 ```
+
+**Six words were unreserved** when aggregate functions became ordinary functions: `aggregate`,
+`sum`, `count`, `min`, `max`, and `avg`. `aggregate` now names a *concept* — any function from a
+table to a scalar — rather than a declaration, and the other five are library functions like any
+other. `view` survives only in `refresh view` and `drop materialized view`; there is no `view`
+declaration. `split` and `merge` survive only in `split shard` and `resolve conflict ... using
+merge`.
 
 ### Contextual Bindings
 
@@ -910,8 +931,11 @@ Words considered and **not** reserved for these:
   the uniqueness it serves, so `next <UniqueName>` reads the scope off a declaration that
   already exists rather than restating it.
 
-`aggregate`, `retain`, `forever`, and `otherwise` are the four added for retention.
-`otherwise` is Haskell's guard fall-through and is used here for exactly that.
+`retain`, `forever`, and `otherwise` are the three words retention added. `otherwise` is
+Haskell's guard fall-through and is used here for exactly that. `materialize` is an admin
+command, not schema syntax, for the reason `retain` and `enforce` are separate statements: it
+is operational policy that changes over time and is not the schema author's decision. See
+[../storage.md](../storage.md#materialization).
 
 Unit names (`day`, `hour`, `week`, `month`, `year`, …) are **not** reserved. They are ordinary
 identifiers bound to `Duration` and `Period` constants in the standard library, which is what

@@ -47,7 +47,7 @@ Namespaces are:
 │
 └── app/                 -- application-defined namespaces (user-managed)
     ├── commerce/
-    │   ├── Order        -- may be a view over connectors.mariadb.production.Order
+    │   ├── Order        -- may be derived from connectors.mariadb.production.Order
     │   └── Customer
     └── reporting/
 ```
@@ -86,21 +86,21 @@ Auto-generated schemas from connectors are placed under `connectors.<type>.<inst
 These namespaces are:
 - **Automatically managed** — updated when the external schema changes
 - **Hidden by default** in the IDE (see ide.md)
-- **Referenceable** in user-defined namespaces via views:
+- **Referenceable** in user-defined namespaces by binding a query:
   ```
-  -- app.commerce.Order is a refined view of the connector shadow schema
-  view app.commerce.Order = connectors.mariadb.production.Order
+  -- app.commerce.Order refines the connector shadow schema
+  app.commerce.Order = connectors.mariadb.production.Order
     { customer
     , total_cents / 100     as total
     , toOrderStatus (status) as status
     }
   ```
-  Each coercion is a named function in the projection, and each mints the view field's type —
-  see [schema/queries.md](schema/queries.md#view-field-types).
+  Each coercion is a named function in the projection, and each mints the field's type — see
+  [schema/queries.md](schema/queries.md#field-types).
 
 ## Schema Visibility Layers
 
-Every table, view, and functor in DataCode has a **visibility level**:
+Every table and functor in DataCode has a **visibility level**:
 
 | Level | Meaning | Default shown in IDE? |
 |---|---|---|

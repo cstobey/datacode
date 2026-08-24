@@ -367,7 +367,7 @@ table app.commerce.OrderStatus : Reference, Extensible {
 
 When a connector meets a code value an `Extensible` table does not have, it issues the schema
 transaction extending the table — the same operation as
-[`extend`](evolution.md#adt-extension), performed automatically — and records which connector
+[`extend`](evolution.md#extend-and-shrink-an-adt), performed automatically — and records which connector
 and token did it. Without the trait, the unknown value is recorded as a violation instead.
 Both land in the same review queue; see [../integrity.md](../integrity.md).
 

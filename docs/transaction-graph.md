@@ -281,7 +281,7 @@ align, and because a low-volume server should not accumulate a million near-empt
 
 `branch` is the index of the matching `retain` branch, or `0` where the table has no `retain`
 statement or an unbranched one. It belongs in the key because branch predicates may reference
-only group fields and the time source
+only the rollup's group keys and the time source
 ([schema/aggregates.md](schema/aggregates.md#branches)), so the branch is decidable when the
 row is written. Without it a segment could hold rows with two different expiries and would not
 be prunable as a unit.

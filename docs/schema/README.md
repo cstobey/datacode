@@ -12,9 +12,9 @@ than restating it.
 | [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
 | [constraints.md](constraints.md) | `assert`, path constraints, presence and absence, access control |
 | [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill |
-| [aggregates.md](aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
-| [evolution.md](evolution.md) | Redeclaration, rename, deprecate, prune, split, merge, ADT extension, visibility |
-| [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, views, mutation |
+| [aggregates.md](aggregates.md) | Aggregate functions, mergeable aggregates, `retain` chains, log retention |
+| [evolution.md](evolution.md) | Redeclaration, rename, retype, deprecate, prune, split, merge, ADT extension, visibility |
+| [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, derived tables, mutation |
 | [functions.md](functions.md) | Scope, the effect ladder, Haskell functions, auto-wrapping, function types, function-valued columns |
 | [functors.md](functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [templates.md](templates.md) | Text with holes, cardinality as control flow, `using` and render functions |
@@ -32,7 +32,7 @@ DataCode schemas are closer to TutorialD than SQL. The core shift:
 
 - A **table** is a named collection of typed tuples (no row ordering, no implicit keys unless declared)
 - A **field** has a precise type with associated validation functors
-- A **query/view** is indistinguishable from a table definition — both are views over the transaction graph
+- A **query** is indistinguishable from a table definition. Both denote tables over the transaction graph, and there is no separate schema object called a view.
 - There is **no NULL** — absent values are expressed as typed ADTs with meaningful names
 - Tables are organized in a **namespace tree** — namespaces replace the SQL "database" concept
 - **Traits** provide abstract base types for tables, encoding replication policy, shared fields, and shared functions
@@ -75,7 +75,7 @@ creation syntax. Full namespace documentation: [../namespaces.md](../namespaces.
 DataCode maintains multiple layers of schema simultaneously:
 
 1. **Auto-generated connector shadow schemas** (`connectors.*`): created when a connector is added; updated automatically as the external schema changes; hidden from the default IDE view
-2. **User-defined application schemas** (`app.*`): created by schema authors; may be views or extensions over connector schemas; visible by default
+2. **User-defined application schemas** (`app.*`): created by schema authors; may be derived from or extend connector schemas; visible by default
 3. **System schemas** (`system.*`): DataCode internals; visible only to admin tokens
 
 This layering enables data independence: the human-understood schema (`app.*`) can evolve
@@ -94,7 +94,7 @@ Follows Haskell: the things that name a *kind* are capitalized, the things that 
 
 | Kind of name | Form | Examples |
 |---|---|---|
-| Type, trait, table, view | `UpperCamelCase`, **singular** | `Email`, `Amount`, `Active`, `UserData`, `Order`, `Customer` |
+| Type, trait, table, derived table | `UpperCamelCase`, **singular** | `Email`, `Amount`, `Active`, `UserData`, `Order`, `Customer` |
 | Sum-type variant | `UpperCamelCase` | `Shipped`, `NotGiven`, `Argon2id` |
 | Field | `lower_snake_case` | `order_num`, `placed_at`, `billing_address` |
 | Function, predicate, constraint name | `lowerCamelCase` | `isValidEmail`, `matches`, `orderRef`, `billingMatch` |
@@ -123,7 +123,7 @@ on syntactic position:
 | `trait T : R` | `:` | a trait |
 | `table T : R, S` | `:` | traits |
 | field declaration | `:` | a type — no alternative may be a table |
-| field declaration | `:>` | a table or view (see the head rule below) |
+| field declaration | `:>` | a table or derived table (see the head rule below) |
 
 `:>` is meaningful only in field position. Using `:` where the right-hand side names a
 table, or `:>` where it names a type, is a compile-time error:
@@ -160,7 +160,7 @@ No second `Null` root is needed — absence types are admissible in the tail of 
 Field declarations take up to five trailing clauses, in this order:
 
 ```
-field ( ":" | ":>" ) Type [ rename from Old | from Source ] [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
+field ( ":" | ":>" ) Type [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
 ```
 
 `where` is last because it is the only clause with an open-ended expression on its right.
@@ -228,7 +228,7 @@ from two traits carries both traits' predicates (see [traits.md](traits.md)).
 
 Comments are `--` to end of line.
 
-**Inside a body** (`table`, `view`, `trait`), field declarations are separated by `,` and
+**Inside a body** (`table`, `trait`), field declarations are separated by `,` and
 the body is closed by `}`. The separator may sit at the end of a declaration or at the start
 of the next — leading-comma style keeps a block `where` readable, and is the recommended
 style whenever any field in the body has one. A comma before the closing `}` is permitted:
@@ -244,7 +244,7 @@ table app.commerce.Customer {
 }
 ```
 
-**At top level** (`type`, `trait`, `table`, `view`, function definitions), there is no
+**At top level** (`type`, `trait`, `table`, bindings, function definitions), there is no
 enclosing bracket and no separator. A declaration ends where the next one begins: at the
 next token in column 0. Blank lines are formatting, not syntax.
 

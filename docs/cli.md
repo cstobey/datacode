@@ -118,9 +118,9 @@ describe shard user.commerce
 split shard user.commerce at key "customer_id > uuid-..."
 ```
 
-Note the `shard` keyword: `split shard <name> at key ...` is a physical operation, distinct
-from the schema-level `split <table> into { ... }` in
-[schema/evolution.md](schema/evolution.md).
+Note the `shard` keyword. `split shard <name> at key ...` is a physical operation. Splitting a
+*table* is a set of bindings and has no dedicated statement — see
+[schema/evolution.md](schema/evolution.md#split-and-merge-a-table).
 
 `describe shard` reports the shard's extents and, for a `LogData` shard, the
 `system.shards.LogSegment` row that roots it. Splitting is not uniformly manual: an extent
@@ -183,9 +183,14 @@ constraints still run. See [namespaces.md](namespaces.md#bypass).
 
 ```
 show materialized views shard user.commerce
+materialize app.reporting.MonthlySummary
 refresh view app.reporting.MonthlySummary at "schema-txn-abc123"
 drop materialized view app.reporting.MonthlySummary
 ```
+
+The system proposes and maintains materialized views on its own, from observed query load. These
+commands inspect and override that. `materialize` pins one that the system has not chosen; `drop`
+removes one it has. See [storage.md](storage.md#materialization).
 
 ### Transaction Log Inspection
 

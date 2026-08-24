@@ -98,7 +98,7 @@ renders the opposite of what it says.
 
 ## Formatting Needs No Filters
 
-A projected expression already mints a type ([queries.md](queries.md#view-field-types)), so a
+A projected expression already mints a type ([queries.md](queries.md#field-types)), so a
 hole may project one:
 
 ```

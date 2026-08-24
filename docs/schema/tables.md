@@ -51,13 +51,17 @@ others it costs no bytes — it is constant for the whole table — and like the
 so `RequestRollup where grain == Hour` selects one level. See
 [aggregates.md](aggregates.md#grain-is-a-virtual-column).
 
+Redeclaring a table diffs it against the previous version. Write `*` in the body to carry
+forward every field the new body does not mention. See
+[evolution.md](evolution.md#redeclare-a-table).
+
 ## Field Declarations
 
 A field declaration is a name, a type token, a type, and up to five trailing clauses in a
 fixed order:
 
 ```
-field ( ":" | ":>" ) Type [ rename from Old | from Source ] [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
+field ( ":" | ":>" ) Type [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
 ```
 
 ```
@@ -267,11 +271,11 @@ Three consequences:
   prefix reaches the shard root warns about nothing, because it costs nothing.
 - **Gaps are guaranteed.** An aborted transaction burns a value. Nobody gets gapless sequences
   without serializing every insert, and where the number is externally meaningful — invoice
-  numbers an auditor will read — gapless is a *reporting* requirement satisfied by a view over
+  numbers an auditor will read — gapless is a *reporting* requirement satisfied by a query over
   the log, not by the allocator.
 - **`next` is an allocation, not a value.** It is admissible only in a `DefaultClause`, only on
   a field the named `unique` includes, and is rejected in a `where`, a `Behavior` definition, a
-  projection, and a view.
+  projection, and a binding.
 
 Counter storage is one row per (constraint, prefix value), sharded by the prefix — the same
 sharding rule as everything else. Layout numbers are open with the other sharding numbers in
@@ -330,7 +334,7 @@ table app.commerce.Order {
 }
 ```
 
-`:>` is required whenever the head of the type expression names a table or view. Writing
+`:>` is required whenever the head of the type expression names a table or derived table. Writing
 `customer : Customer` is a compile-time error, as is `email :> Email` where `Email` is a
 type.
 
@@ -461,7 +465,7 @@ direction. Non-`Component` foreign keys never cascade.
 
 A cross-table in-commit trigger to a **non**-`Component` table is refused. If a row must exist
 atomically with another and has independent identity and lifetime, that is a modelling error —
-make it a component, or make it a view. See
+make it a component, or derive it. See
 [../events.md](../events.md#internal-effects-are-derived-not-triggered).
 
 ## Constraints and Access Control

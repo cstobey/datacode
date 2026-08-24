@@ -35,7 +35,7 @@ appears in a DataCode signature.
 | Effect | May do | Admissible in |
 |---|---|---|
 | `Pure a` | nothing but compute | anywhere |
-| `Read a` | query at the transaction's sample moment | validation, `assert`, `Behavior`, view, template, render function, `every` interval |
+| `Read a` | query at the transaction's sample moment | validation, `assert`, `Behavior`, binding, template, render function, `every` interval |
 | `Tx a` | query, and mutate within the current transaction | field default, internal derivation, API functor |
 | `Effect a` | external calls, with capabilities granted by configuration | **handler position only** |
 
@@ -227,7 +227,7 @@ So: **code by schema, selection-among-code by data.**
 
 All but the last follow from one fact — **function types have no equality**:
 
-- Rejected in `unique`, `order by`, `group by`, and `==`. Comparing functions would mean
+- Rejected in `unique`, `order by`, `group`, and `==`. Comparing functions would mean
   comparing source, under which alpha-equivalent functions differ and equivalent ones do not
   compare equal.
 - Rejected in a candidate key, alongside `Secret`, `Doc`, and `Behavior`.

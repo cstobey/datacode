@@ -39,7 +39,7 @@ type Zip    : Text    where \z -> length z == 5
 ```
 
 `where` restricts a type to the subset of its parent satisfying a predicate — the same
-meaning it carries in queries and views, applied at the type level instead of the row
+meaning it carries in queries, applied at the type level instead of the row
 level. `type Email : Text where isValidEmail` reads as "the `Text`s where `isValidEmail`".
 
 One `where` per declaration. Several predicates go in an indented block beneath it and are

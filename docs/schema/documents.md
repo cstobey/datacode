@@ -210,7 +210,7 @@ have one, for reasons already settled elsewhere in the language:
   anonymous table has no path, so nothing in it can be validated, reported on, or diffed.
 - **The ER diagram has no node for it**, so a significant part of the schema becomes
   invisible to the IDE.
-- **Evolution cannot name it.** `rename from`, `deprecate`, and `prune` all take a path.
+- **Evolution cannot name it.** A rename projection, `deprecate`, and `prune` all take a path.
 - [tables.md](tables.md#inline-sub-tables) already establishes that an inline sub-table is
   sugar for a *named* sibling, precisely so that "there is no embedded product-in-row" stays
   true.

@@ -1,6 +1,19 @@
-# Queries, Views, and Mutation
+# Queries, derived tables, and mutation
 
-## Filter, Projection, Alias
+A query is an expression that denotes a table. A `table` declaration declares stored structure
+and constraints. A binding names a query. All three denote the same kind of thing, so there is
+no separate schema object called a view:
+
+```
+table app.commerce.Order : UserData { ... }        -- declares storage and constraints
+ActiveOrder = Order where status is Active         -- names a query
+```
+
+The difference between them is whether anything is stored and whether constraints are
+declared — not what kind of value they are. Whether a derived table is *maintained* as stored
+rows is a storage decision made separately; see [../storage.md](../storage.md#materialization).
+
+## Filter, projection, alias
 
 ```
 Order >< Customer
@@ -8,135 +21,297 @@ Order >< Customer
   { customer.name as name, total as order_total, applyTax (total) as with_tax }
 ```
 
-- `where` — row filter
-- `{ field, ... }` — projection (bare braces, no `select` keyword)
-- `as` — alias
+- `where` filters rows.
+- `{ field, ... }` projects. There is no `select` keyword.
+- `as` renames.
 
-A projection item is a field path, an expression, or a `*`. An expression **requires** `as`,
-since a computed column has no name to inherit; a bare path keeps the source field's name and
-type. A `*` copies every field of its source and is qualified (`User.*`) to pick one side of a
-join. What an expression does to a *view*'s field type is
-[View Field Types](#view-field-types).
+A projection item is a field path, an expression, or `*`. A bare path keeps the source field's
+name and type. An expression **requires** `as`, because a computed column has no name to
+inherit. For what an expression does to a derived table's field type, see
+[Field types](#field-types).
 
-Field references: `TableName.field_name` or `alias.field_name`. Table aliases are
-encouraged when the full namespace path is in the name.
+Reference fields as `TableName.field_name` or `alias.field_name`. Use a table alias when the
+full namespace path is in the name.
 
-`where` here is the row-level form of the same operator used at the type level in
-declarations (see [types.md](types.md)) — in both cases it restricts to the subset
-satisfying a predicate.
+`where` here is the row-level form of the operator used at type level in declarations (see
+[types.md](types.md)). Both restrict to the subset satisfying a predicate.
 
-## Join Operator
+## The `*` selector
 
-`><` (bowtie) is the natural join operator. It joins on matching FK columns by default —
-that is, along the edges created by `:>` field declarations.
+`*` expands to every field of its source that no other item in the projection mentions.
+Qualify it (`User.*`) to pick one side of a join.
 
 ```
--- Natural join: uses the FK between Order and Customer
+-- Bulk copy
+OrderSummary = connectors.mariadb.production.Order { * }
+
+-- Recompute one field, carry the rest
+Order = connectors.mariadb.production.Order { *, toOrderStatus (status) as status }
+
+-- Rename one field, carry the rest
+Customer = Customer { *, status as account_status }
+```
+
+**Naming a source field anywhere in the projection removes it from `*`.** That is what makes
+the third line a rename rather than a copy: `status` is mentioned, so `*` skips it, and the
+only surviving column is `account_status`. The second line reads the same way — `status` is
+mentioned and re-added under its own name, so the coercion replaces the column instead of
+duplicating it.
+
+To keep both the original and a renamed copy, mention the field twice:
+
+```
+{ Order.*, Customer.name, Customer.name as buyer }
+```
+
+`*` binds to the source schema at query time, so new source fields appear automatically. Named
+fields bind stably.
+
+The same rule applies to `*` in a `table` body, where it carries forward the previous version
+of the table. See [evolution.md](evolution.md#redeclare-a-table).
+
+## Join operator
+
+`><` is the natural join. By default it joins along the edges that `:>` field declarations
+create.
+
+```
+-- Uses the FK between Order and Customer
 Order >< Customer
 
--- Explicit FK path: required when multiple FKs exist between two tables
+-- Names the edge, required when several FKs connect the two tables
 Order >< Customer via customer
 ```
 
-## Outer Joins
+### Outer joins
 
-Outer joins use guard semantics: the right side of `><` is a sum type written with `|`. The
-system tries each type left-to-right; the first that produces a matching row wins.
-`Null`-derived types always match and serve as the catch-all.
+Outer joins use guard semantics. Write the right side as an alternation. The system tries each
+type left to right, and the first that produces a matching row wins. `Null`-derived types
+always match, so they serve as the catch-all.
 
 ```
 type MissingCustomer : Null
 
--- Left outer join equivalent
-Order >< Customer | MissingCustomer
-
--- Chained fallback: try Customer, then HistoricalCustomer, then catch-all
-Order >< Customer | HistoricalCustomer | MissingCustomer
+Order >< Customer | MissingCustomer                          -- left outer join
+Order >< Customer | HistoricalCustomer | MissingCustomer     -- chained fallback
 ```
 
-The result row's customer field has type `Customer | MissingCustomer` — a sum type. Pattern
-matching and functor targeting can address each variant. `MissingCustomer` carries no
-fields; the absence IS the value.
+The result's `customer` field has type `Customer | MissingCustomer`. Pattern matching and
+functor targeting address each variant. `MissingCustomer` carries no fields; the absence is the
+value.
 
-This is the same left-to-right guard rule that governs a nullable `:>` field declaration,
-so the two read identically:
+This is the guard rule that governs a nullable `:>` declaration, so the two read identically:
 
 ```
 customer :> Customer | MissingCustomer      -- declaration
 Order    >< Customer | MissingCustomer      -- query
 ```
 
-A field declared with a fallback chain is joined with no `|` needed at the query site — the
-declaration already carries it.
+A field declared with a fallback chain needs no `|` at the query site. The declaration already
+carries it.
 
-### Joining Against the Reference Direction
+### Cross products
 
-A join may run either way along a `:>` edge. Going backwards — from `Account` to the
-`Suspension` rows that reference it — the result column has no `:>` field to name it, so `as`
-is **mandatory** whenever the query names that source at all:
+A `via` clause naming a `Null`-derived type says the join has no condition:
+
+```
+type Unrelated : Null
+
+Order >< Promotion via Unrelated
+```
+
+`via` names the join edge, so a typed absence there says the edge is absent and records why in
+the type name the author chose. This is the discipline the language already applies to absent
+values, one position over.
+
+`A >< B` where no `:>` edge connects the two is a compile-time error, and the diagnostic names
+`via` and a `Null`-derived type as the fix. An accidental cross product across a distributed
+database is expensive enough to be worth making unwritable.
+
+Cross products compose with outer joins unchanged. `A >< B | NoB via Unrelated` still yields
+`NoB` when `B` is empty, because `Null`-derived types always match.
+
+### Joining against the reference direction
+
+A join runs either way along a `:>` edge. Going backwards — from `Account` to the `Suspension`
+rows that reference it — the result column has no `:>` field to name it, so `as` is
+**mandatory** whenever the query names that source:
 
 ```
 Account >< Suspension as suspension { name, suspension.opened_at }
 ```
 
-Falling back to the bare table name would read as though the table itself were the value.
-A reverse join whose source is never named needs no `as`, which is the common case inside an
+Falling back to the bare table name would read as though the table itself were the value. A
+reverse join whose source is never named needs no `as`, which is the common case inside an
 `assert`.
 
-### Filter Before Guard
+### Filter before guard
 
-**A filter on an outer-joined source belongs inside the join term.**
+**Put a filter on an outer-joined source inside the join term.**
 
 ```
--- WRONG: an account whose every suspension is lifted yields zero rows, not a
--- NoSuspension row — the filter deleted the very rows the guard produced
+-- Wrong: an account whose every suspension is lifted yields zero rows, not a
+-- NoSuspension row. The filter deleted the rows the guard produced.
 Account >< Suspension | NoSuspension as suspension where lifted is NotLifted
 
--- RIGHT
+-- Right
 Account >< (Suspension where lifted is NotLifted) | NoSuspension as suspension
 ```
 
 An outer-level `where` naming a field of an outer-joined source is a compile-time error, and
-the diagnostic names the parenthesized form as the fix. This is SQL's `ON`-versus-`WHERE`
-trap. It is closed structurally rather than documented as a caution because the same
-expression appears inside `assert`, where the symptom is not missing rows but a constraint
-asserting the opposite of what it reads as — see
+the diagnostic names the parenthesized form as the fix. This is SQL's `ON`-versus-`WHERE` trap.
+It is closed structurally because the same expression appears inside `assert`, where the
+symptom is not missing rows but a constraint asserting the opposite of what it reads as. See
 [constraints.md](constraints.md#absence).
 
 ## Grouping
 
-`group` puts the grouped field on the left; all other fields collapse into a nested table
-field. Aggregate functions operate on that nested table.
+`group` takes a table on the left and a projection on the right, and returns a table. The
+projection declares the group keys. Every column the keys do not mention collapses into a
+generated table-valued column named `rows`.
 
 ```
-Order
-  group customer
-  { customer, orders.total sum as total_spend }
--- Result: { customer: DataId, total_spend: Amount }
--- The intermediate orders nested table is computed then projected away
+Order group { customer }
+-- Result: { customer, rows }, where rows holds that customer's orders
 ```
+
+Because the right side is an ordinary projection, group keys can be renamed and computed:
+
+```
+Order group { monthOf placed_at as month, customer as buyer }
+```
+
+Follow the `group` with a projection to shape the result and to apply aggregate functions to
+`rows`:
+
+```
+Order group { customer } { customer, count rows as num_orders }
+```
+
+Group keys are one column each and `rows` holds the rest, so nothing is discarded and there is
+exactly one output row per distinct key value. Chain `group` clauses to nest further.
+
+A group key named `rows` is a compile-time error. Residual columns named `rows` cannot collide,
+because they sit inside `rows`.
+
+### Grouping by a whole table
+
+`group { c.* }` groups by every column of `c`:
+
+```
+Order >< Customer as c group { c.* }
+-- Result: each Customer, plus a rows column holding that customer's orders
+```
+
+The optimizer rewrites this to a group on `Customer`'s candidate key, and from there to
+`DataId`. What licenses the rewrite is the key, not the identifier: grouping by every column
+merges two distinct rows that happen to be field-identical, and grouping by a key does not.
+They coincide only because `Customer` declares a candidate key that `c.*` contains. On a
+`Keyless` or `LogData` source the reduction is unavailable and the rewrite is unsound.
+
+`Order.customer` lands in `rows`, where it is the FK back to the group row. That is the link
+the nested table needs, so it costs no extra bytes.
+
+### Naming the nested table
+
+Rename `rows` in the following projection. Give it traits with `:` and name its FK with `via`:
+
+```
+Sales group { product_sku, product_name }
+  { product_sku, product_name, rows as Sale : UserData via product }
+```
+
+| Clause | Effect |
+|---|---|
+| `as Sale` | Names the nested table |
+| `: UserData` | Overrides the trait it would otherwise inherit from its source |
+| `via product` | Names the FK back to the group row |
+
+Defaults: the nested table carries `Component`, and its FK is named after the group row's table
+in `lower_snake_case`. `via` is needed only when that name collides or when you want a
+different one.
+
+**The trait decides whether the nested table is a column or a sibling.** A `Component` nested
+table is a column, addressed as a path (`Agg.LinkedTable`), identified by `Ordinal`, and
+destroyed with its parent — the same construct as an inline component sub-table
+([tables.md](tables.md#component-sub-tables)). Elevating it out of `Component` gives its rows
+their own `DataId` and shard placement, makes the parent link a real `:>` field costing real
+bytes, stops `deprecate` from cascading, and makes the name a top-level table rather than a
+path. `:describe` reports which.
+
+Elevation is what an ETL split needs, because the extracted rows outlive the row they were
+grouped under:
+
+```
+Product : Reference = DenormalizedSales
+  group { product_sku, product_name }
+        { product_sku, product_name, rows as Sale : UserData via product }
+```
+
+## Aggregate functions
+
+An aggregate function takes a table and returns a scalar. Apply it like any other function:
+
+```
+count Orders                                      -- rows in the table
+Orders group { customer } { customer, count rows as num_orders }
+count $ Orders group { customer }                 -- customers that have orders
+```
+
+There is no special position and no fixed list. `count`, `sum`, `min`, `max`, and `avg` are
+ordinary functions, and a user-defined one is admissible wherever they are. A retention chain
+imposes the one extra requirement, that the function declare an associative merge with an
+identity; see [aggregates.md](aggregates.md#aggregates-in-a-chain-must-merge).
+
+**A path through a table-valued column distributes to a column.** `rows.bytes_sent` has type
+`Table Amount`, which is what lets a prefix aggregate take it without parentheses:
+
+```
+{ status, count rows as requests, sum rows.bytes_sent as bytes, max rows.duration as slowest }
+```
+
+Signatures follow from that: `count :: Table a -> Int`, `sum :: Table Number -> Number`.
+
+`group` is not required. `count Orders` reads the whole table, and the result is a scalar rather
+than a one-row table.
 
 ## Ordering
 
 ```
--- Per-query ordering (overrides the table default from `order by` in the table body)
+-- Overrides the table default set by `order by` in the table body
 Order
   where total > 100
   order by total desc
   { customer, total }
 ```
 
-## Local Bindings
+## Local bindings
 
 ```
 let activeOrders = Order where status is Active
 activeOrders >< Customer { customer.name, total }
 ```
 
-`let` is local only. Top-level bindings are global and committed to the schema — see
-[functions.md](functions.md).
+`let` binds locally. A binding at top level is global and committed to the schema:
 
-## Document Paths
+```
+ActiveOrder            = Order where status is Active
+ServiceAccount : LogData = User >< AccountKind { User.*, AccountKind.purpose } where kind is Service
+```
+
+Nothing precedes the name. `table` keeps a keyword because it declares storage and constraints;
+a binding declares neither, and DataCode's top-level function definitions already take no
+keyword. A binding whose right side contains a query clause is a query; one that does not is an
+expression, which is the rule that already distinguishes the two inside parentheses.
+
+A trait list after `:` overrides the traits a derived table would otherwise inherit. **By
+default it inherits its sources' replication trait**, and sources that disagree are a
+compile-time error — a derived table over `LogData` was never free to be `UserData`.
+
+Because a binding has no body, its asserts and uniqueness constraints are written standalone
+([constraints.md](constraints.md#standalone-form)).
+
+## Document paths
 
 A path into a `Doc indexed` field reads like any other path and resolves through the shredded
 node tree:
@@ -146,11 +321,11 @@ app.log.Request where body.event_type == "charge.succeeded"
 app.log.Request { received_at, body.data.object.amount as amount }
 ```
 
-The result type is the sum of every type that path has ever held, plus `NotFound` for
-documents lacking it — the same discipline as any other sum type, with no implicit coercion.
+The result type is the sum of every type that path has held, plus `NotFound` for documents
+lacking it — the same discipline as any other sum type, with no implicit coercion.
 
-A path into a `Doc` that is *not* `indexed` is a compile-time error rather than a slow query:
-the bytes are opaque by construction, and the error names `indexed` as the fix. See
+A path into a `Doc` that is not `indexed` is a compile-time error rather than a slow query. The
+bytes are opaque by construction, and the error names `indexed` as the fix. See
 [documents.md](documents.md).
 
 ## Restrictions on `matches`
@@ -164,10 +339,10 @@ let u = system.auth.User where username == name
 in  attempt `matches` u.password
 ```
 
-## Historical Queries
+## Historical queries
 
-Pin a query to a historical schema version. The token may be a graph node hash prefix, a
-tag, or a branch name — see [../transaction-graph.md](../transaction-graph.md).
+Pin a query to a historical schema version. The token is a graph node hash prefix, a tag, or a
+branch name — see [../transaction-graph.md](../transaction-graph.md).
 
 ```
 Order at "schema-txn-abc123" where total > 100
@@ -181,254 +356,174 @@ version:
 Loan at "2026-03-01T00:00:00Z" { account, balance }
 ```
 
-## Every Query Has a Sample Moment
+## Every query has a sample moment
 
-A query is evaluated at one moment, and that moment is a value carried in the query — not a
-clock the evaluator reads. Where no `at` is given it defaults to the moment the request
-arrived.
+A query is evaluated at one moment, and that moment is a value carried in the query rather than
+a clock the evaluator reads. Without `at`, it defaults to the moment the request arrived.
 
-This is what makes [behaviors](types.md#behaviors) well defined: `balance` has no value
-except at a moment, and the moment is supplied by the query rather than fetched by the field.
-It is the same discipline the missing `Effect`-to-`Tx` lift already enforces on functors
-([functions.md](functions.md)) — nothing inside the evaluation may read the clock, because a
-commit that reads the clock is not replayable and a view that reads the clock is not
-recomputable.
+This is what makes [behaviors](types.md#behaviors) well defined: `balance` has no value except
+at a moment, and the query supplies the moment instead of the field fetching it. It is the
+discipline the missing `Effect`-to-`Tx` lift already enforces on functors
+([functions.md](functions.md)) — a commit that reads the clock is not replayable, and a derived
+table that reads the clock is not recomputable.
 
-> **The coordinating server resolves the sample moment once, and every shard evaluates
-> against the value it was given.**
+> **The coordinating server resolves the sample moment once, and every shard evaluates against
+> the value it was given.**
 
 This matters beyond behaviors. `DataId` timestamps come from per-server wall clocks with
 regression clamping ([../transaction-graph.md](../transaction-graph.md#clock-regression)), so
 shards that each resolved "now" independently would answer one query as of slightly different
-times, and a cross-shard aggregate would not correspond to any actual state of the database.
+times, and a cross-shard aggregate would correspond to no actual state of the database.
 
-A materialized view is pegged to a `(commit node, sample moment)` pair for the same reason.
-Over stored fields the moment is immaterial and only the commit node matters, which is why it
-has not needed stating until now; over a behavior the view is a snapshot and the moment is
-part of what it means.
+Stored rows make the moment immaterial, which is why this has not needed stating until now.
+Over a behavior it is part of what the result means.
 
-## Views
+## Field types
 
-**A view is a named query.**
+A derived table does not declare field types. It inherits or computes them.
 
-```
-view app.commerce.ActiveOrder = Order where status is Active
-
-view system.auth.ServiceAccount = User >< AccountKind { User.*, AccountKind.purpose }
-  where kind is Service
-```
-
-It binds with `=`, exactly as `aggregate` does, and for the same reason: both name a query,
-and a second syntax for writing one would have to be kept in step with the first forever.
-Replication traits still attach where they do on a table — `view X : LogData = …`.
-
-A view previously had a table-style body: field declarations, a standalone `where` as a row
-filter, and `from` clauses naming each field's source table. That form could not express a
-join at all, which is what forced the change — there was no production for it, so "the users
-reachable through this linking table" was unwritable. Three things went with it:
-
-- the standalone `where` body item, and with it the rule that position told a row filter apart
-  from a field validation;
-- `WildcardField` (`* from <table>`), replaced by a qualified `*` in the projection;
-- `FieldDecl`'s bare `from <table>` clause, which had no remaining use.
-
-Since a view has no body, its `assert`s are written standalone
-([constraints.md](constraints.md#standalone-form)).
-
-## View Field Types
-
-A view does not declare field types; it inherits or computes them.
-
-- A projected `FieldPath` keeps the source field's name and type, including its validations.
-  `User.email` in a view is still a `system.auth.User.email`.
-- A projected **expression** mints a computed type, named by the view field's path. `normalize
-  (User.name) as name` in `system.auth.ServiceAccount` defines the type
+- A projected field path keeps the source field's name and type, including its validations.
+  `User.email` is still a `system.auth.User.email`.
+- A projected expression mints a computed type named by the field's path.
+  `normalize (User.name) as name` in `system.auth.ServiceAccount` defines the type
   `system.auth.ServiceAccount.name`.
 
-The naming rule is not new. A field's `where` is already addressed by the field's path, and
-that path is already the name of the field's computed type
-([README.md](README.md#addressing-validations)) — a projection is the same mechanism reaching
-a new position.
+The naming rule is not new. A field's `where` is already addressed by the field's path, and that
+path is already the name of the field's computed type
+([README.md](README.md#addressing-validations)). A projection is the same mechanism reaching a
+new position.
 
-**Types are shared structurally and named by their first definer.** Two views projecting
-`normalize (User.name)` get one type, not two incompatible ones: functors are transparent, so
-the same function over the same source type is the same computed type. What "tied to the
-first definer" decides is the *name*. One consequence to expect: the name outlives its
-definer's `deprecate`, since nothing is destroyed and the type is still in use elsewhere.
+**Types are shared structurally and named by their first definer.** Two derived tables
+projecting `normalize (User.name)` get one type, not two incompatible ones, because functors are
+transparent and the same function over the same source type is the same computed type. First
+definer decides only the *name*. Expect one consequence: the name outlives its definer's
+`deprecate`, because nothing is destroyed and the type is still in use elsewhere.
 
 **A function over a key column degenerates the key**, because injectivity is not knowable in
-general. That costs the view incremental refresh, pins its sources against `deprecate`, and
-makes it non-writable (below) — so apply functions to non-key columns, or accept a read-only
-view. `:describe` reports which happened.
+general. That costs incremental refresh, pins the sources against `deprecate`, and makes the
+result read-only. Apply functions to non-key columns, or accept a read-only table. `:describe`
+reports which happened.
 
-## View Keys Are Computed, Never Declared
+## Keys are computed, never declared
 
-A table must declare a candidate key ([tables.md](tables.md#candidate-keys-are-mandatory)). A
-view must not — its key follows from its sources and the operators applied to them, and the
+A `table` declares a candidate key ([tables.md](tables.md#candidate-keys-are-mandatory)). A
+binding must not — its key follows from its sources and the operators applied to them, and the
 system derives it.
 
-**Every view has a key.** A table is a set of tuples, so at worst the whole tuple is one. The
-question is never whether a key exists; it is whether the derived key is **meaningful** — a
-proper subset that identifies an entity — or **degenerate** — all attributes, identifying only
-"this exact combination of values".
+**Every derived table has a key.** A table is a set of tuples, so at worst the whole tuple is
+one. The question is never whether a key exists, but whether the derived key is **meaningful**
+(a proper subset identifying an entity) or **degenerate** (all attributes, identifying only this
+combination of values).
 
-### How Each Operator Propagates
+### How each operator propagates
 
 | Operator | Key of the result |
 |---|---|
-| `where` — filter | Unchanged. A subset of rows keyed by K is still keyed by K. |
-| `{ … }` — projection | The source key, if every one of its columns survives; otherwise **degenerate** |
-| `group f` | The group columns. Exactly one row per distinct value, by construction. |
-| Aggregation with no `group` | The empty set — the result has at most one row |
-| `><` where the join field is `:>` | `K` of the referencing side alone. The join is **lossless**: each row matches at most one counterpart, so cardinality is preserved. |
-| `><` on non-key fields | `K₁ ∪ K₂` |
+| `where` | Unchanged. A subset of rows keyed by K is still keyed by K. |
+| `{ ... }` | The source key if every one of its columns survives, otherwise **degenerate** |
+| `group { ... }` | The group keys. Exactly one row per distinct value, by construction. |
+| `><` along a `:>` edge | K of the referencing side alone. The join is **lossless** — each row matches at most one counterpart. |
+| `><` on non-key fields | K₁ ∪ K₂ |
 | `><` outer | As above, but **degenerate** if a key column comes from the outer side |
-| `\|` — union | The source key **plus a discriminator**, which may not exist |
+| `><` via a `Null` type | K₁ ∪ K₂ |
+| `\|` union | The source key **plus a discriminator**, which may not exist |
 
-Two of these are worth their own note.
+Three of these need a note.
+
+**A superkey of a declared candidate key reduces to it.** `group { c.* }` derives every column
+of `c` as its key, which contains `c`'s declared key, so the result is keyed by that instead —
+meaningful rather than degenerate. This is the rule that also licenses the optimizer's rewrite
+above, and it is unavailable on a source with no declared key.
 
 **Foreign keys substitute.** A key containing a `:>` field resolves to the referent's key, so
-`Order` keyed `{customer, order_num}` joined to `Customer` yields `{Customer.email,
-order_num}`. The key therefore survives even when the FK column itself is projected away. The
-same substitution is what tells the optimizer the join is lossless — without the reference
-direction you would derive only the superkey `K₁ ∪ K₂`, which is correct but not minimal.
+`Order` keyed `{customer, order_num}` joined to `Customer` yields `{Customer.email, order_num}`.
+The key survives even when the FK column is projected away. The same substitution tells the
+optimizer the join is lossless; without the reference direction you would derive only the
+superkey K₁ ∪ K₂, which is correct but not minimal.
 
-**Grouping is exact here in a way it is not in SQL.** Because `group` nests rather than
-aggregating away, nothing is discarded and there is precisely one output row per distinct
-group value. The group columns are a key by construction rather than by argument.
+**Grouping is exact here in a way it is not in SQL.** `group` nests rather than aggregating away,
+so nothing is discarded and there is precisely one output row per distinct group value. The
+group keys are a key by construction rather than by argument.
 
-### Where Propagation Genuinely Breaks
+### Where propagation breaks
 
-**Union** does not preserve a shared key — two rows carrying the same key from different
-sources collide. The rollup union in [aggregates.md](aggregates.md#the-union-view) is exactly
-this case: every level is keyed `{bucket_start, …}`, and an hourly bucket starting at midnight
-collides with a daily bucket starting at midnight. `grain` is the discriminator that fixes it,
-and it had to be introduced for the purpose. A union whose sources offer no discriminator has
-a degenerate key.
+**Union** does not preserve a shared key, because two rows carrying the same key from different
+sources collide. The rollup union in [aggregates.md](aggregates.md#the-union) is this case:
+every level is keyed `{bucket_start, ...}`, and an hourly bucket starting at midnight collides
+with a daily bucket starting at midnight. `grain` is the discriminator that fixes it, and it was
+introduced for the purpose. A union whose sources offer no discriminator has a degenerate key.
 
-**Outer joins** degrade for the same reason declared keys may not contain a `Null`-derived
-variant ([tables.md](tables.md#ineligible-key-fields)): `MissingCustomer` is an ordinary
-value, so every absent row carries the same one and they collide. The rule falls out twice
-from one fact, which is a good sign it is the right rule.
+**Outer joins** degrade for the reason declared keys may not contain a `Null`-derived variant
+([tables.md](tables.md#ineligible-key-fields)): `MissingCustomer` is an ordinary value, so every
+absent row carries the same one and they collide. The rule falls out twice from one fact, which
+is a good sign it is the right rule.
 
-**Behaviors** cannot participate in a key at all, so a view distinguished only by projected
-[behaviors](types.md#behaviors) has no stable key.
+**Behaviors** cannot participate in a key at all, so a derived table distinguished only by
+projected [behaviors](types.md#behaviors) has no stable key.
 
-### Degeneracy Is a Warning, Not an Error
+### Degeneracy warns, it does not fail
 
-A view with a degenerate key is well-defined and queryable, and reporting views legitimately
-have no entity identity — a revenue-by-month summary is not *about* anything you can point at.
-So it is never rejected.
+A degenerate key is well-defined and queryable, and reporting tables legitimately have no entity
+identity — a revenue-by-month summary is not *about* anything you can point at. So it is never
+rejected.
 
-But it is never silent either. Accepting an all-attributes key without saying so would let a
-view claim an identity it does not have, and merge reconciliation would then trust it.
-`:describe` reports the derived key, and marks it when it is degenerate:
+It is never silent either. Accepting an all-attributes key without saying so would let a derived
+table claim an identity it does not have, and merge reconciliation would then trust it.
+`:describe` reports the derived key and marks it:
 
 ```
 datacode[app.commerce]> :describe app.commerce.OrderSummary
-view app.commerce.OrderSummary
+app.commerce.OrderSummary
   key:      (all attributes) -- degenerate: `customer` and `order_num` are projected away
   refresh:  full only
   writable: no -- degenerate key
 ```
 
-This is the posture [../integrity.md](../integrity.md) already takes elsewhere: the system
-computes what it knows, reports it, and leaves the decision.
+This is the posture [../integrity.md](../integrity.md) takes elsewhere: compute what is known,
+report it, leave the decision.
 
-### What the Key Decides
+### What the key decides
 
-The derived key is not bookkeeping. Three things depend on it:
+Three things depend on it:
 
-**Incremental refresh.** A materialized view with a meaningful key can be refreshed by
-upserting changed rows, because the key says which row a recomputed one replaces — the same
-idempotence argument that makes rollup catch-up safe
-([aggregates.md](aggregates.md#what-gets-generated)). A degenerate key admits only wholesale
-recomputation. See [../storage.md](../storage.md#materialized-views).
+- **Incremental refresh.** A meaningful key says which row a recomputed one replaces. See
+  [../storage.md](../storage.md#materialization).
+- **Whether the sources can be retired.** An incrementally-refreshable table has an existence
+  independent of its sources' full extent, which makes it a candidate to replace them. See
+  [evolution.md](evolution.md#a-degenerate-dependent-blocks-deprecation).
+- **Whether it can be written through.** See [Writing through a derived table](#writing-through-a-derived-table).
 
-**Whether the source can be retired.** An incrementally-refreshable view has an existence
-independent of its sources' full extent, which makes it a **candidate to replace them** — the
-generalization of what a retention chain does when an aggregate supersedes the raw table it
-was computed from.
+## Writing through a derived table
 
-**Whether the view can be written through.** A meaningful key says which base row each view
-row is, which is what makes decomposing a mutation unambiguous. See
-[Writing Through a View](#writing-through-a-view).
-
-A degenerate view has no such independence: it can only ever be rebuilt by rescanning its
-sources. **`deprecate` on a table with a degraded dependent view is therefore rejected**, and
-the diagnostic says which view and why. Alter the view to carry its sources' key columns, or
-deprecate the view first.
-
-```
-datacode[app.commerce]> deprecate app.commerce.Order
-error: app.commerce.OrderSummary depends on app.commerce.Order and has a degenerate key,
-       so it cannot be maintained without rescanning it.
-       Project `customer` and `order_num` into the view, or deprecate the view first.
-```
-
-That makes the warning load-bearing rather than advisory: a degenerate key is not merely
-untidy, it pins the schema.
-
-## The `*` Selector and Field Propagation
-
-`*` in a projection includes every field of its source, and is qualified to pick one side of a
-join:
-
-```
--- Wildcard: tracks the source schema dynamically
-view app.commerce.OrderSummary = connectors.mariadb.production.Order { * }
-
--- Mixed: bulk by wildcard, one field recomputed
-view app.commerce.Order = connectors.mariadb.production.Order
-  { *, toOrderStatus (status) as status }
-
--- Explicit field list: stable, change-resistant
-view app.commerce.OrderDetail = connectors.mariadb.production.Order
-  { id, total, toOrderStatus (status) as status }
-```
-
-`*` binds to the source's schema at query time — new fields in the source appear
-automatically. Named fields bind stably — new source fields don't propagate. A later item
-overrides an earlier `*` on the same name, which is how a coercion is applied to one field
-without listing the rest.
-
-The second example is what a connector overlay looks like now. A view body used to write this
-as a bare `status : OrderStatus` re-declaration, leaving the coercion implied; the function is
-named instead, which is both what actually happens and what mints the field's type
-([View Field Types](#view-field-types)).
-
-## Writing Through a View
-
-An insert or update against a view decomposes into one mutation per base table, ordered by FK
-direction — referenced side first, so the row exists before anything references it.
+An insert or update decomposes into one mutation per base table, ordered by FK direction —
+referenced side first, so the row exists before anything references it.
 
 ```
 system.auth.ServiceAccount { username = "billing-sync", purpose = "invoice ingestion" }
 -- inserts a system.auth.User row, then an AccountKind row with kind = Service
 ```
 
-Note what supplied `kind`. **The view's `where` filter is a check constraint on write, and its
-constant equalities supply values on insert** — the row you write must satisfy the filter, and
-where the filter pins a field to a constant, that constant is written. This is SQL's `WITH
-CHECK OPTION`, doing one extra job: it is what lets adding a row through the view create the
-linking row without the call site knowing the linking table exists.
+Note what supplied `kind`. **A `where` filter is a check constraint on write, and its constant
+equalities supply values on insert.** The row you write must satisfy the filter, and where the
+filter pins a field to a constant, that constant is written. This is SQL's `WITH CHECK OPTION`
+doing one extra job: it lets a write create the linking row without the call site knowing the
+linking table exists.
 
 Write-through is admissible exactly when:
 
-1. the derived key is **meaningful**, not degenerate — it is what says which base row a view
-   row is;
-2. every join is along a `:>` edge, so the key propagation rule above makes the join lossless
-   and each view row corresponds to at most one row per base table;
-3. every required field of each base table — one with no default — is either projected by the
-   view or fixed by its `where`.
+1. The derived key is meaningful, not degenerate. It is what says which base row a row is.
+2. Every join runs along a `:>` edge, so key propagation makes it lossless and each row
+   corresponds to at most one row per base table.
+3. Every required field of each base table — one with no default — is either projected or fixed
+   by the `where`.
 
-Fail any of the three and the view is read-only, with `:describe` reporting which.
+Fail any of the three and the table is read-only, with `:describe` reporting which.
 
-**`delete` removes the row the key identifies, and never cascades.** For a `:>` join that is
-the *referencing* side: deleting from `ServiceAccount` appends a tombstone to the `AccountKind`
-row, and the `User` survives, now matching no service-account view. This falls out of key
-propagation rather than being stipulated, but it is stated here because "delete the service
-account" reads as though the user should go too, and it does not.
+**`delete` removes the row the key identifies, and never cascades.** For a `:>` join that is the
+*referencing* side: deleting from `ServiceAccount` appends a tombstone to the `AccountKind` row,
+and the `User` survives, now matching no service-account row. This falls out of key propagation
+rather than being stipulated, but "delete the service account" reads as though the user should
+go too, and it does not.
 
 ## Mutation
 
@@ -438,44 +533,33 @@ Row construction and row update both use `=` for their fields, as in Haskell rec
 -- Insert
 app.commerce.Order { customer = customerId, total = 99.99, status = Pending }
 
--- Functional update (returns new version; all functors re-evaluated)
+-- Functional update; returns a new version, re-evaluates all functors
 Order where id == "uuid-..." { status = Shipped }
 
--- Delete (appends a tombstone version; the row's history stays readable)
+-- Delete; appends a tombstone version, history stays readable
 delete Order where id == "uuid-..."
 ```
 
-### Delete Appends a Version
-
-`delete` is an ordinary mutation and follows the same rule as every other one: it appends a
-tombstone version of the row rather than removing anything. The row is absent from any query
-whose sample moment is at or after the delete, and present in any query pinned earlier with
-`at`. The `DataId` is never reused, dependent history is untouched, and writing a new version
-brings the row back.
-
-**There is no second, harder delete.** A `delete!` spelling was reserved and has been removed.
-As specified it did nothing `delete` did not already do — both descriptions amounted to
-"removes it from the current state, keeps it in the graph" — and the only operation that would
-have justified the sigil is destroying bytes already written to the append-only log, which is
-unsolved. Scrubbing PII and quarantining a `UserData` shard are
-[OQ-036](../open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine);
-whatever answers it will not be spelled as a variant of `delete`, because it is an
-administrative act on a shard and not a row mutation.
-
-A brace block in query position is a **projection** when its items are bare paths and a
-**row update** when they are `field = value` bindings:
+A brace block in query position is a **projection** when its items are bare paths, and a **row
+update** when they are `field = value` bindings:
 
 ```
 Order where total > 100 { customer, total }        -- projection
 Order where id == "uuid-..." { status = Shipped }  -- update
 ```
 
-## Materialized Views
+### Delete appends a version
 
-Materialized views are pegged to specific commit nodes in the transaction graph. They never
-block ongoing transactions (they reference a past, stable state), are updated in the
-background or lazily on access, and are maintained per server. Large analytical
-computations can be distributed across neighbouring servers — see
-[../distribution.md](../distribution.md).
+`delete` follows the rule every other mutation follows: it appends a tombstone version rather
+than removing anything. The row is absent from any query whose sample moment is at or after the
+delete, and present in any query pinned earlier with `at`. The `DataId` is never reused,
+dependent history is untouched, and writing a new version brings the row back.
 
-Materialization is a storage hint applied to a view, not a separate kind of schema object.
+**There is no second, harder delete.** A `delete!` spelling was reserved and has been removed.
+It did nothing `delete` did not already do — both amounted to "removes it from the current
+state, keeps it in the graph" — and the only operation that would justify the sigil is
+destroying bytes already written to the append-only log, which is unsolved. Scrubbing PII and
+quarantining a `UserData` shard are
+[OQ-036](../open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine). Whatever
+answers it will not be spelled as a variant of `delete`, because it is an administrative act on
+a shard rather than a row mutation.

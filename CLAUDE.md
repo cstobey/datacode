@@ -57,6 +57,28 @@ the single source of truth for syntax: the EBNF is both the normative grammar an
 railroad-diagram source (rendered at https://rr.red-dove.net/ui.html). If a syntax decision
 changes, that file must change.
 
+## Documentation Style
+
+**Microsoft Documentation Style.** Second person, active voice, present tense, sentence-case
+headings, short sentences, lists over prose walls. No "simply", "just", "obviously", or
+"we". Record the reasoning behind a decision and what it replaced — that is the point of
+these files — but cut restatement, throat-clearing, and rhetorical flourish. A paragraph
+that only re-says the sentence before it goes.
+
+**One normative home per rule; everything else links.** Redundancy between files is a defect,
+because two copies drift and the reader cannot tell which is authoritative.
+
+| Home | Owns |
+|---|---|
+| `schema/railroad.md` | The EBNF, and one-line bullets for constraints not expressible in it. Rationale links out. |
+| `schema/queries.md` | Query semantics, `group`, key derivation, derived tables |
+| `schema/tables.md` | Stored structure, keys, sub-tables |
+| `schema/evolution.md` | Redeclaration and diff, split and merge |
+| `schema/aggregates.md` | Aggregate functions, merges, retention |
+| `storage.md` | Materialization |
+
+Before adding a passage, check whether the rule already has a home. If it does, link to it.
+
 ## Design Principles
 
 **Make it feel like Haskell.** This is the tie-breaker for syntax decisions. DataCode's
@@ -75,12 +97,12 @@ Do not restate settled decisions back to them.
 - **Nothing is destroyed.** Evolution adds graph nodes; old schema versions stay queryable. `deprecate` hides, `prune` removes, and only orphaned branches are truly deletable. Log data is the one exception, and even there discarding is never manual — a `retain` chain rolls it to coarser resolutions and prunes as a consequence; a `LogData` table with no chain is never pruned. Silence means keep.
 - **No external calls inside a commit.** Side effects go to a queue table and run later under the event scheduler. Enforced by a missing lift: `commit :: Tx a -> Effect a` exists, nothing takes `Effect a` to `Tx a`. Handlers run in `Effect`, are the one place arbitrary Haskell is admissible, and are compiled in.
 - **Four functor kinds**: validation, foreign key, path constraint, event. Data constraints and access control are the *same* kind, differing only in whether the requesting token is one of the terms — and that difference is read off the assert *body* (does it mention `authed_user`?), never off its name, so an administrator's `bypass access` grant exempts an exact set. An assert body is an equality, a query rooted at `self` (asserting non-empty), or `not` of one. A `Behavior` is not a fifth kind — it enforces nothing, it projects.
-- **Every table declares a candidate key** unless it carries `LogData`, `Component`, or `Keyless`. `DataId` does not count. On a shard-local table the key must reach the shard root through its FK chain, which makes the key declaration also the sharding declaration. Shards are row-rooted. A **view** declares none — its key is derived from its sources, and a derived key that degenerates to all attributes blocks incremental refresh and pins its sources against `deprecate`.
+- **Every table declares a candidate key** unless it carries `LogData`, `Component`, or `Keyless`. `DataId` does not count. On a shard-local table the key must reach the shard root through its FK chain, which makes the key declaration also the sharding declaration. Shards are row-rooted. A **binding** declares none — its key is derived from its sources, and a derived key that degenerates to all attributes blocks incremental refresh and pins its sources against `deprecate`. A superkey of a declared key reduces to it.
 - **Time is a parameter, never ambient.** `Behavior a ≅ Moment -> a` for values that change with no write. `Moment` (observation, ranges over past and future) is distinct from `Timestamp` (stored). Nothing may read the clock inside a functor — that is the missing `Effect` lift doing the work.
 
 ## Syntax Quick Reference
 
-Full detail in `docs/schema/`. **Capitalization**: types, traits, tables, views, and variants are `UpperCamelCase` and singular; fields are `lower_snake_case`; functions and constraint names are `lowerCamelCase`; namespaces are `lowercase`. So `app.commerce.Order`.
+Full detail in `docs/schema/`. **Capitalization**: types, traits, tables, derived tables, and variants are `UpperCamelCase` and singular; fields are `lower_snake_case`; functions and constraint names are `lowerCamelCase`; namespaces are `lowercase`. So `app.commerce.Order`.
 
 The two tokens most easily got wrong:
 
@@ -106,9 +128,18 @@ table app.commerce.Order : UserData {
   assert ownerAccess { authed_user == customer.user }
 }
 
-view app.commerce.RecentOrder = Order >< Customer { Order.*, Customer.name as buyer }
+app.commerce.RecentOrder = Order >< Customer as c { Order.*, c.name as buyer }
   where placed_at > cutoff
+
+app.commerce.OrdersPerCustomer = Order group { customer } { customer, count rows as orders }
 ```
+
+**There is no `view`.** A table declaration, a query, and a derived table are one kind of
+thing. `Name = <query>` binds one (with `Name : Traits = <query>` to override the replication
+trait it would otherwise inherit); `let` makes it local. `table` keeps its keyword because it
+declares storage and constraints. Aggregate functions are ordinary functions applied to a
+table (`count rows`, `sum rows.total`), never a postfix keyword, and `group` takes a
+projection whose residual columns collapse into a generated `rows` column.
 
 ## Working Norms
 

@@ -51,7 +51,7 @@ The distinction determines whether any state has to be stored at all.
 transaction graph, evaluated at a chosen schema node. `system.integrity.Violation` is a
 **materialized view** over that query — pegged to a commit node, computed in the background,
 refreshable, and droppable without losing anything. This is the existing materialization
-machinery (see [storage.md](storage.md#materialized-views)), not a new mechanism, and it
+machinery (see [storage.md](storage.md#materialization)), not a new mechanism, and it
 means there is no derived state that can drift out of agreement with the data.
 
 **Observational nonconformance must be recorded.** The transient witness is gone by the time
@@ -125,7 +125,7 @@ table has no natural key" lands in the same review queue as everything else inst
 a waiver granted silently at schema generation time. An operator can waive it with a reason,
 and the waiver is itself in the audit trail.
 
-A **view** an author writes over a keyless connector table is an authored table and is not
+A derived table an author binds over a keyless connector table is an authored table and is not
 exempt. If the underlying rows cannot be identified, that is a fact worth being made to
 confront at declaration time rather than discovering during a merge.
 
@@ -300,8 +300,8 @@ can be expressed as tables should be:
 -- What is open, worst first
 system.integrity.Violation
   where state is Open
-  group functor
-  { functor, violations.subject count as affected }
+  group { functor }
+  { functor, count rows as affected }
   order by affected desc
 
 -- Waive one, with a reason

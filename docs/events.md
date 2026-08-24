@@ -479,7 +479,7 @@ the other direction. Non-`Component` FKs never cascade.
 
 **A cross-table in-commit trigger to a non-`Component` table is refused.** If a row must exist
 atomically with another and it has independent identity and lifetime, that is a modelling error:
-make it a component, or make it a view. Admitting the general case would put arbitrary
+make it a component, or derive it. Admitting the general case would put arbitrary
 user-authored mutation inside the commit path with unbounded cascade depth, order-dependence,
 and a commit whose cost is not readable from the schema.
 
@@ -489,7 +489,7 @@ listed so they are not reinvented:
 | Classic trigger | What DataCode does instead |
 |---|---|
 | Audit / history rows | Nothing. The transaction graph **is** the audit log. |
-| Denormalized counters, derived status | A view field or a `Behavior`. |
+| Denormalized counters, derived status | A projected field or a `Behavior`. |
 | `created_by = current_user` | A field default: `created_by :> User = authed_user`. |
 | Sequence allocation | A field default: `order_num : Int = next orderRef`. See [tables.md](schema/tables.md#sequences). |
 | Materialized view refresh, index maintenance | In-commit per OQ-027, or `system.events.MaintenanceQueue`. |

@@ -172,21 +172,56 @@ bytes directly.
 
 Requires the `capnp` C++ tool at compile time (`apt install capnproto`).
 
-## Materialized Views
+## Materialization
 
-Materialized views are pegged to **specific commit nodes** in the transaction graph:
+Materialization is how DataCode delivers data independence for analytical queries. A query you
+have never run is slow, because nothing has been arranged for it. Subsequent runs are fast,
+because the arrangement now exists and is maintained. Nothing about the query changes.
 
-- They never block or slow down ongoing transactions (they reference a past, stable state)
-- They are updated in the background or lazily when accessed
-- Each server maintains its own materialized views
-- Large analytical queries can be distributed across neighbouring servers
-- The computation of a materialized view can be shared between neighbours (distribute the work, merge the results)
+A materialized view is pegged to a **specific commit node** in the transaction graph, and to a
+sample moment where the query reads a behavior
+([schema/queries.md](schema/queries.md#every-query-has-a-sample-moment)):
 
-### Refresh Is Incremental Only If the View Has a Meaningful Key
+- It never blocks or slows ongoing transactions, because it references a past, stable state.
+- It is updated in the background, or lazily on access.
+- Each server maintains its own.
+- Neighbouring servers can share the computation — distribute the work, merge the results. See
+  [distribution.md](distribution.md).
 
-A view's candidate key is derived from its sources rather than declared
-([schema/queries.md](schema/queries.md#view-keys-are-computed-never-declared)), and which kind
-of key it derives decides how the view can be maintained:
+**Materialization replaces the user-defined index.** There is no `create index`, because the set
+of arrangements worth maintaining is a function of observed load rather than of the schema
+author's foresight.
+
+### Views are proposed, not created silently
+
+The maintenance queue reads `system.telemetry` request logs and **proposes** a materialized
+view. A `Configuration` row sets the threshold above which a proposal is approved
+automatically.
+
+The proposal step is not ceremony. A query that silently created a view would write state
+nobody authored, in a system built on named branches and no anonymous forks. This is the same
+mechanism, one scope wider, as the per-field timestamp cache
+([transaction-graph.md](transaction-graph.md#declaring-and-proposing-the-cache)) — automatic
+behaviour is a policy somebody set, recorded in a row you can query and reject.
+
+Operators inspect and override the result:
+
+```
+show materialized views shard user.commerce
+materialize app.reporting.MonthlySummary
+refresh view app.reporting.MonthlySummary
+drop materialized view app.reporting.MonthlySummary
+```
+
+`materialize` is an admin command rather than schema syntax, for the reason `retain` and
+`enforce` are separate statements: it is operational policy that changes over time, and it is not
+the schema author's decision to make. See [cli.md](cli.md).
+
+### Refresh is incremental only with a meaningful key
+
+A derived table's candidate key comes from its sources rather than a declaration
+([schema/queries.md](schema/queries.md#keys-are-computed-never-declared)), and which kind of key
+it derives decides how it can be maintained:
 
 | Derived key | Refresh |
 |---|---|
@@ -197,16 +232,12 @@ This is the same idempotence property that lets a retention rollup play catch-up
 duplicating buckets ([schema/aggregates.md](schema/aggregates.md#what-gets-generated)) — a
 keyed derived table can be recomputed for any window and merged, an unkeyed one cannot.
 
-It also decides whether a view can outlive its sources. An incrementally-maintainable view has
-an existence independent of its sources' full extent and is a candidate to replace them, which
-is what a rollup level does when it supersedes the raw table. A degenerate view can only be
-rebuilt by rescanning, so it pins its sources in place and `deprecate` on them is rejected
-until the view is altered or deprecated.
+It also decides whether a derived table can outlive its sources. See
+[schema/evolution.md](schema/evolution.md#a-degenerate-dependent-blocks-deprecation).
 
-Views are just table definitions — the distinction between a "live" table and a
-"materialized view" is a storage hint, not a schema-level distinction. See
-[schema/queries.md](schema/queries.md) for the syntax and
-[distribution.md](distribution.md) for the cooperative computation protocol.
+Materialization is a storage decision, never a schema-level distinction: a table, a query, and a
+derived table are one kind of thing, and whether rows are stored for it is decided here rather
+than in the declaration. See [schema/queries.md](schema/queries.md).
 
 **Retention rollups are not materialized views**, despite being computed in the background the
 same way. A materialized view is recomputable from its source by definition, and a rollup's

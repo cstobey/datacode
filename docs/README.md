@@ -23,10 +23,10 @@ diagrams.
 | [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible`, `Queue`/`QueueState` |
 | [schema/constraints.md](schema/constraints.md) | `assert`, path constraints, presence and absence, access control |
 | [schema/documents.md](schema/documents.md) | The `Doc` type, shredding, key interning |
-| [schema/aggregates.md](schema/aggregates.md) | `aggregate` and `retain`, rollup chains, mergeable aggregates, log retention |
+| [schema/aggregates.md](schema/aggregates.md) | Aggregate functions, mergeable aggregates, `retain` chains, log retention |
 | [schema/templates.md](schema/templates.md) | Templates as text with holes, cardinality as control flow, `using`, escaping by type |
-| [schema/evolution.md](schema/evolution.md) | Redeclare, deprecate, prune, split, merge, ADT extension |
-| [schema/queries.md](schema/queries.md) | Filter, projection, joins, grouping, views, mutation |
+| [schema/evolution.md](schema/evolution.md) | Redeclare, rename, retype, deprecate, prune, split, merge, ADT extension |
+| [schema/queries.md](schema/queries.md) | Filter, projection, joins, grouping, derived tables, mutation |
 | [schema/functions.md](schema/functions.md) | Scope, the effect ladder, auto-wrapping, function types, function-valued columns |
 | [schema/functors.md](schema/functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [namespaces.md](namespaces.md) | Namespace tree, visibility levels, namespace ACL |
@@ -36,7 +36,7 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [transaction-graph.md](transaction-graph.md) | Append-only DAG, branches and tags, shards, `DataId`, component ordinals, `PhysicalLocator` |
-| [storage.md](storage.md) | Append-only log, LMDB indexes, Cap'n Proto, zero-copy reads, materialized views |
+| [storage.md](storage.md) | Append-only log, LMDB indexes, Cap'n Proto, zero-copy reads, materialization |
 | [distribution.md](distribution.md) | Server roles, the range tree, push/fetch replication, schema and constraint shards, cross-shard transactions, bulk mutations, shard splits, geo-diversity |
 | [tech-stack.md](tech-stack.md) | Library and format decisions, with the OQ and spike that settled each |
 | [dynamic-loading.md](dynamic-loading.md) | GADT DSL + `Data.Dynamic`; full addendum of options considered |
