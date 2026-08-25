@@ -356,6 +356,37 @@ version:
 Loan at "2026-03-01T00:00:00Z" { account, balance }
 ```
 
+### Diffing two transaction points
+
+`diff` evaluates a query at two graph nodes and returns what changed between them:
+
+```
+app.commerce.Order diff "v2.1.0" to "v2.2.0"
+```
+
+Both operands are version tokens — a graph node hash prefix, a tag, or a branch name — never
+moments. A node is exact and reads no clock, which is what makes a diff reproducible.
+
+The result is keyed by the query's own derived key
+([below](#keys-are-computed-never-declared)) and carries three generated columns:
+
+| Column | Holds |
+|---|---|
+| `before` | the query's row type; zero rows or one |
+| `after` | the query's row type; zero rows or one |
+| `change` | `Added`, `Removed`, or `Changed` |
+
+`before` and `after` are table-valued columns — the shape `group` already produces as `rows` — so
+projecting into them needs no new syntax.
+
+**A degenerate key is rejected.** Where the derived key is all attributes, nothing identifies a
+row across the two points: every change would read as a `Removed` plus an `Added`, and the result
+would say nothing that two separate queries do not. The diagnostic names the source whose key
+degenerated.
+
+Comparing aggregates over time needs neither `diff` nor window functions. A rollup level is a
+real table and queries compose, so a shifted self-join states it directly.
+
 ## Every query has a sample moment
 
 A query is evaluated at one moment, and that moment is a value carried in the query rather than
@@ -557,9 +588,8 @@ dependent history is untouched, and writing a new version brings the row back.
 
 **There is no second, harder delete.** A `delete!` spelling was reserved and has been removed.
 It did nothing `delete` did not already do — both amounted to "removes it from the current
-state, keeps it in the graph" — and the only operation that would justify the sigil is
-destroying bytes already written to the append-only log, which is unsolved. Scrubbing PII and
-quarantining a `UserData` shard are
-[OQ-036](../open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine). Whatever
-answers it will not be spelled as a variant of `delete`, because it is an administrative act on
-a shard rather than a row mutation.
+state, keeps it in the graph" — and the operations that would justify the sigil are `erase`,
+which closes a row's history, and `scrub`, which destroys bytes already written. Both are
+administrative acts reachable only from the CLI and the admin interface, never from the query
+language, and neither is spelled as a variant of `delete`. See
+[../integrity.md](../integrity.md#erasure-restricts-scrub-destroys).

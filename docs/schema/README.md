@@ -7,14 +7,14 @@ than restating it.
 
 | Document | Covers |
 |---|---|
-| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret`, `Hashed` |
+| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret`, `Hashed`, `Encrypted` |
 | [tables.md](tables.md) | Table bodies, field declarations, defaults, candidate keys, ordering, foreign keys, sub-tables |
-| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible` |
+| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Personal`, `Extensible` |
 | [constraints.md](constraints.md) | `assert`, path constraints, presence and absence, access control |
-| [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill |
+| [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill, key shape rules, demotion |
 | [aggregates.md](aggregates.md) | Aggregate functions, mergeable aggregates, `retain` chains, log retention |
 | [evolution.md](evolution.md) | Redeclaration, rename, retype, deprecate, prune, split, merge, ADT extension, visibility |
-| [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, derived tables, mutation |
+| [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, derived tables, mutation, `diff` |
 | [functions.md](functions.md) | Scope, the effect ladder, Haskell functions, auto-wrapping, function types, function-valued columns |
 | [functors.md](functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [templates.md](templates.md) | Text with holes, cardinality as control flow, `using` and render functions |

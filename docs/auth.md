@@ -117,14 +117,12 @@ does not authenticate on its own. See
 
 **Not every method fits `Hashed`.** A password, an API key, and a WebAuthn public key are all
 verified by re-deriving or re-checking against what is stored, so a one-way digest is the right
-shape. A shared secret that the server must *reproduce from* is not. `Secret` is a type
-*property* and `Hashed` is one constructor carrying it; a reversible constructor does not exist
-yet, and inventing one alongside a key-management policy is more than this change should carry.
-See [open-questions.md](open-questions.md#oq-037-reversible-secret-storage) — until it is
-answered, methods needing a recoverable secret cannot be declared.
+shape. A shared secret the server must *reproduce from* is not, and it takes the second `Secret`
+constructor, [`Encrypted`](schema/types.md#encrypted-types). Key custody is
+[below](#envelope-encryption-and-key-custody).
 
-That restriction is narrower than it first looks, because the most-wanted second factor does
-not need a recoverable secret at all.
+Most deployments need neither, because the most-wanted second factor needs no recoverable secret
+at all.
 
 ## Challenge Methods
 
@@ -194,12 +192,13 @@ Two mechanisms get called "TOTP" and only one of them fits above.
 | | Delivered code | Authenticator app (RFC 6238) |
 |---|---|---|
 | Secret | generated per attempt | provisioned once, never re-transmitted |
-| Stored as | `Hashed` — verified by re-hashing | must be recovered to recompute the code |
-| Expressible today | **yes** | no — needs OQ-037 |
+| Stored as | `Hashed` — verified by re-hashing | `Encrypted` — recovered to recompute the code |
+| Costs | nothing beyond what exists | a data key and its custody |
 
-So a second factor is available in the first pass, and it is the one most deployments reach for
-first. What stays blocked is any method whose secret the server must read back: authenticator
-apps, and a connector's outbound credential to a third party.
+Reach for the delivered code first. It is the one most deployments want, it needs no key
+management, and a code that lives ten minutes cannot be stolen from a backup taken a year later.
+The authenticator app and a connector's outbound credential are the two cases that justify the
+key custody below.
 
 A `Challenge` is not a `Credential` and does not appear in `Credential`'s key, but it satisfies
 a `CredentialMethod` the same way one does — so a method whose `standing` is `SecondFactor` may
@@ -287,6 +286,124 @@ and flag the account for a forced change at the next opportunity. `enforce forwa
 makes this the default rather than a special case — the old value is grandfathered, so
 nothing about the existing row is rejected.
 
+## Envelope Encryption and Key Custody
+
+A key management service is three operations — `wrap`, `unwrap`, `rotate` — plus an audit trail
+and an access policy, over key material that never crosses the boundary. HSMs, Vault, and cloud
+KMS products are that interface with different trust anchors.
+
+One consequence decides the design before any algorithm question does: **`unwrap` is an external
+call, so it cannot happen inside a commit.** The effect ladder has no lift from `Effect` to `Tx`
+([events.md](events.md)), and a commit that waits on a network round trip to a key service is
+exactly what that missing lift forbids.
+
+Envelope encryption is the arrangement that satisfies it:
+
+```
+table system.crypto.WrappingAuthority : Reference {
+  name       : Text unique,
+  effect_sig : TypeRef                    -- compiled-in: key file, PKCS#11, cloud KMS
+}
+
+table system.crypto.CipherPolicy : Reference {
+  name      : Text unique,
+  algorithm : Aes256Gcm | ChaCha20Poly1305 | XChaCha20Poly1305,
+  key_name  : Text
+}
+
+table system.crypto.DataKey : Configuration {
+  name       : Text,
+  generation : Int,
+  authority :> WrappingAuthority,
+  wrapped    : Bytes,
+  unique keyGeneration { name, generation }
+}
+```
+
+The authority wraps a **data key**. Each server unwraps it once at startup or on rotation, in
+`Effect`, in the generation pool ([dynamic-loading.md](dynamic-loading.md)), and holds the
+plaintext data key in process memory. Commits encrypt with the cached key and make no external
+call at all. `WrappingAuthority` naming compiled-in Haskell is the `system.events.Handler`
+pattern reused, which is what makes a key file, a PKCS#11 token, and a cloud KMS
+interchangeable without new mechanism.
+
+**`CipherPolicy` names its key by name, not by `:>`.** The algorithm is schema and must be
+identical everywhere; *which* key material stands behind that name is a deployment fact, and
+staging must not share production's key. A `Reference` row holding a foreign key into a
+`Configuration` table would make a schema object depend on a deployment row, which is the line
+[schema/traits.md](schema/traits.md#traits-are-not-configuration) draws. Resolution by name keeps
+each side owning what it should.
+
+`DataKey` is keyed `{ name, generation }` rather than by name alone, because a rotation adds a
+generation instead of replacing a row — which is what lets a check probe every live generation
+when the plaintext behind an old digest is gone.
+
+### Servers Do Not Share a Private Key
+
+The obvious first implementation — one key file copied to every server — is the wrong one, and
+the reason is not the algorithm but the copying. A key that must be identical everywhere has to
+be distributed, and every distribution channel is a place it can be captured.
+
+**Wrap the data key to each server's public key instead.** An X25519 recipient construction —
+`age` is the packaged form, and it accepts existing SSH keys as recipients — wraps one data key
+to many recipients. Each server holds only its own private key, on disk, outside the transaction
+graph. Adding a server re-wraps a small blob; no server ever learns another's private key.
+
+Two specifics worth stating because they are easy to get wrong:
+
+- **`ssh-ed25519` is a signing key and cannot encrypt.** Encryption to an Ed25519 identity goes
+  through its X25519 birational map, which is what the `age` SSH recipient type does. Reaching
+  for the key directly does not work.
+- **The wrapping key never encrypts row data.** Asymmetric primitives wrap the data key and
+  nothing else; the rows are encrypted symmetrically under the data key named by their
+  `CipherPolicy`.
+
+The ciphertext therefore travels in every backup and replication stream, as it must, and the
+key to it does not.
+
+### Rotation Has Two Tiers
+
+| Rotate | Cost |
+|---|---|
+| Wrapping key | Re-wrap one blob per data key. No row is touched. |
+| Data key | Re-encrypt affected rows, lazily on write under `enforce forward`. |
+
+Data-key rotation is the same machinery as [password policy rotation](#password-policy-rotation)
+— each stored value records its policy, so a value under a superseded one is a reportable
+violation and nothing else has to track the migration.
+
+Destroying a data key destroys every value encrypted under it. That is crypto-shredding, and
+here it costs nothing, because decryption was never on the read path. It reaches only
+`Encrypted` fields; plaintext that reached the log is
+[scrubbed](integrity.md#erasure-restricts-scrub-destroys) instead.
+
+## Failed-Attempt Digests
+
+Distinguishing a brute-force attack from a user retyping the same wrong password requires
+knowing that two attempts were *equal*, which a per-row salt is designed to prevent. So attempt
+comparison uses a **keyed deterministic digest**, in its own table:
+
+```
+table system.auth.AttemptDigest : LogData {
+  user   :> User | NotFound,
+  method :> CredentialMethod,
+  digest : Bytes,
+  outcome : Failed | Succeeded
+}
+
+retain system.auth.AttemptDigest for 90 day, drop
+```
+
+Three rules make this safe enough to be worth having:
+
+- **The key is cluster-wide, one per generation.** Key scope must equal comparison scope: a
+  per-server key makes an attack spread across points of presence invisible, which is the
+  attack the table exists to catch. It is an ordinary data key under the envelope above.
+- **The retention chain is short.** A deterministic digest is offline-dictionary-attackable if
+  the key leaks, and the analysis window is days. `drop` is the terminal, deliberately.
+- **It lives with the auth system, not in a request log.** Retention and access rules are then
+  the auth system's, and the digest is never adjacent to the request body it came from.
+
 ## Access Control Functors
 
 Access control is not a separate ACL system — it is not even a separate functor kind. It is
@@ -343,6 +460,11 @@ assert still runs. **An administrator is exempt from access control, never from 
 integrity.** This is the requirement that forced the classification to be structural — under a
 naming convention, an access rule someone named `ownerCheck` would not have been bypassed and
 nothing in the syntax would have said so.
+
+`bypass erasure` is the second modifier and is separate from the first, because seeing the
+history of an erased row is a narrower and rarer permission than administering a namespace. A
+grant may carry either, both, or neither. See
+[integrity.md](integrity.md#erasure-restricts-scrub-destroys).
 
 Two alternatives were rejected. Writing `|| authed_user.role is Admin` into every rule spreads
 one decision across every table and cannot be audited. Rebinding `authed_user` to the set of

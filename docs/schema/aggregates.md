@@ -295,6 +295,9 @@ That default is deliberate. `prune the log shard` is the operation most likely t
 pressure, and it must not be able to silently destroy evidence that cannot be reconstructed.
 Silence means keep.
 
+The rule is about the chain rather than about the trait, which is why it extends unchanged to
+[`UserData`](#retain-on-userdata-is-admissible-and-rare).
+
 ### Retention prunes whole segments
 
 A `LogData` shard is rooted at a `system.shards.LogSegment` row keyed by
@@ -315,6 +318,39 @@ clause was considered and rejected: the segment key already supplies the alignme
 declared. The period and the size thresholds are `Configuration` rows, and a table with no
 `retain` statement is still partitioned — it is simply never pruned. *Silence means keep* must
 not be allowed to become *silence means one unbounded shard*.
+
+### `retain` on `UserData` is admissible and rare
+
+`retain` names a table, and nothing in it requires that table to carry `LogData`. A long-lived
+`UserData` row can accumulate a version chain nobody needs at full resolution, and collapsing
+part of one is a legitimate, occasional act.
+
+It stays inside the rule above rather than becoming an exception to it. A `UserData` chain is
+declared like any other, and the ordered branch form is what makes "these specific rows"
+expressible without a manual prune:
+
+```
+retain app.crm.Contact as ContactRollup
+  where status is Closed && closed_at < cutoff
+    by Month for 7 year
+    , drop
+  otherwise
+    forever
+```
+
+Two differences from the `LogData` case, both consequences of shard shape rather than new rules:
+
+- **Pruning is row-level, never segment-level.** A `UserData` shard is rooted at an entity, not
+  at a time-keyed segment, so there is no sealed segment to unlink.
+- **The version chain over the pruned range is gone**, and anything derived from it goes with
+  it. Per-field timestamps are the case that matters, since they are a cache over the chain
+  rather than a stored column
+  ([../transaction-graph.md](../transaction-graph.md#per-field-timestamps)). They read
+  `NotRetained` for a pruned range — a typed gap, not a wrong answer.
+
+Expect this to be rare. It trades the graph's account of how a row reached its value for space,
+which is the trade compaction refuses to make automatically, and declaring it as a chain is what
+keeps the decision visible in the schema rather than in someone's shell history.
 
 ### A rollup is two appends, not a rewrite
 

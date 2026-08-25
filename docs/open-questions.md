@@ -4,6 +4,9 @@ Questions that need answers before or during implementation. Grouped by urgency.
 
 ## Must Resolve Before Writing Core Code
 
+**All answered.** Nothing in this group blocks the first line of core code. The entries stay
+here as the decision record; each carries the reasoning and, where one exists, the spike.
+
 ### OQ-001: Dynamic Loading Mechanism ✓ ANSWERED
 **Answer**: Two mechanisms, because there were two questions. Functors are
 **effect-indexed GADT DSL terms**, interpreted, never compiled. Compiled-in Haskell
@@ -187,111 +190,150 @@ All three resolve to the same thing at dispatch time: token → schema graph nod
 - **Integration**: replace `IORef (Map String Application)` in the Servant `Raw` handler with `IORef (RouteTrie Application)`. Schema changes rebuild the trie and atomically swap the IORef — zero request interruption.
 - **Conflict resolution** (answers OQ-028 partially): exact-path conflicts are a schema validation error at insert time. The trie's `nodeHandler` slot can only hold one handler; inserting a duplicate pattern is rejected.
 
-### OQ-036: Erasure, PII Scrubbing, and Shard Quarantine
-**Question**: By what mechanism does data leave DataCode permanently, and what does the system
-look like afterwards?
+### OQ-036: Erasure, PII Scrubbing, and Shard Quarantine ✓ ANSWERED
+**Answer**: Two operations, not one. **`erase` closes a row's history and destroys nothing;
+`scrub` destroys bytes and is the single exception to "nothing is destroyed".** Quarantine needs
+no mechanism. Crypto-shredding is rejected as the general answer and kept where it is free. See
+`integrity.md` (policy), `storage.md` (physical), `distribution.md` (constraint index, cold
+shards), `schema/traits.md` (`Personal`), `cli.md` and `schema/railroad.md` (`ErasureCmd`).
 
-Every existing removal path is deliberately incapable of this. `delete` appends a tombstone and
-the row stays readable at earlier moments. `prune` removes schema objects and orphaned
-branches. `retain`/`drop` discards `LogData` only, never manually. Relocation preserves
-everything by construction. "No subsequent operation can remove it" is stated as a *hazard* in
-`integrity.md` about a plaintext credential reaching the log — which is the admission that the
-capability is missing rather than merely unbuilt.
+**Erasure is restriction of processing, and is documented as such.** GDPR Art. 17(3) exempts
+retention for legal obligation and legal claims, but "kept forever behind an access check" is not
+itself an Art. 17 exemption — it is **Art. 18(2) restriction of processing**, which is a
+recognised shape and the one this design implements. Naming it correctly matters: describing it
+as erasure invites the assumption that bytes are gone. The retained copy is defensible only
+while it stays inert — unreachable by ordinary query, absent from derived state, unused beyond
+the audit obligation. Where an authority orders destruction, or a regime offers no audit
+carve-out, the operation is `scrub`.
 
-It is needed for three concrete cases: a subject-erasure request, a credential or key that
-reached the log, and PII an unvetted connector ingested. **This is placed before core code
-rather than during it** because one of the candidate mechanisms decides the on-disk log format,
-and retrofitting it is a rewrite.
+**`erase` reuses settled rules rather than adding an evaluation path.** It appends an `Erased`
+tombstone; reads at earlier moments return `Erased` for any token without `bypass erasure`. It is
+retroactive by construction, because a historical read is already checked against HEAD's access
+rules rather than the moment's (OQ-027). It cascades from a shard root for free, because every
+dependent row reaches the root through its FK chain. Eligibility is the `Personal` marker trait
+on the table; the act is the tombstone on the row. A *third* shard-level flag was considered and
+rejected — erasing the root already scopes the act to the shard.
 
-**Unit.** Shards are row-rooted, so "erase this customer" is already a natural unit — the shard
-that customer's row roots. Whether erasure is offered at field, row, or shard granularity, and
-whether the narrower ones are anything more than a shard-level operation with extra steps, is
-undecided. Field-level is the case a connector-ingested column wants; shard-level is the case a
-subject-erasure request wants.
+**A regular tombstone is never an erasure.** `delete` keeps its meaning and its readable history.
+`erase` is a separate, manual, recorded act, reachable only from `ErasureCmd`.
 
-**Mechanism.** Two candidates, and they are not close in cost:
+**Scrub is overwrite-in-place: one primitive, two callers.** Blanking a leaked secret in the
+transaction graph *is* byte destruction, so "erasure needs no destruction primitive" was never
+available — the choice was whether to build one primitive or two. Callers are the routine one (a
+scrub rule matched) and the rare one (an ordered destruction). Three details it forces: the scrub
+node records checksum-before and checksum-after so tamper evidence survives the overwrite;
+payload length is preserved so no locator moves, which makes the gap a length disclosure that
+compaction removes; and a restore replays every scrub node at or before the restore point, which
+is what keeps a re-imported dump from being the way scrubbed data returns.
 
-- **Overwrite in place.** Zero the payload bytes in the log extent and rewrite the affected
-  `log_index` entries. Simple, but it is the one operation that mutates a written extent, and
-  every argument for the append-only log is an argument against admitting it.
-- **Crypto-shredding.** Encrypt each shard under its own key and destroy the key. The log stays
-  byte-immutable and erasure becomes a deletion in a key table, which is a thing the system
-  already knows how to do and to replicate. The cost is that it puts a cipher between mmap and
-  the Cap'n Proto message, and the zero-copy read path (`storage.md`) is a load-bearing claim
-  that would have to be re-argued or scoped to encrypted-shards-only.
+**Scrub rules are `Configuration`, and they are rules, not rows per field.** A default pattern set
+ships (`password`, `passphrase`, `secret`, `token`, `api_key`, `ssn`, `cvv`) matching on field
+path and document key. Auto-inserting a config row per matching field was rejected: a schema
+commit writing configuration makes the table half-authored and half-derived, so a diff can no
+longer say who decided what — and one default pattern already covers every field named
+`password` that will ever exist.
 
-Crypto-shredding aligns suspiciously well with row-rooted shards — one key per shard root *is*
-one key per customer — which is the argument for taking it seriously despite the read-path
-cost.
+**Detection is three layers, preferred in order**: the type at declaration; a static check at
+schema commit, which is free because functors are transparent (OQ-001) and the walk that does
+static access analysis also answers "does this route reach a `Secret` source?"; and a runtime
+matcher over document keys that runs *before the frame is written* on the two dynamic paths that
+actually leak, HTTP request logs and connector payloads. Scrub-then-violation is what remains for
+a rule taught too late, and subsequent writes of that field store a keyed deterministic digest so
+a brute-force attempt stays distinguishable from a user retyping (`auth.md`).
 
-**Quarantine is the weaker sibling and may be the more common one.** Marking a shard
-unreadable and unreplicated pending review destroys nothing and is reversible, which is what an
-operator actually wants in the first hour of an incident. Whether it is a distinct mechanism or
-the mandatory first step of erasure is undecided; it is also cheap enough that it might be
-answerable ahead of the rest.
+**The unique-constraint leak decided the constraint index format.** Tombstoning a row leaves the
+question of whether its `unique` value is freed, and both obvious answers are wrong: freeing a
+root table's key breaks routing, because that key *is* the cluster shard directory and the
+directory would stop being a function over history; reserving it leaves the erased value in a
+replicated index in another shard. The resolution is that **the table-wide `unique` index stores
+a keyed digest and partitions on it, always** — not only after an erasure. Uniqueness is
+equality-only, so the plaintext was never needed; constraint shards then hold no personal data,
+and erasure has nothing to propagate to them. The key is per constraint, generation-tagged,
+scoped to its comparison scope — a per-server key would produce two digests for one value and the
+constraint would silently never fire. Cost accepted: no cluster-wide ordered index on the column,
+which was never usable anyway.
 
-**Open sub-questions beyond mechanism:**
+**A reserved value is released only deliberately.** Placement keys are never released; any other
+`unique` may be, by an explicit `release` recorded with authority and reason, and only where the
+owning row is deleted or erased. Consequence made normative: a lookup by unique value resolves at
+the query's sample moment, not at HEAD.
 
-- **What a read returns afterwards.** It wants a `Null`-derived type, but `Redacted` is already
-  taken by access-control denial (OQ-005) and means "you may not see this", not "this no longer
-  exists". `Erased` is the obvious spelling.
-- **Replication.** An erasure must propagate and must not be optional — a tertiary that missed
-  it still holds the data. A prune node is already a recorded graph node, so there is a shape
-  to copy, but prune is advisory in a way this cannot be.
-- **Derived state.** Materialized views, `Doc indexed` shredded trees, LMDB indexes, and
-  `system.integrity.Violation.observed` all hold copies. Rollup levels are the hard case: the
-  source is pruned by the time the rollup exists, so the rollup is the only record and may
-  itself carry the PII.
-- **Exports and backups.** `export shard … to` (`cli.md`) writes bytes outside the system
-  entirely, and no in-system mechanism reaches them. Whether that is in scope or is documented
-  as an operator obligation needs deciding, not ignoring.
-- **Authorization and audit.** Erasure is the one act that destroys evidence, so the record
-  *that* it happened, who ordered it, and under what authority has to survive it — analogous to
-  a `Waived` violation carrying its reason.
+**Derived state is handled by what it is.** Materialized views and shredded document trees are
+recomputable, so a refresh drops the row. Two are not: a rollup whose group key is a `Personal`
+field is the only surviving record and warns at schema commit; and an interned document key is
+schema replicated to every server, which is why scrub rules match document keys and why
+`Doc indexed` gained a key-shape rule (see OQ-033).
 
-**Constraint**: whatever is chosen must not become a general edit primitive. It is the single
-exception to "nothing is destroyed", it must be recorded as a graph node the way a prune node
-is, and it must be impossible to reach from the query language — which is why `delete!` was
-withdrawn rather than given these semantics (OQ-005, `schema/queries.md`).
+**Quarantine is expressible, not built.** "Unreadable and unreplicated pending review" is a
+revoked namespace grant plus a range-tree entry with no serving roles. Both exist, both are
+reversible. A `quarantine` verb was rejected because it would restate what grants and role
+assignment already say, and the two would drift.
 
-### OQ-037: Reversible Secret Storage
-**Question**: What type constructor stores a secret the server must be able to read back, and
-where does its key live?
+**Cold shards relax placement, not role count.** Three role holders always. A flat-file dump is
+not a replica — not verified, not sequence-tracked, not in the swarm — and over a seven-year
+audit window the failures that arrive are regional loss and bit rot, which two geodiverse copies
+defend against and one unverified file does not. What may be relaxed is hardware class and write
+load: a sealed cold shard on three cheap hosts costs nearly nothing, and moving it there is a
+range-tree edit. Where an operator insists on one copy plus a dump, the honest form is a
+content-addressed dump whose checksum is a graph node and which a scheduled event re-reads.
 
-`Secret` is a type property; `Hashed a` is the one constructor carrying it, and it is one-way
-by construction. That covers every credential verified by re-deriving — a password, an API
-key, a WebAuthn public key. It does not cover a credential the server must *reproduce from*: an
-authenticator app's shared secret (RFC 6238) has to be recovered to compute the current code,
-and a connector's outbound credential has to be recovered to authenticate with. Neither is
-expressible, so **a method needing a recoverable secret cannot currently be declared**
-(`auth.md`).
+**Sunset is proposed, never automatic**, on the rule that already governs materialized views —
+an operation that moves authority is not automatic, and inactivity is a clock reading besides.
+**Rolling up `UserData` history is a `retain` chain with a predicate, not a command**, which
+keeps "pruning is only ever a consequence" intact while giving the row-targeting that was wanted;
+per-field timestamps over a pruned range read `NotRetained` rather than a wrong answer.
 
-**Scope narrowed.** This does *not* block having a second factor. A **delivered** one-time code
-is an occurrence rather than an enduring capability, so it is a `Challenge` row in its own
-`LogData` table rather than a `Credential`: generated per attempt, stored `Hashed`, verified
-with `matches`, sent by an `on state is Issued emit` event, expiring by `Behavior`, and pruned
-by a `retain` chain. It needs nothing that does not exist. What remains blocked is narrower
-than "multi-factor" — it is authenticator apps and outbound connector credentials
-specifically.
+**Exports stay an operator obligation**, now with one in-system guarantee attached: the restore
+replay rule above.
 
-The shape is presumably `Encrypted a using <policy>`, mirroring `Hashed a using
-system.crypto.HashPolicy.…`, and it would inherit `Secret`'s four effects unchanged except for
-reads. What is undecided is everything underneath:
+**Rejected: crypto-shredding as the general mechanism.** It aligns well with row-rooted shards,
+but it puts a cipher between mmap and the Cap'n Proto message and would have forced the zero-copy
+read path to be re-argued. OQ-037 makes it available for free in the one place it costs nothing —
+destroying a data key destroys every `Encrypted` value under it — because decryption there is
+never on the read path.
 
-- **Where the key lives.** Not in the same shard as the ciphertext, or the pair travels
-  together in every backup and every replication stream. An external KMS is the conventional
-  answer and is the first external dependency in a system that has none.
-- **Whether reads are a functor at all.** Decryption on read is a per-row operation on the
-  read path, which is the path `storage.md`'s zero-copy claim is about — the same collision
-  crypto-shredding runs into in OQ-036, and the two should probably be answered together.
-- **What a read returns to a token that may not decrypt.** `Sealed` means "one-way"; this is
-  not that.
-- **Rotation.** Re-encrypting under a new policy is a rewrite of every affected row, which the
-  append-only log makes an append of new versions — bounded, but not free, and it interacts
-  with `enforce forward` the way password policy rotation already does.
+**Still open**: nothing blocking. The empirical thresholds are OQ-033 (key cardinality) and
+OQ-035 (extent and segment sizing).
 
-Blocks TOTP specifically (OQ-011); does not block the `User`/`Credential` split, which is
-settled.
+### OQ-037: Reversible Secret Storage ✓ ANSWERED
+**Answer**: `Encrypted a using system.crypto.CipherPolicy.…`, stored under **envelope
+encryption**, with **decryption as an `Effect` and never a read**. See
+`schema/types.md#encrypted-types` and `auth.md#envelope-encryption-and-key-custody`.
+
+**The effect ladder decides the shape before any algorithm question does.** `unwrap` is an
+external call, and there is no lift from `Effect` to `Tx`, so a commit cannot wait on a key
+service. Envelope encryption is the arrangement that satisfies it: an authority wraps a data key,
+each server unwraps it once at startup or rotation in `Effect` in the generation pool, and
+commits encrypt with the cached key making no external call at all. `WrappingAuthority` is a
+`Reference` row naming compiled-in Haskell — the `system.events.Handler` pattern reused — so a
+key file, a PKCS#11 token, and a cloud KMS are interchangeable with no new mechanism.
+
+**Servers do not share a private key, and do not have to.** Wrapping the data key to each
+server's public key (X25519; `age` is the packaged form and accepts existing SSH keys as
+recipients) means each server holds only its own private key, on disk, outside the graph, and
+adding a server re-wraps a small blob. This dissolves the concern that made "keep the key and the
+secret on the same schema shard" look acceptable as a v1 — **that compromise was offered and is
+not needed**, so it is rejected rather than deferred. Two specifics recorded so they are not
+re-derived: `ssh-ed25519` is a signing key and reaches encryption only through its X25519
+birational map, and the wrapping key never encrypts row data.
+
+**Decryption is an `Effect`, never a read**, which answers three of the four open sub-questions at
+once. Both consumers of a reversible secret are handler-side — TOTP verification and connector
+authentication — so no cipher sits on the read path, `storage.md`'s zero-copy claim is untouched,
+and the collision this question shared with OQ-036 does not exist. What a read returns to a token
+that may not decrypt needs no invention: every token gets `Sealed`, and who may call `reveal` is
+an ordinary grant.
+
+**Rotation has two tiers.** Rotating the wrapping key re-wraps one blob per data key and touches
+no row. Rotating the data key re-encrypts affected rows lazily on write under `enforce forward` —
+the same machinery as password policy rotation, since each value records its policy.
+
+**Crypto-shredding falls out free** for `Encrypted` fields: destroy the data key and every value
+under it is unrecoverable. It reaches only encrypted fields; plaintext that reached the log is
+scrubbed (OQ-036).
+
+**Scope narrowed and unchanged**: a delivered one-time code is a `Challenge` row and needs none of
+this. Unblocks authenticator apps (OQ-011) and outbound connector credentials.
 
 ## Must Resolve During Core Development
 
@@ -350,7 +392,10 @@ Key decisions:
 - **Placement is separate from identity and needs only a total order.** A candidate key answers *which row is this*; placement answers *where does it go*. `DataId` is excluded from satisfying the candidate-key rule — counting the surrogate would make it vacuous — but it is monotone, total, and present on every row, so it is always a valid *placement* key. Consequence: **every shard can be split**, and a declared partition space only chooses where the cut falls. `LogData` therefore gets the root it was missing: a `system.shards.LogSegment` row keyed `{ origin_server, period_start, branch }`, with all three components derivable or decidable at write time — `origin_server` from bytes 6–7 of the row's own `DataId` (the virtual column, declared nowhere), period from bytes 0–5, branch from the `retain` predicate, which may reference only the rollup's group keys and the time source. Routing costs zero stored bytes, the log table itself stays keyless, the segment root carries the key instead, and retention aligns to segments so pruning becomes an unlink. A third layer is named to keep this safe: an **extent** is storage, a **shard** is authority, and `PhysicalLocator` already draws the line by carrying `plShard` but *not* the byte offset — so moving a row within its shard rewrites one `log_index` value and is invisible to the graph, while moving it across shards is a recorded split. Splitting a shard with one root row is thus possible but yields a **shard group** sharing a primary, because non-root uniqueness, `assert` evaluation, and `Ordinal` assignment are all defined as within-one-shard. **No syntax was added**: a `shard by <grain>` clause on `retain` was considered and rejected, since the segment key supplies the same alignment for free.
 - **Operational tuning is a row, not a trait.** A trait declares what a table *is*; a `Configuration` row declares how a deployment *treats* it. Extent size and segment grain track hardware and must differ between staging and production without branching the schema, so they are rows in `system.shards.ExtentPolicy` keyed by table path, with `system.shards.ExtentOverride` keyed `{ table, server }` for per-server exceptions, resolved most-specific-first — two tables rather than one, because a `Null`-derived "all servers" variant in a key is rejected. Traits consequently take **no parameters**; where a declaration must name a policy the spelling is a reference to a policy row, as `Hashed Text using system.crypto.HashPolicy.password_v2` already does. Same separation as enforcement modes, queue retry policy, and retention.
 - **`system` is a namespace, not a replication class.** It had been listed as a fifth shard type in `transaction-graph.md` and as a table type in `namespaces.md`; both are corrected. Tables in `system` carry ordinary replication traits — `system.integrity.Violation` is `LogData`, `system.shards.Node` is `Configuration`. Namespace says whose a table is and who may see it; trait says how it propagates.
-- **There is one `delete`.** The `delete!` "hard delete" spelling is **withdrawn**. Its documented distinction from `delete` was not one — both left the record in the transaction graph and removed the row from the current state, which is the definition of a delete, so `delete!` was redundant syntax carrying a sigil that promised something it did not do. `delete` is an ordinary mutation: it appends a tombstone version, the row is absent at sample moments at or after it and present at any earlier `at`, the `DataId` is never reused, and writing a new version restores it. The operation `delete!` would have had to mean — destroying bytes already in the append-only log — is real and needed, but it is an administrative act on a shard rather than a row mutation, so it is not reachable from the query language at all. See OQ-036.
+- **There is one `delete`.** The `delete!` "hard delete" spelling is **withdrawn**. Its documented distinction from `delete` was not one — both left the record in the transaction graph and removed the row from the current state, which is the definition of a delete, so `delete!` was redundant syntax carrying a sigil that promised something it did not do. `delete` is an ordinary mutation: it appends a tombstone version, the row is absent at sample moments at or after it and present at any earlier `at`, the `DataId` is never reused, and writing a new version restores it. The operations `delete!` would have had to mean are `erase` and `scrub`, both administrative acts reachable only from `ErasureCmd` and never from the query language. See OQ-036.
+- **Removal is administrative, and there are three verbs, not one.** `erase` closes a row's history, `scrub` destroys bytes, and `release` frees a reserved `unique` value. All three are `ErasureCmd` productions, all three take a mandatory `reason`, and none appears in `Query` or `Mutation` — which is the constraint that withdrew `delete!` rather than giving it these semantics. `row` was considered as a marker (`erase row …`) and not reserved: it is the likeliest identifier in any schema, and `erase <table> <id>` is unambiguous without it. `bypass` gained a second kind, `erasure`, kept separate from `bypass access` because reading an erased row's history is narrower and rarer than administering a namespace (OQ-036).
+- **`diff` compares two graph points, never two moments.** `Table diff "a" to "b"` returns the query's rows keyed by their derived key with generated `before`, `after`, and `change` columns; a degenerate derived key is rejected, since nothing would identify a row across the two points. Graph points rather than moments because a diff must be reproducible and a moment is not a graph position. **There are no window functions and none are planned** — a rollup level is a real table and queries compose, so period-over-period comparison is a shifted self-join. `union`, `except`, `intersect`, `window`, `over`, and `partition` are consequently unreserved. `now`, as a query-level binding for relative sampling (`at now - 30 day`), is available if wanted and currently unneeded.
+- **`indexed` gained a `using`.** `Doc indexed using <predicate>` names a `Text -> Bool` over the document key; a key that fails it spills instead of interning, however far below the cap the field is. `using` rather than a new clause word, because the established spelling for a declaration that must name a policy is a reference to a function or a row (`Hashed … using`), and this reuses it with no reserved word added. `deprecate` correspondingly takes a `NamePattern` rather than a bare `QName`, so a polluted key table is cleaned in one statement (OQ-033).
 - **The virtual columns are projections of the row identifier**, which makes `created_at` an instance of a rule rather than a special case: bytes 0–5 are `created_at`, bytes 6–7 are `origin_server`, and a component's id suffix is `ordinal`. Two are added. **`origin_server`** is typed `:> system.shards.Node` rather than `Int` — as a bare 2-byte integer every "which server wrote this" query is a manual join against a magic number meaningless outside the registry that defines it. It is the only virtual column that is a reference and the only one resolving through a candidate key rather than a `DataId`, since the projected bytes *are* `Node`'s key; `Node` is `Configuration` so the join is local everywhere, and its rows become permanently non-prunable, which costs nothing at one row per server and is what keeps a retired server's historical rows readable (an `| RetiredServer` alternation was rejected — it puts an absence case in every query for no gain). `system.shards.LogSegment` had been hand-rolling this projection as a declared `server` field; that field is **removed** and its key now names `origin_server` directly, which required settling that virtual columns are eligible in a key — all of them but `updated_at`, which is excluded for the same reason a `Behavior` is: not because it is virtual, but because it moves. `period_start` stays declared, and the asymmetry is the point — `period` is a `Configuration` value that may be retuned while routing is never revised, so a truncation under a mutable policy must be pinned at write time; bytes 6–7 cannot be retuned and so need no pinning. **`ordinal`** closes a real gap rather than adding sugar: without it there is no way to *state* document order in a query, only to receive it from a range scan, which cannot be restated after a join or reversed. It is the position at the row's own level, not the full path — nesting makes a path variable-length, the rendered identifier already spells it, and a column whose type varied with nesting depth would be worse than what it duplicates. **The sequence counter (bytes 8–11) stays unexposed**: it disambiguates within one server-millisecond and is a tiebreak rather than an ordering — two servers' values are incomparable, and the clock-regression clamp deliberately continues it across a held timestamp — while `DataId` order already gives the total order anyone reaching for it wants. `updated_at` remains the odd one out, reading the head locator rather than the identifier. See `transaction-graph.md`.
 - **Effects are a ladder, and one missing lift carries the whole "no external calls in a commit" rule.** `Pure ⊂ Read ⊂ Tx`, with `Effect` outside that chain and connected by exactly one arrow: `commit :: Tx a -> Effect a` exists, and nothing takes an `Effect a` to a `Tx a`. This **replaces the `a -> IO b` signature rejection**, which was weaker — a signature check does not close `traverse` over an effectful function inside a validation, or one hidden behind a type alias, and an unconstructible type does. `IO` no longer appears in any DataCode signature at all. The arrow that *does* exist is what makes handlers workable: a handler runs in `Effect` and calls `commit` freely, so advancing a queue row's state or writing 50 000 ingested rows in batches is an ordinary transaction subject to every validation and assert. It also fixes retry granularity by placement — everything before the first `commit` is redone on retry, everything after is not. `Effect`'s capabilities come from the handler's `Configuration` row, never from code, so a handler cannot reach an ungranted host and never holds a credential in a compiled constant. See `schema/functions.md`.
 - **`every <Expr> emit <queue> { … } where <cond>` is the second event trigger form**, and its interval is an **expression**, not a literal — a `LengthLit`, a field of the row, or a `Configuration` path are one production. That is what retired the interval-override mechanism that was briefly proposed: you do not need an override when you can point the expression at wherever tuning should live. It fires per row of the table it is declared on, so fan-out is what "declared on a table" already means rather than a feature of `every`. **False-to-true still holds** — sampling observes the transition between ticks instead of across a write — which costs a `system.events.TriggerState` bit per (trigger, row) and is why schema commit **warns** when the solver could have closed the condition instead. There is deliberately **no top-level cron form**: a timer job always has rows that parameterize it (which feed, which directory, which account), so that table is the producing table and the payload stays typed against a row it can name. `schedule` and `cron` were considered and not reserved.
@@ -527,13 +572,28 @@ using UUIDs as object keys would grow a `Reference` table on every node
 (`schema/documents.md`). Above the cap, keys spill to a shard-local data table; the cap is
 what makes that boundary safe.
 
-**Needs**: an empirical default, and a policy for what happens as a field approaches it.
-Spilling silently makes the field quietly slower and larger; refusing to spill makes ingest
-fail, which is exactly the outcome `monitor` mode exists to avoid.
+**The policy half is answered** (OQ-036). Three moves at increasing cost, none of which rewrites
+history:
 
-**Notes**: should be tunable per field and overridable per connector, in the same spirit as
-OQ-009's rendering thresholds. Validate against real webhook payloads (Stripe, GitHub) and
-real application log context before fixing a number.
+- **Prevent.** `Doc indexed using <predicate>` sends keys failing a shape test straight to spill,
+  however far below the cap the field is. This is the fix; a document keyed by identifiers is a
+  map keyed by a value, and the rule is how the schema says so.
+- **Demote.** `deprecate` on an interned key, or on a pattern, stops new writes from interning it
+  while existing rows keep resolving. It does not reclaim tags — tags are assigned monotonically
+  and never reused, and proving no row holds one is not decidable while unmerged branches exist —
+  so the counter does not move back and nothing is rewritten. On a general `Extensible`
+  `Reference` table, where there is no spill target, the same verb reads as a denylist.
+- **Supersede.** Redeclaring the field mints a new key table at a new schema node. The cap resets,
+  historical rows decode against the key table at their own node, and the old table becomes
+  prunable once orphaned.
+
+Crossing a fill threshold raises a violation naming the *shape* found (`94% match
+/^[0-9a-f-]{8,}$/`), which is what makes a shape rule get written while it costs one declaration
+rather than a supersession.
+
+**Still open**: the number. Needs an empirical default, tunable per field and overridable per
+connector in the same spirit as OQ-009's rendering thresholds. Validate against real webhook
+payloads (Stripe, GitHub) and real application log context before fixing one.
 
 ### OQ-034: Behavior-Triggered Event Scheduling
 **Question**: How does the scheduler handle an `on` condition whose subject is a `Behavior`?
@@ -754,8 +814,9 @@ enough to take it later without disturbing anything, and that is settled:
   factor is available in the first pass. Separating enduring capability from occurrence is the
   `User`/`Credential` split paying for itself twice.
 - **Not every method fits `Hashed`** — an authenticator app's shared secret must be recoverable.
-  That is OQ-037, and it blocks authenticator apps and outbound connector credentials
-  specifically, not multi-factor and not the split above.
+  That is `Encrypted`, answered in OQ-037, so authenticator apps and outbound connector
+  credentials are no longer blocked. Reach for the delivered code first regardless: it needs no
+  key custody.
 
 Implementation remains post-MVP. See `auth.md`.
 

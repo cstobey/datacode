@@ -319,7 +319,8 @@ Built-in absence types (all extend `Null`):
 | `Redacted` | Present but access-controlled away |
 | `Pending` | Not yet computed or arrived |
 | `Deleted` | Tombstoned in history |
-| `Sealed` | Present but one-way — a `Secret` value that cannot be read back |
+| `Erased` | Tombstoned and history closed — see [../integrity.md](../integrity.md#erasure-restricts-scrub-destroys) |
+| `Sealed` | Present but not readable through a query — a `Secret` value |
 | `JsonNull` | An explicit `null` received in a document |
 | `NoKey` | This node is identified by position, not by name (see [documents.md](documents.md)) |
 | `NotRetained` | The retention policy did not cover this bucket (see [aggregates.md](aggregates.md)) |
@@ -367,7 +368,7 @@ Marking a type `Secret` has four effects, all enforced at schema commit:
 
 | Effect | Rule |
 |---|---|
-| Reads | The field resolves to `Sealed`, a `Null`-derived absence type. Never to the stored bytes. |
+| Reads | The field resolves to `Sealed`, a `Null`-derived absence type. Never to the stored bytes, for any token. |
 | Predicates | Only `a -> Bool` is admitted. `a -> Either Error a` and `a -> Maybe b` are rejected. |
 | Comparison | `==` and `/=` against a `Secret` field are compile-time errors. |
 | Diagnostics | Any error payload produced while handling the value is erased and replaced by the failing predicate's address. |
@@ -460,8 +461,45 @@ Two restrictions:
   inputs produce different digests, so the constraint would silently never fire — a lie the
   schema would keep telling forever.
 
-`Hashed` is one-way. Reversible encryption at rest is a different type with different key
-management and is not currently specified.
+`Hashed` is one-way. The reversible constructor is `Encrypted`, below.
+
+## Encrypted Types
+
+`Encrypted a` is the second `Secret` constructor: it accepts an `a`, validates it, and stores a
+ciphertext the server can recover. It exists for the two credentials that must be reproduced
+rather than re-derived — an authenticator app's shared secret and a connector's outbound
+credential.
+
+```
+type TotpSecret : Encrypted Text using system.crypto.CipherPolicy.totp_v1
+```
+
+The shape mirrors `Hashed a using …` exactly, and for the same reason: `using` names a policy
+row, so the algorithm and its key reference are data rather than part of the type declaration.
+Every stored value records the policy that produced it, which makes rotation the ordinary
+`enforce forward` path rather than a special one.
+
+### Decryption Is an `Effect`, Never a Read
+
+> **An `Encrypted` field reads as `Sealed` for every token. Plaintext is reached only by
+> `reveal`, which runs in `Effect`.**
+
+This is the whole of the read story, and it is what keeps encryption off the query path. Both
+consumers of a reversible secret are handler-side — TOTP verification and connector
+authentication — so no cipher ever sits between mmap and the Cap'n Proto message, and
+[../storage.md](../storage.md#full-zero-copy-read-path)'s zero-copy claim is untouched.
+
+It also answers what a read returns to a token that may not decrypt: the same thing every other
+token gets. Who may call `reveal` is an ordinary grant, decided where access is decided rather
+than inside the type.
+
+`Encrypted` inherits every `Secret` restriction — `Sealed` reads, `a -> Bool` predicates only,
+no `==`, erased diagnostics — and adds none. `unique`, `indexed`, and `order by` are rejected on
+such a field for the reason they are rejected on a `Hashed` one: the constraint or arrangement
+would be over ciphertext and could not mean what it says.
+
+Key custody, wrapping, and rotation are in
+[../auth.md](../auth.md#envelope-encryption-and-key-custody).
 
 ## The `is` Operator
 

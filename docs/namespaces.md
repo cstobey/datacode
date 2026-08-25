@@ -143,6 +143,12 @@ assert bodies rather than off their names
 exemption is exact rather than a matter of whether a rule was named the way its author
 expected.
 
+`bypass erasure` is the second kind and is independent of the first. It lets a token read the
+history of a row that has been erased, and it is kept separate because that is a narrower and
+rarer permission than administering a namespace — an auditor may need it where an application
+administrator should not have it. A grant may carry either, both, or neither. See
+[integrity.md](integrity.md#erasure-restricts-scrub-destroys).
+
 Two properties follow from putting this in the grant rather than in the tables. Bypass is
 **one queryable place** — "who can see everything under `app.pm`" is a query against
 `system.auth.Grant`, not a scan of every table's asserts. And it is **subtree-scoped** like

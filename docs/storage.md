@@ -93,10 +93,29 @@ pair, because both run on the same queue and only one of them may lose anything:
 | Relocation | volume, background | nothing — not even a locator |
 | Compaction | schema change, background | nothing — every version survives |
 | Pruning | a declared `retain` chain | granularity, deliberately, after the rollup exists |
+| Scrubbing | an administrative act or a scrub rule | one field's bytes, irrecoverably |
 
 The consequence relied on elsewhere: **anything derivable from a row's version chain stays
 derivable for as long as the row exists.** That is what lets per-field timestamps be a cache
 rather than a stored column ([transaction-graph.md](transaction-graph.md#per-field-timestamps)).
+Scrubbing is the one operation that breaks it, which is why it is administrative and why it
+records what it did.
+
+### Scrubbing Overwrites In Place
+
+Scrubbing is the single operation that mutates a written extent. Policy — who may invoke it,
+what a scrub node records, and how tamper evidence survives — is in
+[integrity.md](integrity.md#erasure-restricts-scrub-destroys). Three physical rules:
+
+- **The payload allocation keeps its original length.** `log_index` maps a locator to
+  `{offset, length}`, so a shorter replacement would force every row after it in the extent to
+  relocate. Zeroing in place rewrites the frame and its checksum and touches no index at all.
+- **The gap discloses the length of what was there.** This is a physical fact, not a policy
+  choice, and it is why the scrub node records the length rather than pretending otherwise.
+- **Compaction removes the gap.** A scrubbed run is dead space that the next compaction pass
+  reclaims through the ordinary locator indirection. So compaction is not only a space
+  optimization here — it is the step that removes the length disclosure, which is reason enough
+  to prioritize scrubbed extents on the maintenance queue.
 
 ### Clustering Order
 

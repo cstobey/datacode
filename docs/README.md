@@ -18,15 +18,15 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [schema/README.md](schema/README.md) | Design philosophy, visibility layers, notation conventions (`:` vs `:>`, clause order, layout) |
-| [schema/types.md](schema/types.md) | Primitives, domain types, sum types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret` and `Hashed` |
+| [schema/types.md](schema/types.md) | Primitives, domain types, sum types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret`, `Hashed`, `Encrypted` |
 | [schema/tables.md](schema/tables.md) | Table bodies, fields, defaults, candidate keys, ordering, foreign keys, sub-tables |
-| [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Extensible`, `Queue`/`QueueState` |
+| [schema/traits.md](schema/traits.md) | Traits, multiple inheritance, replication traits, `Component`, `Keyless`, `Personal`, `Extensible`, `Queue`/`QueueState` |
 | [schema/constraints.md](schema/constraints.md) | `assert`, path constraints, presence and absence, access control |
-| [schema/documents.md](schema/documents.md) | The `Doc` type, shredding, key interning |
+| [schema/documents.md](schema/documents.md) | The `Doc` type, shredding, key interning, key shape rules, demotion |
 | [schema/aggregates.md](schema/aggregates.md) | Aggregate functions, mergeable aggregates, `retain` chains, log retention |
 | [schema/templates.md](schema/templates.md) | Templates as text with holes, cardinality as control flow, `using`, escaping by type |
 | [schema/evolution.md](schema/evolution.md) | Redeclare, rename, retype, deprecate, prune, split, merge, ADT extension |
-| [schema/queries.md](schema/queries.md) | Filter, projection, joins, grouping, derived tables, mutation |
+| [schema/queries.md](schema/queries.md) | Filter, projection, joins, grouping, derived tables, mutation, historical queries and `diff` |
 | [schema/functions.md](schema/functions.md) | Scope, the effect ladder, auto-wrapping, function types, function-valued columns |
 | [schema/functors.md](schema/functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [namespaces.md](namespaces.md) | Namespace tree, visibility levels, namespace ACL |
@@ -36,8 +36,8 @@ diagrams.
 | Document | Covers |
 |---|---|
 | [transaction-graph.md](transaction-graph.md) | Append-only DAG, branches and tags, shards, `DataId`, component ordinals, `PhysicalLocator` |
-| [storage.md](storage.md) | Append-only log, LMDB indexes, Cap'n Proto, zero-copy reads, materialization |
-| [distribution.md](distribution.md) | Server roles, the range tree, push/fetch replication, schema and constraint shards, cross-shard transactions, bulk mutations, shard splits, geo-diversity |
+| [storage.md](storage.md) | Append-only log, LMDB indexes, Cap'n Proto, zero-copy reads, materialization, scrubbing |
+| [distribution.md](distribution.md) | Server roles, the range tree, push/fetch replication, schema and constraint shards, cross-shard transactions, bulk mutations, shard splits, durability classes, cold shards, geo-diversity |
 | [tech-stack.md](tech-stack.md) | Library and format decisions, with the OQ and spike that settled each |
 | [dynamic-loading.md](dynamic-loading.md) | GADT DSL + `Data.Dynamic`; full addendum of options considered |
 
@@ -49,7 +49,7 @@ diagrams.
 | [ide.md](ide.md) | Admin IDE — ER diagram, sidebar, functor editor |
 | [api.md](api.md) | Route registration, versioning, HTTP dispatch, request logging |
 | [api-and-rendering.md](api-and-rendering.md) | Content-type dispatch, HTML rendering, themes, information density |
-| [auth.md](auth.md) | Token types, access control functors |
+| [auth.md](auth.md) | Token types, credential storage, envelope encryption and key custody, access control functors |
 
 ## Integration and Operations
 
@@ -57,7 +57,7 @@ diagrams.
 |---|---|
 | [connectors.md](connectors.md) | External data ingestion, sync protocol, conflict resolution |
 | [events.md](events.md) | Event scheduler, the two trigger forms, queue tables, priority, handlers, volume-based backoff, repair queues |
-| [integrity.md](integrity.md) | Nonconformance, enforcement modes, the violations table, admin reporting |
+| [integrity.md](integrity.md) | Nonconformance, enforcement modes, the violations table, admin reporting, erasure and scrubbing |
 
 ## Status
 

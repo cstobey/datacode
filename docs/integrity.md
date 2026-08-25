@@ -6,6 +6,9 @@ writes something its own schema permits and ours does not. This document covers 
 detects that, records it, and reports it, without violating the append-only guarantee and
 without blocking the writes that keep the system running.
 
+It also covers the two operations by which data leaves DataCode — `erase` and `scrub` — because
+the second is triggered by the mechanism described here and recorded through it.
+
 The term for such a row is **nonconforming**. ("Dirty" is avoided: in database vocabulary it
 already means *modified but not yet written* — dirty page, dirty read — which is close enough
 to be confusing and far enough to be wrong.)
@@ -202,7 +205,7 @@ table system.integrity.Violation : LogData {
   functor       : FunctorRef,
   schema_node   : DataId,
   origin        : Derived | Observed | Forced,
-  observed      : Bytes | Redacted | NotGiven,
+  observed      : Bytes | Redacted | Erased | NotGiven,
   state         : Open | Acknowledged | Waived Text | Repaired,
 
   assert readableAccess { authed_user `canRead` subject_table }
@@ -272,13 +275,15 @@ This is enforced by the type, not by reviewer discipline. A `Secret` type admits
 to return a value at all; and the runtime erases error payloads at the boundary as a
 backstop. See [schema/types.md](schema/types.md#secret-types).
 
-The reason this matters more here than elsewhere: the transaction log is append-only. A
-plaintext credential that reaches it is there permanently, and no subsequent operation can
-remove it. That is a statement about the system as designed, not a permanent one — the
-mechanism by which anything leaves DataCode for good is
-[OQ-036](open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine).
-Until it is answered, keeping the value out of the log is the whole defence, which is why it is
-enforced by the type rather than by review.
+`observed` also reads `Erased` where the subject row has been erased, for the same reason: the
+report must stay useful without becoming the copy that survives the act.
+
+The reason type enforcement matters more here than elsewhere: the transaction log is
+append-only, so a plaintext credential that reaches it is there until someone destroys bytes on
+purpose. That operation exists — see [below](#erasure-restricts-scrub-destroys) — but it is
+administrative, it is the single exception to "nothing is destroyed", and needing it is already
+a failure. Keeping the value out of the log remains the defence, which is why it is enforced by
+the type rather than by review.
 
 ## Reporting and Administration
 
@@ -342,6 +347,144 @@ row, reported out of band; it is not a change to the row's value or its type.
 
 **Not a blocker for reads.** No mode causes a read to fail or a field to disappear. Access
 control is the only thing that changes what a read returns.
+
+## Erasure Restricts, Scrub Destroys
+
+Two operations remove data. They are not variants of each other, and conflating them is the
+mistake this section exists to prevent.
+
+| | `erase` | `scrub` |
+|---|---|---|
+| Removes | access to a row's history | bytes from the log |
+| Eligibility | tables carrying [`Personal`](schema/traits.md#personal) | any field, any table |
+| Invoked by | an administrator, per row or shard root | an administrator, or a scrub rule |
+| Recorded as | a graph node | a graph node |
+| Reachable from the query language | no | no |
+
+Neither is spelled as a `delete`. `delete` appends an ordinary tombstone and leaves history
+readable ([schema/queries.md](schema/queries.md#delete-appends-a-version)) — which is what
+`delete!` also did, and why that spelling was withdrawn rather than given these semantics.
+
+### Erasure Is Restriction of Processing
+
+`erase` appends an `Erased` tombstone. The row is absent from the current state like any deleted
+row, and unlike a deleted row it reads `Erased` at every *earlier* sample moment as well, for
+every token that does not hold `bypass erasure`.
+
+Call this what it is. It is **restriction of processing** — GDPR Art. 18(2) — not Art. 17
+destruction, and describing it as erasure invites someone to assume the bytes are gone. The
+retained copy is defensible only while it stays inert: unreachable by ordinary query, absent
+from derived state, and unused for any purpose beyond the audit obligation that justifies
+keeping it. Where an authority orders actual destruction, or a regime offers no audit
+carve-out, the operation is `scrub`.
+
+Three properties follow from rules already settled rather than being new:
+
+- **Erasure is retroactive by construction.** A historical read is checked against HEAD's access
+  rules, never the moment's (OQ-027), so an erasure decided today closes history today and needs
+  no new evaluation path.
+- **Erasing a shard root cascades.** Every dependent row reaches the root through its foreign-key
+  chain ([schema/tables.md](schema/tables.md#keys-must-be-rooted)), so "erase this customer" is
+  one act rather than a traversal someone writes.
+- **A prior `delete` is unnecessary.** Erasure implies deletion at HEAD.
+
+What must survive the act is the record of it — which row, ordered by whom, under what
+authority, and why — for the reason a `Waived` violation carries its reason.
+
+Derived state holding a copy is handled by what it is. Materialized views and shredded document
+trees are recomputable, so a refresh drops the row. Two cases are not:
+
+- **A rollup whose group key is a `Personal` field.** Its source is pruned by the time it
+  exists, so it is the only record and may itself carry the data. Schema commit warns.
+- **An interned document key.** `DocKeys` rows are schema, replicated everywhere and never
+  pruned, so a payload keyed by an address puts that address on every server. This is the case
+  scrub rules over document keys exist for; see
+  [schema/documents.md](schema/documents.md#key-shape-rules).
+
+The table-wide `unique` index is not on this list, because it never holds the value. See
+[distribution.md](distribution.md#the-unique-index-holds-digests-not-values).
+
+### Scrub Overwrites Payload Bytes
+
+`scrub` is the one operation that mutates a written extent and the single exception to "nothing
+is destroyed". It has one routine caller — a secret that reached the log — and one rare one, an
+ordered destruction that restriction of processing does not satisfy.
+
+A scrub node records:
+
+| Field | Why |
+|---|---|
+| target locator and field | what was scrubbed |
+| byte length | the gap is physically observable regardless; recording it is the honest form |
+| checksum before, checksum after | tamper evidence |
+| authority and reason | the act destroys evidence, so its own record must not be destructible |
+
+**Tamper evidence survives the overwrite.** Verification is defined as "matches the recorded
+checksum, or matches the `after` of a scrub node covering it", so divergence with no scrub node
+is corruption and `verify shard` reports it as such. Without this, the append-only guarantee
+would have been traded for nothing.
+
+Physical mechanics — why length is preserved and what compaction has to do with it — are in
+[storage.md](storage.md#scrubbing-overwrites-in-place).
+
+### Scrub Rules Are Configuration
+
+What must never reach the log is an operational list that moves as APIs move, so it is
+`Configuration` rather than schema:
+
+```
+table system.crypto.ScrubRule : Configuration {
+  pattern : Text where isValidRegex,
+  applies : FieldName | DocKey | Both,
+  reason  : Text,
+  unique rulePattern { pattern, applies }
+}
+```
+
+Rules match on field path and document key. A default set ships covering the obvious names —
+`password`, `passphrase`, `secret`, `token`, `api_key`, `ssn`, `cvv`.
+
+**Nothing is inserted automatically.** A schema commit that wrote configuration rows would make
+the table half-authored and half-derived, so a diff could no longer say who decided what — and
+one default pattern already covers every field named `password` that will ever exist, which is
+what a row per field was for. The type is the guarantee; the rule is the net that catches what
+no type covered. A rule never weakens a `Secret` type.
+
+### Three Layers, in Order of Preference
+
+1. **The type, at declaration.** A `Secret` type has no channel through which a value can
+   escape.
+2. **A static check, at schema commit.** Functors are transparent (OQ-001), so the walk that
+   already performs static access analysis also answers "does this route's projection reach a
+   `Secret` source?" — and such a route is rejected. The same walk warns where a field or
+   document key matches a scrub rule and its type is *not* `Secret`, which is the diagnostic
+   that gets the type declared before anything leaks.
+3. **A runtime matcher, at ingest.** HTTP request logs and connector document payloads have no
+   static shape, and they are where leaks actually happen. The matcher runs over document keys
+   **before the frame is written**, so the plaintext never reaches the log. For those two paths
+   this is the primary defence, not a backstop.
+
+Scrub-then-violation is what remains for a rule taught too late: the bytes are scrubbed, a
+violation is raised with `origin = Forced`, and every subsequent write of that field stores a
+keyed deterministic digest in place of the value. The digest is what makes a brute-force attempt
+distinguishable from a user retyping the same wrong password; on the login path it lands in
+[`system.auth.AttemptDigest`](auth.md#failed-attempt-digests), whose key scope and retention
+rules apply.
+
+### Replication and Restore
+
+A scrub node replicates through the ordinary commit fan-out. Two cases sit outside it:
+
+- **A tertiary holds current state only**, so scrubbing a superseded version reaches nothing
+  there and needs no special handling.
+- **A restore replays scrubs.** `import shard` reinstates bytes as they were when the dump was
+  taken, which would resurrect anything scrubbed since. A restore is not complete until every
+  scrub node at or before the restore point has been re-applied, and the shard does not come
+  online before that finishes.
+
+Exports stay an operator obligation: `export shard … to` writes bytes outside the system and no
+in-system mechanism reaches them. The restore rule above is what stops a re-imported dump from
+becoming the path by which scrubbed data returns.
 
 ## Retention
 

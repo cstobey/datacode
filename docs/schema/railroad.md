@@ -130,11 +130,12 @@ See [types.md](types.md#hashed-types).
 
 ```ebnf
 FieldDecl    ::= Ident RefToken TypeExpr SubTableTraits? SubTableBody?
-                 'unique'? 'indexed'? DefaultClause? WhereClause?
+                 'unique'? IndexedClause? DefaultClause? WhereClause?
 
 RefToken     ::= ':' | ':>'
 SubTableTraits ::= ':' TraitList
 SubTableBody ::= '{' TableBody '}'
+IndexedClause::= 'indexed' ( 'using' QName )?
 DefaultClause::= '=' ( Expr | SeqAlloc )
 SeqAlloc     ::= 'next' Ident
 
@@ -158,10 +159,12 @@ Constraints not expressible in the grammar, enforced at compile time:
   further tables or `Null`-derived types. See the head rule in [README.md](README.md).
 - `SubTableBody` and `SubTableTraits` are only valid with `:>`. `SubTableTraits` mirrors
   `TableDecl`'s trait list and is how an inline sub-table declares `Component`.
-- `indexed` is valid only where the `TypeExpr` is `Doc`. See
-  [documents.md](documents.md).
-- `unique` is rejected on a field whose type is `Secret` (including every `Hashed` type),
-  because per-row salts make the constraint unenforceable in principle.
+- `IndexedClause` is valid only where the `TypeExpr` is `Doc`. Its `using` names a
+  `Text -> Bool` function over a document key; a key that fails it spills instead of interning.
+  See [documents.md](documents.md#key-shape-rules).
+- `unique`, `IndexedClause`, and `OrderByDecl` are rejected on a field whose type is `Secret` —
+  every `Hashed` and every `Encrypted` type. A per-row salt makes `unique` unenforceable in
+  principle, and an arrangement over ciphertext cannot mean what it says.
 - Where the `TypeExpr` head is `Behavior`, the `DefaultClause` is **mandatory** and is the
   behavior's definition rather than a default — its `Expr` must be a `Lambda` of one
   parameter, bound to a `Moment`. `unique`, `indexed`, and `WhereClause` are all rejected on
@@ -389,7 +392,7 @@ See [aggregates.md](aggregates.md).
 EvolutionStmt   ::= DeprecateStmt | PruneStmt
                   | ExtendStmt | ShrinkStmt | VisibilityStmt
 
-DeprecateStmt   ::= 'deprecate' QName
+DeprecateStmt   ::= 'deprecate' NamePattern
 PruneStmt       ::= 'prune' QName
 
 ExtendStmt      ::= 'extend' QName 'with' Variant
@@ -404,6 +407,12 @@ a merge is a `Binding` joining them — both are ordinary queries, so the derive
 losslessness that the dedicated statements could only assert. `split` and `merge` stay reserved
 for `split shard` and `resolve conflict ... using merge`. See
 [evolution.md](evolution.md#split-and-merge-a-table).
+
+`DeprecateStmt` takes a `NamePattern` rather than a bare `QName` so that a polluted key table can
+be cleaned in one statement. On an interned document key it demotes: the key spills from then on
+and existing rows still resolve. On an `Extensible` `Reference` value it is a denylist — a
+connector meeting that value records a violation instead of extending the table. See
+[documents.md](documents.md#demoting-an-interned-key).
 
 `PruneStmt` removes a **schema object** or an orphaned branch. It does not remove log rows:
 those are discarded only by a `retain` chain, and a `LogData` table with no chain is never
@@ -603,6 +612,7 @@ QueryClause  ::= JoinClause
                | OrderByDecl
                | Projection
                | AtClause
+               | DiffClause
                | LimitClause
 
 JoinClause   ::= '><' JoinSource ( 'via' QName )? ( 'as' Ident )?
@@ -610,6 +620,7 @@ JoinSource   ::= TypeExpr
                | '(' Query ')' ( '|' TypeExpr )*
 GroupClause  ::= 'group' Projection
 AtClause     ::= 'at' StringLit
+DiffClause   ::= 'diff' StringLit 'to' StringLit
 LimitClause  ::= 'limit' NumLit
 
 Projection   ::= '{' ProjItem ( ',' ProjItem )* '}'
@@ -671,6 +682,12 @@ an ISO-8601 moment; the two are told apart at resolution, not by the grammar. Wh
 omitted the sample moment defaults to request arrival. Every query is evaluated at exactly
 one moment, resolved once by the coordinating server and passed to each shard as a value —
 see [queries.md](queries.md#every-query-has-a-sample-moment).
+
+`DiffClause`'s two `StringLit`s are version tokens only — never moments — because a diff must be
+reproducible and a moment is not a graph position. It is rejected alongside an `AtClause` in the
+same query, and rejected on a query whose derived key is degenerate, since nothing would then
+identify a row across the two points. The result adds three generated columns, `before`, `after`,
+and `change`; see [queries.md](queries.md#diffing-two-transaction-points).
 
 ---
 
@@ -764,7 +781,7 @@ HistoryOpt   ::= 'since' StringLit
 
 ```ebnf
 AdminCommand ::= ServerCmd | ShardCmd | ConnectorCmd | TokenCmd | GrantCmd
-               | MatViewCmd | TxnCmd | IntegrityCmd | DrCmd
+               | MatViewCmd | TxnCmd | IntegrityCmd | ErasureCmd | DrCmd
 
 ServerCmd    ::= 'show' 'servers' ( 'for' 'shard' QName )?
                | 'elevate' 'secondary' Host 'to' 'primary' 'for' 'shard' QName
@@ -789,8 +806,9 @@ TokenCmd     ::= 'show' 'tokens' ( 'type' TokenType )?
 TokenType    ::= 'server' | 'client' | 'user'
 
 GrantCmd     ::= 'show' 'grants' ( 'for' QName )?
-               | 'grant'  QName 'on' QName ( 'bypass' 'access' )?
+               | 'grant'  QName 'on' QName ( 'bypass' BypassKind+ )?
                | 'revoke' 'grant' QName 'on' QName
+BypassKind   ::= 'access' | 'erasure'
 
 MatViewCmd   ::= 'show' 'materialized' 'views' ( 'shard' QName )?
                | 'materialize' QName
@@ -801,7 +819,33 @@ TxnCmd       ::= 'show' 'transactions' ( 'shard' QName )? ( 'since' 'seq' NumLit
                | 'show' 'transaction' Ident
 
 IntegrityCmd ::= 'show' 'violations' ( 'for' ValidationRef )? ( 'shard' QName )? ( 'limit' NumLit )?
+
+ErasureCmd   ::= 'erase'   QName StringLit ReasonClause
+               | 'erase'   'shard' QName ReasonClause
+               | 'scrub'   FieldPath 'at' 'seq' NumLit ReasonClause
+               | 'release' 'unique' FieldPath StringLit ReasonClause
+
+ReasonClause ::= 'reason' StringLit
 ```
+
+`ErasureCmd` covers the only three operations that remove anything, and none of them appears in
+`Query` or `Mutation` — the removal path is administrative by construction, which is the
+constraint that withdrew `delete!` rather than giving it these semantics.
+
+Constraints not expressible in the grammar:
+
+- `erase` requires the named table to carry `Personal`
+  ([traits.md](traits.md#personal)). `erase shard` names a shard root and cascades through the
+  foreign-key chain.
+- `release` is rejected where the named `unique` is or contains a root table's placement key, and
+  where the owning row is neither deleted nor erased. See
+  [../distribution.md](../distribution.md#a-reserved-value-is-released-only-deliberately).
+- `ReasonClause` is mandatory on all three. Each writes a graph node carrying the target, the
+  authority, and the reason, for the same reason a `Waived` violation carries one.
+
+Automatic scrubbing has no command. It is driven by `system.crypto.ScrubRule`, an ordinary
+`Configuration` table, on the self-hosting principle that keeps violation waivers out of this
+grammar. See [../integrity.md](../integrity.md#scrub-rules-are-configuration).
 
 `IntegrityCmd` is the only integrity command with its own syntax, and it exists only as a
 convenience for the degraded-server case. Waiving a violation, acknowledging one, and raising
@@ -834,19 +878,19 @@ DrCmd        ::= 'force' 'elect' 'primary' Host 'for' 'shard' QName
 ```
 acknowledge  add    always    as        assert    asc       at        by
 bypass    connector conflict  DataCode  deep      delete    demote    deprecate
-describe  desc      drop      elect     elevate   else      emit      enforce
-every     export    extend    External  False     flag      for       force
-forever   forward   from      grant     grants    group     handler   if
-import    in        indexed   into      is        issue     key       lag
-let       limit     materialize         materialized        merge     migrate
-monitor   next      not       on        order     otherwise pause     primary
-prune     refresh   removing  repair    replay    replication         resolve
-resume    retain    revoke    scoped    secondary seq       servers   set
-shard     shards    show      shrink    since     split     sync      table
-tertiary  then      to        token     tokens    transaction
-transactions        trait     True      type      ui        unique    using
-verify    via       view      views     violations          visibility
-waive     where     with
+describe  desc      diff      drop      elect     elevate   else      emit
+enforce   erase     erasure   every     export    extend    External  False
+flag      for       force     forever   forward   from      grant     grants
+group     handler   if        import    in        indexed   into      is
+issue     key       lag       let       limit     materialize         materialized
+merge     migrate   monitor   next      not       on        order     otherwise
+pause     primary   prune     reason    refresh   release   removing  repair
+replay    replication         resolve   resume    retain    revoke    scoped
+scrub     secondary seq       servers   set       shard     shards    show
+shrink    since     split     sync      table     tertiary  then      to
+token     tokens    transaction         transactions        trait     True
+type      ui        unique    using     verify    via       view      views
+violations          visibility          waive     where     with
 ```
 
 **Six words were unreserved** when aggregate functions became ordinary functions: `aggregate`,
@@ -886,9 +930,9 @@ Words that were considered and deliberately **not** reserved:
 - **`delete!`**, as a hard delete alongside the soft `delete`. This one was reserved and has
   been **withdrawn**. The distinction it drew was not a distinction — both spellings left the
   record in the transaction graph and removed the row from the current state, which is what a
-  delete is. The operation that would have earned the sigil is destroying bytes already in the
-  append-only log; that is [OQ-036](../open-questions.md#oq-036-erasure-pii-scrubbing-and-shard-quarantine),
-  it is administrative rather than a row mutation, and it will not be spelled as a `delete`.
+  delete is. The operations that would have earned the sigil are `erase` and `scrub`; both are
+  `ErasureCmd` productions, administrative rather than row mutations, and neither is spelled as
+  a variant of `delete`.
 
 
 - **`write`**, as in an `enforce … on write` spelling of the grandfathering mode. `write` is
@@ -962,7 +1006,31 @@ kept empty so the collision cannot recur.
 reserved against future admin syntax but currently have no production — those operations are
 ordinary mutations against `system.integrity.Violation`.
 
-Type and trait names (`Text`, `Int`, `Null`, `NotFound`, `Doc`, `Duration`, `Period`, `Grain`, `Moment`,
-`Behavior`, `Reference`, `UserData`, `LogData`, `Configuration`, `Component`, `Extensible`,
-`Keyless`, `DocKeys`, …) are ordinary identifiers resolved through the namespace tree, not
-reserved words.
+`erase`, `erasure`, `reason`, `release`, and `scrub` are the five words `ErasureCmd` added.
+`reason` is the one with a plausible field name behind it, and it is reserved anyway: an
+operation that destroys evidence must carry why in a position the grammar guarantees, not in an
+optional record literal that can be left off. `row` was considered as a marker (`erase row …`)
+and **not** reserved — it is the likeliest identifier in any schema, and `erase <table> <id>` is
+unambiguous without it because `shard` is already reserved.
+
+`diff` is the one word added for temporal comparison, and it sits where `at` does, so no new
+position is introduced. Words considered and **not** reserved for it:
+
+- **`union`**, **`except`**, and **`intersect`**, as general set operators over two queries. The
+  need they were reaching for is answered by `diff` at two graph points and by composition over
+  rollup levels, and admitting them would raise key-reconciliation questions the language does
+  not otherwise have to answer.
+- **`window`**, **`over`**, and **`partition`**. A rollup level is a real table and queries
+  compose, so a shifted self-join expresses period-over-period comparison directly. There is no
+  window-function construct and none is planned.
+- **`now`**, as a query-level binding for relative moments (`at now - 30 day`). `at` takes a
+  version token or a moment literal, and a diff takes graph points, so nothing currently needs
+  it. It stays available if relative sampling is wanted later.
+
+`reveal` is an ordinary `Effect` function, not a keyword, exactly as `matches` is an ordinary
+function.
+
+Type and trait names (`Text`, `Int`, `Null`, `NotFound`, `Erased`, `Doc`, `Duration`, `Period`,
+`Grain`, `Moment`, `Behavior`, `Hashed`, `Encrypted`, `Reference`, `UserData`, `LogData`,
+`Configuration`, `Component`, `Extensible`, `Keyless`, `Personal`, `DocKeys`, …) are ordinary
+identifiers resolved through the namespace tree, not reserved words.

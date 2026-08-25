@@ -148,7 +148,9 @@ every server. That makes it the wrong home for anything an operator tunes per de
 > commit, it is a trait. Otherwise it is a row.
 
 Extent size and segment period fail that test — they track hardware, and staging and production
-must be able to differ without branching the schema. They are therefore rows in
+must be able to differ without branching the schema. So does replication durability: `LogData`
+sets the default, and `system.shards.DurabilityPolicy` overrides it per table
+([../distribution.md](../distribution.md#two-durability-classes)). They are therefore rows in
 `system.shards.ExtentPolicy`, keyed by table path, with a per-server override in
 `system.shards.ExtentOverride` keyed by `{ table, server }`, resolved most-specific-first. Two
 tables rather than one key with an "all servers" variant, because a `Null`-derived variant in a
@@ -259,6 +261,28 @@ ordering.
 Connector shadow tables carry `Keyless` automatically when the external source has no primary
 key, and the connector records why — see
 [../integrity.md](../integrity.md#connector-tables-without-a-source-key).
+
+## `Personal`
+
+`Personal` is a marker trait — no fields, no functions — that makes a table's rows eligible for
+erasure:
+
+```
+table app.crm.Contact : UserData, Personal {
+  email : Email unique,
+  name  : Text
+}
+```
+
+It is not a replication trait and occupies no slot. What it changes is what history returns
+after an `erase`: on an ordinary table a tombstoned row stays readable at earlier sample
+moments, and on a `Personal` table an erased row reads `Erased` at every moment unless the token
+holds `bypass erasure`.
+
+Eligibility is opt-in because erasure is the one act that closes history, and a table whose rows
+are not about a person has no reason to admit it. Scrubbing has the opposite polarity and needs
+no trait, because a leaked credential lands wherever the API put it. See
+[../integrity.md](../integrity.md#erasure-restricts-scrub-destroys).
 
 ## `Queue` and `QueueState`
 

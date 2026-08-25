@@ -172,12 +172,39 @@ See [auth.md](auth.md).
 ```
 show   grants for app.commerce
 grant  system.auth.Role.Admin on app.pm bypass access
+grant  system.auth.Role.Auditor on app.crm bypass erasure
 revoke grant system.auth.Role.Admin on app.pm
 ```
 
 A grant is a row in `system.auth.Grant`; these commands write it. `bypass access` exempts the
 grant from every `assert` that mentions `authed_user` and from nothing else — data
-constraints still run. See [namespaces.md](namespaces.md#bypass).
+constraints still run. `bypass erasure` is separate and narrower: it lets a token read the
+history of an erased row. See [namespaces.md](namespaces.md#bypass) and
+[integrity.md](integrity.md#erasure-restricts-scrub-destroys).
+
+### Erasure and Scrubbing
+
+```
+erase   row app.crm.Contact "05KG3N0001BB2M9X4E" reason "DSR-2291"
+erase   shard user.crm.05KG3N0001BB2M9X4E       reason "DSR-2291"
+scrub   app.log.Request.body at seq 84210 reason "credential in payload"
+release unique app.crm.Contact.email "a@example.com" reason "DSR-2291"
+```
+
+These are the only three operations that remove anything, and none is reachable from the query
+language. `erase` closes a row's history and requires the table to carry
+[`Personal`](schema/traits.md#personal); `scrub` destroys bytes; `release` frees a reserved
+`unique` value whose row is already deleted or erased, and is rejected on a placement key. Each
+writes a graph node recording the target, the authority, and the reason.
+
+`reason` is mandatory on all three. The act destroys evidence, so its own record has to carry
+why — the same requirement a `Waived` violation carries.
+
+Automatic scrubbing needs no command: it is driven by `system.crypto.ScrubRule`, an ordinary
+`Configuration` table. See [integrity.md](integrity.md#erasure-restricts-scrub-destroys).
+
+These belong in the admin web interface as well, and will be added there. They are CLI-only for
+now because the CLI exists and the admin interface does not.
 
 ### Materialized Views
 

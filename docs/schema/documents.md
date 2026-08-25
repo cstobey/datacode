@@ -164,6 +164,72 @@ table rather than a bare `Text`: admitting `Text` into the tail of a `:>` would 
 | Replication | All servers | The owning table's — shard-local under `UserData`, server-local under `LogData` |
 | Added by | Schema transaction | Ordinary insert |
 
+### Key Shape Rules
+
+The cap is a backstop, and reaching it means the damage is already done. A field whose keys are
+known to be identifiers should say so at declaration:
+
+```
+body : Doc indexed using app.log.isKeyLike
+```
+
+`using` names a `Text -> Bool` function over the key name. A key that fails it spills rather than
+interning, however far the field is below the cap. Omitting the clause keeps the existing
+behaviour: intern until the cap.
+
+This is the same `using` that parameterizes `Hashed`. A declaration that must name a policy names
+a function or a row rather than carrying a literal, so the rule is testable, reusable across
+fields, and visible in the schema graph.
+
+The distinction it lets the schema state: a document keyed by identifiers is a **map keyed by a
+value**, not a record with named fields.
+
+### Demoting an Interned Key
+
+`deprecate` on an interned key demotes it. No new write interns it, the key spills from then on,
+and every existing row still resolves, because the `Reference` row is still there.
+
+```
+deprecate app.log.RequestBodyKey.a3f2b1c9
+deprecate app.log.RequestBodyKey.*
+```
+
+The pattern form is not a convenience. Cleaning forty thousand accidental keys one statement at
+a time is a second incident.
+
+**Demotion stops growth; it does not reclaim tags.** Variant tags are assigned monotonically and
+never reused ([traits.md](traits.md#reference-tables-are-code)), and proving that no row anywhere
+holds one is not decidable while unmerged branches exist. The counter does not move back — and
+in exchange nothing is rewritten and no historical row changes meaning.
+
+On a general `Extensible` `Reference` table there is no spill target, so `deprecate` reads as a
+denylist: a connector meeting that value records a violation instead of issuing a schema commit,
+which is how a non-`Extensible` table already behaves. One verb, one meaning, two positions.
+
+### Superseding a Key Table
+
+Where a key table is beyond saving, redeclare the field. Keys are interned per field, so the
+redeclaration mints a new key table at a new schema node, the cap resets, and historical rows
+decode against the key table at *their* schema node.
+
+Nothing is rewritten and no tag is renumbered. The old key table survives for historical decode
+and becomes prunable once no live row references it — the ordinary rule that only orphaned
+branches are deletable ([evolution.md](evolution.md)).
+
+### The Cap Reports Before It Bites
+
+A key table crossing a fill threshold raises a violation, and the report names the shape it
+found:
+
+```
+app.log.RequestBodyKey: 39 210 of 65 535 tags used
+  94% match /^[0-9a-f-]{8,}$/ — candidates for a key shape rule
+```
+
+That diagnostic is the point of having a per-field cap at all. A shape rule written while the
+table is 60 percent full costs one declaration; written at the cap it costs a supersession. The
+threshold and the cap itself are `Configuration`, per field and overridable per connector.
+
 ## Querying
 
 Field access into a `Doc indexed` reads as an ordinary path, and resolves through the

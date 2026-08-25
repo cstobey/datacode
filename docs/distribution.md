@@ -101,8 +101,39 @@ Since `DataId` is time-major, a range over it is a time range.
 ### Transaction Propagation
 - Transactions are **sequence-numbered deltas** within a shard
 - The primary assigns sequence numbers; all replicas apply them in order
-- Secondaries must acknowledge receipt before a transaction is considered committed
+- Secondaries acknowledge receipt before a transaction is considered committed, in the
+  synchronous durability class below
 - Tertiaries receive transactions asynchronously — eventual consistency for reads, no durability guarantee
+
+### Two Durability Classes
+
+Every shard still has exactly two secondaries. What differs is whether the primary waits for
+them.
+
+| Class | Commits when | Default for |
+|---|---|---|
+| Synchronous | both secondaries ACK | `UserData`, `Configuration`, `Reference` |
+| Batched | the local append is durable; secondaries catch up in batches | `LogData` |
+
+`LogData` is high-volume, its value is aggregate rather than per-row, and paying two network
+round trips per log append would put the slowest path in the cluster on the hottest one. Batched
+replication is the right default for it.
+
+**It is a default, not a property of the trait.** Losing a server before its batch ships loses
+up to one batch, and some `LogData` is audit evidence that cannot be reconstructed —
+`system.integrity.Violation` with `origin = Observed` or `Forced` is exactly that
+([integrity.md](integrity.md#two-classes-of-nonconformance)). Silently making it lossy would
+undo the retention guarantee that answered OQ-032.
+
+So durability is a `Configuration` row, `system.shards.DurabilityPolicy`, keyed by table path
+and resolved most-specific-first — the same shape as `ExtentPolicy` / `ExtentOverride`, and for
+the same reason: staging and production should be able to differ without branching the schema
+([schema/traits.md](schema/traits.md#traits-are-not-configuration)).
+
+Nothing else changes. A `LogData` shard is already rooted at a `system.shards.LogSegment` row
+whose key the range tree partitions on, so assigning it two secondaries is ordinary role
+assignment, and batched deltas resume through the announce-and-fetch path like any other
+sequence range.
 
 ### Push for Liveness, Fetch for Resume
 
@@ -248,9 +279,60 @@ constraint. The consequence that decided it: schema-shard unavailability would s
 rather than only DDL.
 
 Instead, a table-wide `unique` is served by a shard **rooted at that constraint's schema-node
-row**, splittable by value range, with its primary placeable near the writers and movable by
+row**, splittable by digest range, with its primary placeable near the writers and movable by
 ordinary elevation. This also answers OQ-035's open question about where a table-wide `next`
 counter lives: it is a row in that constraint's shard.
+
+### The `unique` Index Holds Digests, Not Values
+
+> **The index stores a keyed digest of the value, never the value, and partitions on the
+> digest.**
+
+A `unique` constraint is satisfied by equality alone, so the index has no use for the plaintext.
+Storing it anyway would put every email address in the cluster into a shard that is neither the
+subject's nor prunable, replicated, and reachable by anyone who can read the constraint shard.
+
+Four things follow, and the third is the one that decided it:
+
+- **Constraint shards hold no personal data**, so erasure has nothing to propagate to them. The
+  cross-shard half of the erasure problem disappears rather than being solved.
+- **Enumeration is unchanged.** Any uniqueness constraint tells you "taken" for a value you
+  already hold. That is inherent to the construct, and the digest neither adds nor removes it.
+- **Reserving a value costs nothing**, which is what makes the release rule below a semantic
+  choice rather than a privacy trade.
+- **Cluster-wide ordering on the column is given up.** There was never a usable one — a
+  cross-shard `order by` is a distributed merge regardless.
+
+The digest key is scoped **per constraint** and lives in that constraint shard's root row,
+beside the `next` counter, replicated to its three role holders. Key scope must equal comparison
+scope: a per-server key would produce two digests for one value and the constraint would
+silently never fire. It is an ordinary data key under the envelope in
+[auth.md](auth.md#envelope-encryption-and-key-custody).
+
+Rotating it cannot recompute entries whose plaintext is gone, so entries carry a generation tag
+and a check probes every live generation. Generations are rare; the probe count is one or two.
+
+### A Reserved Value Is Released Only Deliberately
+
+A tombstone does not free the value. The reason is stronger than privacy: a root table's
+candidate key **is** the cluster shard directory
+([transaction-graph.md](transaction-graph.md#shard-roots)), so freeing it and letting it be
+re-registered would make the directory resolve one key to two shards depending on the sample
+moment. Routing would stop being a function.
+
+| Kind of `unique` | On delete or erase |
+|---|---|
+| Is, or contains, a root table's placement key | Reserved permanently. `release` is rejected. |
+| Any other | Reserved, and releasable by an explicit `release`, recorded with authority and reason. |
+
+`release` applies only to a value whose owning row is deleted or erased. Releasing a live row's
+value would break the constraint it is declared under, so that is a compile-time rejection
+rather than a runtime one.
+
+After a release and re-registration the value identifies different rows at different sample
+moments. That is correct and already handled — key resolution happens at the query's moment —
+but it makes one thing normative: a lookup by unique value resolves **at the query's sample
+moment**, not at HEAD.
 
 ### Constraint Groups
 
@@ -311,6 +393,10 @@ Primary (async) → Tertiaries: propagate via peer swarm
 ```
 
 The primary does not wait for tertiary acknowledgment. Tertiaries are eventually consistent.
+
+Under the batched class the primary commits and answers the client after its own append is
+durable, then ships accumulated deltas to the secondaries. The steps are the same; only the wait
+moves.
 
 ## Cross-Shard Transactions
 
@@ -429,6 +515,62 @@ Which yields the property the whole arrangement exists for:
 That holds only alongside "validation reads merged nodes only" — a validation permitted to
 observe a prepared node would reintroduce the wait-for edge this removes. The two are one
 decision.
+
+## Cold Shards
+
+A shard nobody has written to for years should not occupy premium hardware. The relaxation that
+buys that is **placement, not role count**.
+
+> **Three role holders always. A dump is not one of them.**
+
+An exported file is not verified, not sequence-tracked, and does not participate in the swarm,
+so "we have a backup" is a claim nobody checks until restore day. Over a seven-year audit
+retention the failures that actually arrive are regional loss and bit rot, which is precisely
+what two geodiverse copies defend against and a single unverified file does not.
+
+What may be relaxed instead:
+
+- **Hardware class.** A cold shard's primary and both secondaries may sit on slow, cheap hosts
+  on cheap storage.
+- **Read path.** A cold shard is sealed — read-only until something touches it — so its hosts
+  carry no write load.
+- **Nothing else.** Geodiversity is retained, because it is the property the seven-year window
+  needs most.
+
+Moving a cold shard to cheaper hosts is a range-tree edit, which is what the coarsening of the
+partition function was designed to make free.
+
+Where an operator insists on one copy plus a dump, the honest form of that is a dump that is
+content-addressed, whose checksum is recorded as a graph node, and which a scheduled event
+re-reads and reports on. That makes it a replica with a slow protocol rather than a hope, and
+`verify shard` can then say something true about it.
+
+### Sunset Is Proposed, Never Automatic
+
+The maintenance queue notices a shard that has been inactive past a `Configuration` threshold
+and **proposes** sunsetting it. An operator accepts.
+
+This is the rule that already governs materialized views ([storage.md](storage.md#views-are-proposed-not-created-silently))
+and the per-field timestamp cache, applied one scope wider, and it lands on the same side of the
+line as `split shard`: an operation that moves authority is not automatic, and inactivity is a
+clock reading besides.
+
+**Rolling up `UserData` history is a `retain` chain, not a command.** Collapsing a row's version
+range is prunable-data semantics, and it is subject to the same rule as every other prune —
+[it is only ever the consequence of a declared chain](schema/aggregates.md#pruning-is-only-ever-a-consequence).
+The ordered `where` / `otherwise` branch form is what makes "these specific rows" expressible
+without a manual prune. Two consequences to expect: the version chain over the pruned range is
+gone, so anything derived from it — per-field timestamps most of all — reads `NotRetained`
+rather than a wrong answer.
+
+### Quarantine Needs No Mechanism
+
+"Make this shard unreadable and unreplicated pending review" is two rows: revoke the namespace
+grant, and assign the shard a range-tree entry with no serving roles. Both operations exist, and
+both are reversible, which is what an operator wants in the first hour of an incident.
+
+It is documented as a recipe rather than built as a keyword. A dedicated `quarantine` verb would
+add a second way to say what grants and role assignment already say, and the two would drift.
 
 ## Geo-Diversity Goals
 
