@@ -15,6 +15,7 @@ reviewer). Every audit finding below survived a verification pass whose default 
 | `20-syntax-decisions.md` | The sixteen questions: recommendation, pushback, alternatives, critique |
 | `30-integrated-grammar.md` | The conflict-resolved EBNF delta across all sixteen, plus the phase plan |
 | `40-bibliography.md` | Annotated bibliography, organised by the design claim each source bears on |
+| `50-validation.md` | Validation of the two Phase 0 rules: the admissible-default table, corpus violations, and ten open items |
 | `90-questions.md` | What I need from you |
 
 ## Decisions taken
@@ -91,9 +92,577 @@ proposed:
   `Effect`-only `File` cannot serve the second path. The read is bounded by a
   `system.config` size cap; above it, the value is reachable only through the streaming handler.
 
-Still open, and asked below: "the decision to store outside DataCode should be field specific" needs
-one more turn, because storing bytes outside the graph while DataCode remains the origin is a real
-departure from *the log is the graph* and the cost depends on which of three things is meant.
+Storage tiering is settled as **(a) default, (b) available, (c) modelled as an ordinary URL**:
+
+- **(a)** Where a `File`'s chunks are laid out *inside* the graph — inline with the parent's extent
+  or in an extent of their own — is a `Configuration` row beside `ExtentPolicy`, per field with a
+  per-server override. Pure tuning, invisible to the model.
+- **(b)** Bytes on the server filesystem with the row holding a digest and a path is available, as a
+  **separately named type**, never as a quiet per-field flag. It gives up four properties a reader
+  otherwise assumes — `verify shard` cannot check the bytes, replication does not carry them, a
+  restore does not restore them, and `scrub` cannot reach them — so the type name is what warns.
+- **(c)** A purely external reference is an ordinary `Text` URL and needs no mechanism.
+
+### `Component` is 1:many, and a many:many *link table* may still be a `Component`
+
+These are two questions and they have different answers.
+
+**A component has exactly one parent, structurally.** The parent's `DataId` *is* the component's
+identity prefix (`transaction-graph.md:473-491`), so a second parent has nowhere to live. Cardinality
+from the parent is 0..2³²; from the child it is exactly 1. `Component` is therefore always 1:many and
+a many:many *identity* is unrepresentable rather than merely disallowed. The ordinal follows from the
+same fact rather than being a separate choice: single parent → the parent's id is the prefix →
+an ordinal disambiguates siblings → the parent link costs zero bytes and the subtree is one range
+scan.
+
+**But a many:many relationship can be implemented with a `Component` link table**, because
+`traits.md:221-222` permits an outbound FK from a component to anything: *"A component may reference
+outward freely — an outbound FK creates no inbound dependency."* So `OrderTag : Component` of `Order`
+with `tag :> Tag` is a legal many:many between `Order` and `Tag`, shard-local to `Order`, with a
+zero-byte order link.
+
+The discriminator is the *other* invariant, `traits.md:220`: **nothing outside the parent's subtree
+may reference a component.** So:
+
+> Use a `Component` for a link exactly when nothing needs to reference the **link row itself** from
+> outside, and the link's lifetime is the owner's.
+
+A `Membership` row that a `Payment` points at cannot be a component. A `Membership` row nobody points
+at can be.
+
+| Relationship | Construct | Owned by | Placement |
+|---|---|---|---|
+| 1:many, wholly owned | `:>` to an inline `Component` sub-table | the parent | parent's shard; ordinals; zero-byte link |
+| many:many, one side owns the link, nothing points at link rows | `Component` of that side + outbound `:>` to the other | that side | owner's shard |
+| many:many, neither side owns, or link rows are referenced | a table with two `:>` fields — declared top level or via `:<` | nobody | the **first** FK in its key decides the root |
+| 1:many, child outlives parent or has its own identity | a table with a `:>` back — top level or via `:<` | nobody | the child's key decides |
+
+Two corrections to the assumption this came from:
+
+- **Outward references are not limited to `Reference` tables.** A component may point at any table.
+  That is precisely what makes the second row of the table above work. The cost is that an outbound
+  FK crossing a shard is a warning naming the edge (`constraints.md:187-189`) and restricts that
+  attachment to `enforce forward`, `monitor`, or `repair` (`distribution.md:442-457`).
+- **`:<` does not *make* a relationship many:many.** It is sugar for "declare that other table and
+  give it an FK back to me". The many:many-ness comes from the link table carrying two `:>` fields.
+  `:<` and a top-level declaration produce the same graph; `:<` only removes the second statement.
+
+And one consequence worth stating in `tables.md`, because it is not obvious: a two-`:>` link table
+lands in **one** side's shard family, decided by the head rule (the first FK in the key). The
+asymmetry is unavoidable — a row lives in one shard — and it should be chosen deliberately rather
+than by declaration order.
+
+### `Component` shrinks to one bit: owned lifetime
+
+The generalization is right and it removes a trait's worth of special-casing. `Component` stops
+being a thing you get and becomes a thing you *declare only where it cannot be derived*, which is
+one bit.
+
+**Adopted:**
+
+- **A `Component` may declare `unique`.** `tables.md:129` exempts it from *needing* a key and does
+  not forbid one; the justification ("it is already keyed — by parent plus `Ordinal`") explains why
+  it is optional, not why it is unavailable. A `unique` on a component is checked within the parent,
+  so it costs one shard-local check. This closes the two-identical-`(order, tag)`-links gap.
+- **`Component` stops occupying the replication-trait slot.** `traits.md:182` currently makes
+  `table T : Component, UserData` an error. That is backwards: "wherever the parent is" is not a
+  replication *policy*, it is what rooted placement already means, and the row's real replication
+  answer comes from `UserData`. `Component` becomes a marker trait alongside `Personal` and
+  `Keyless`, and `table OrderTag : UserData, Component` is legal.
+- **The ordinal representation is derived, not declared.** Eligibility is mechanical: the key's head
+  is an FK reaching the shard root through its chain. That is the same rule that already decides
+  placement, so it cannot drift.
+- **Many:many is then ordinary.** `table app.commerce.OrderTag : UserData, Component { order :>
+  Order, tag :> Tag, unique linkRef { order, tag } }`. The ordinal is the surrogate, `linkRef` is
+  the natural key — exactly parallel to `DataId` plus a candidate key on any other table.
+
+**One bit cannot be derived from the key, and it is lifetime.** Two tables with an identical key
+shape want opposite answers:
+
+| Table | Key | On parent delete |
+|---|---|---|
+| `Order` | `{ customer, order_num }` | orders **survive** — `tables.md:464`, non-`Component` FKs never cascade |
+| `OrderLine` | `{ order, product }` | lines **go** — a line has no meaning without its order |
+
+Both are `{ <FK reaching the root>, <local discriminator> }`. Nothing in the key distinguishes them,
+so `Component` survives as exactly that declaration, and everything it currently bundles becomes a
+consequence of it: `created_at` and `origin_server` inherit (the row cannot outlive its owner);
+nothing outside the subtree may reference it (or the subtree is not prunable as a unit); the row
+cannot be reparented; the surrogate identity is the position.
+
+Two costs to price rather than hide:
+
+- **Ordinal assignment is a per-parent read-modify-write.** Coordination-free, because the parent's
+  shard primary linearizes writes — but still a serialization point on that parent, where a `DataId`
+  needs no coordination at all. Bounded children (order lines, request headers, `Doc` nodes) do not
+  notice. A component directly under a shard root with unbounded cardinality does. Schema commit
+  should price it exactly as a table-wide `next` is priced today (`tables.md:269-271`) — the same
+  diagnostic, naming the serialization it introduces.
+- **`created_at` is the parent's.** `transaction-graph.md:642-643` already supplies the escape
+  (declare a `Timestamp` field), but it should be named at the point of decision rather than found
+  later.
+
+### Re-keying is a delete plus an insert
+
+The placement-key hole closes without new machinery, and closing it deletes four rules.
+
+**The chain.** A foreign-key functor is `DataId → Either Error Row` and resolves to a **live** row
+(`functors.md:15`), so an FK can name a deleted row only where the field carries a `Null`-derived
+tail. A placement-key FK can never carry one, because `tables.md:207` rejects a `Null`-derived
+variant in a key — and that rule is **general, not Component-specific**, so it already holds for
+`Order.customer` as much as for a component's owner. So a shard-bounded `Ordinal`, and a rooted key
+generally, can be invalidated by exactly one thing: the placement-key FK being **updated**.
+
+**The rule.** A write that changes a placement key is not an update. It is a **delete and an
+insert**, and it applies generally rather than only to components — two rules for one situation
+would be worse than one.
+
+Four things stop needing to exist:
+
+- The recorded cross-shard *migration* it would otherwise need. A delete in shard A plus an insert in
+  shard B is an ordinary two-participant transaction: a prepared node each and one commit node,
+  already fully specified (`distribution.md:401-432`).
+- `traits.md:220`'s "a component cannot be reparented" as a standalone invariant. It follows.
+- Any rule about placement-key mutability. There is nothing to permit or forbid.
+- `traits.md:221`'s "nothing outside the parent's subtree may reference a component" can relax to a
+  warning: an outside reference makes the subtree non-prunable as a unit, which is worth saying, not
+  worth forbidding, once the delete is restricted.
+
+Two things must be added, and the design needed both anyway:
+
+- **Deleting a row with live inbound non-nullable references is rejected.** This is `RESTRICT`, and it
+  follows from the FK functor's own signature rather than being a new policy. `tables.md:464` says
+  non-`Component` foreign keys never cascade and never says what they do instead; this is the answer.
+- **Re-keying is therefore rejected wherever the delete is** — that is, where the row has non-owned
+  inbound references. Moving a row across shards while things point at it from elsewhere is the hard
+  case, and rejecting it is better than a silent distributed rewrite.
+
+Two consequences to state rather than discover:
+
+- **The row's `DataId` changes.** It genuinely became a different row in a different shard. The old
+  row's history stays readable under its own id, and *nothing links the two* — see the open detail
+  below.
+**The rule is gated, and the gate is every `unique` on the table.**
+
+> Delete-plus-insert applies only where **every `unique` on the table is headed by a foreign key
+> reaching the same shard root as the placement key.** Where any `unique` is table-wide, or rooted
+> elsewhere, changing the placement key is rejected.
+
+The gate is not decoration. Two things go wrong without it, and only the first is about reservations:
+
+- **A second `unique` collides with its own tombstone.** The placement key is safe, because the
+  trigger for the operation is that its value changed, so the new value differs from the reserved
+  one. Any *other* `unique` on the row keeps its value: the delete tombstones the row, a tombstone
+  does not free the value (`distribution.md:315-330`), and the insert then writes the same value and
+  is rejected. A table-wide `unique` served by a constraint shard fails this way every time.
+- **A `unique` rooted elsewhere silently changes what it means.** A non-root key is checked within
+  one shard (`tables.md:188`), and that shard is the row's — decided by the placement key's head.
+  So a `unique` headed at a *different* root is checked against whichever population the row
+  currently sits among, and moving the row changes that population without any of the constraint's
+  own values changing. That is a semantic change with no write behind it.
+
+The head is what matters, not every field: `unique linkRef { order, tag }` on a component of `Order`
+is headed by `order`, so it qualifies, and it means "this order has at most one link to this tag" —
+which is the intended reading of a many:many link.
+
+Where the gate fails, the mutation is rejected with a diagnostic naming the constraint. The escape
+is the existing one and it is deliberately manual: `release` the offending value, with its mandatory
+authority and reason (`railroad.md:826`), then re-key. Auto-releasing inside an ordinary update would
+defeat the property `distribution.md:315` exists to protect — a reserved value is released only
+deliberately — and it would put an `ErasureCmd` inside the query language, which the design keeps
+out on purpose.
+
+**Open detail, not blocking:** nothing connects the tombstoned row to its successor, so "this order
+moved from C1 to C2" is findable only by scanning. A `supersedes` edge on the insert would fix it and
+is one field; whether audit needs it is a decision, not a derivation.
+
+### What is left of `Component`
+
+Restating after the above, because it is now smaller than the previous section says.
+
+**The counter-scoping credit belongs to the key rule, not to `Component`.** `next <UniqueName>`
+already allocates within the named constraint's field list minus the defaulted field
+(`tables.md:249-256`), so `unique orderRef { customer, order_num }` already gives a per-customer,
+shard-local counter with no coordination, and `unique invoiceNum { invoice_num }` already warns about
+the table-wide one. Any rooted key gets this; `Component` adds nothing to it.
+
+What `Component` adds is that **the ordinal replaces the `DataId` rather than sitting beside it**:
+
+| | Ordinary rooted dependent | `Component` |
+|---|---|---|
+| Surrogate identity | `DataId`, 12 bytes | `Ordinal`, 4 bytes |
+| Parent reference | FK column, 12 bytes | the identifier prefix, 0 bytes |
+| Declared counter | `order_num : Int = next orderRef`, 4–8 bytes | none needed |
+
+Roughly 24 bytes a row, and it is the whole of the space case.
+
+**And one bit remains declared: does a delete cascade or restrict?** That bit is now smaller than it
+was. Under the delete-plus-insert rule, reparenting, `created_at` inheritance and identity all follow
+from the key; the only thing left that the key cannot say is whether deleting the owner destroys the
+owned. `Component` means cascade; its absence means restrict. Everything else is derived.
+
+### `retain` on `UserData` stands; branch squashing does not
+
+`retain` on `UserData` is admissible and expected to be rare, which is what `aggregates.md:322`
+already says. Phase 0 question 0.2 resolves to: keep the section, and add the missing half — there is
+still no row-level `prune`, and `retain` is the only path.
+
+**Squash merge is the wrong shape, and there is a better mechanism already implied by the design.**
+The motivation is right: a local admin branch accumulates schema nodes nobody will ever need
+individually, and they should be reclaimable. Three reasons not to squash:
+
+- **Squash makes the source branch look orphaned.** Under a squash the branch is not a parent of
+  anything on `main`, so `transaction-graph.md:88-92`'s "a branch with any path to `main` cannot be
+  deleted" stops protecting it, and the git idiom that follows a squash is deleting the branch. That
+  is history destruction arriving by convention.
+- **Two-parent merge is load-bearing.** Merge reconciliation identifies "the same" row across
+  branches by candidate key (`tables.md:136-143`), and the audit property is that the DAG shows both
+  lineages. Collapse the second parent and you cannot say which branch asserted a value — the same
+  gap that made the supplied-field mask undecidable at a merge.
+- **Replay needs intermediate predicates, sometimes.** `enforce forward` compares against the
+  predicate *as it was*, and re-deriving a `Derived` violation needs the predicate as of the
+  violation (OQ-001). Squashing discards those.
+
+That third reason also supplies the discriminator that makes reclamation safe:
+
+> **A schema node is discardable exactly when no row was ever committed under it.**
+
+On a local branch, by construction, none was — `distribution.md:251-264` says a local branch holds
+the schema graph plus `Reference` rows and no user data. So the whole intermediate run qualifies,
+and no rule has to be relaxed to say so.
+
+The mechanism should therefore be **pruning, not squashing**, and it needs one existing rule
+widened rather than a new merge mode: a *merged* branch's exclusive schema nodes become prunable once
+nothing references them. That is the same refcount `prune` already needs, it keeps the merge
+two-parented, it rewrites nothing, and it lands on the side of the line the design already draws —
+reclamation is a consequence of a policy, never a verb someone types.
+
+**The OQ is general graph reclamation, not branch cleanup.** Branch reclamation is the easy corner
+of it — the case where the discriminator is free, because a local branch provably committed no rows.
+The real question is what an administrator does when they genuinely need the space back across the
+whole graph, and it is deliberately scheduled late: it is a background maintenance process on the
+existing queue, it changes no syntax, and answering it early would mean designing a reference count
+before the things being counted are stable. The reclamation *rule* — discardable exactly when no row
+was ever committed under it — is what to record now; the traversal, the refcount representation, and
+the operator surface are the OQ.
+
+### Connectors: one kind, two GTID dialects, selected per connector
+
+MariaDB is the required source and MySQL is supported alongside it, configured per connector row —
+not two connector kinds, because everything downstream of the position is identical.
+
+The two dialects are genuinely incompatible and the difference is not cosmetic:
+
+| | MariaDB | MySQL |
+|---|---|---|
+| Position | `domain_id-server_id-sequence`, one per domain | `source_uuid:interval-list`, a GTID **set** |
+| Handshake | session vars (`@slave_connect_state`, `@mariadb_slave_capability`) then `COM_BINLOG_DUMP` | `COM_BINLOG_DUMP_GTID` carrying the set in the packet body |
+| Gaps | not representable — a domain has one high-water mark | representable, and normal |
+
+So the stored position is **a set of rows, not a scalar**: one row per source (a MariaDB `domain_id`
+or a MySQL `source_uuid`) carrying its high-water mark. MySQL's interval list is the one real
+asymmetry — a single high-water mark is lossy once a gap exists, so the MySQL row needs the interval
+set or an explicit "no gaps asserted" flag.
+
+Two details worth fixing while this is written:
+
+- **Detect and verify, do not just configure.** `@@gtid_mode`, `@@gtid_current_pos` and
+  `@@version_comment` distinguish the two at connect time. Configuring the dialect and never checking
+  it means a misconfiguration replicates from the wrong position silently.
+- **A connector needs a seed.** An empty arrival log yields no position at all, so there must be an
+  explicit origin — `Streamed | Snapshot | Reseeded Text` — or a connector cannot be started,
+  re-seeded, or recovered from a source purge.
+
+Neither dialect is supported by `mysql-haskell` 1.3.0; both are reachable through
+`Database.MySQL.Connection`'s `writeCommand` and `putToPacket` with no fork.
+
+### Every added column declares a default
+
+> **A field added to an existing table must carry a `DefaultClause`. Omitting one is a compile-time
+> error.**
+
+Unconditional — it does not depend on whether the table currently has rows. That is deliberately the
+opposite polarity from `integrity.md:173-197`'s "mode is mandatory on a *populated* field", and the
+asymmetry is defensible: that rule is conditional because the blast-radius *number* is what the
+author needs in hand, and here there is no number. The answer is the same at zero rows and at forty
+million, so making it conditional would only mean a schema file that succeeds in development and
+fails in production.
+
+This replaces three contradictory statements about what an added field reads on older rows:
+`evolution.md:34` (the default), `evolution.md:274` (`NotFound`), and `transaction-graph.md:655`
+(`NotGiven`). The latter two are wrong for one reason — both sit outside the field's declared type.
+`loyalty_tier : Tier` returning `NotFound` makes an exhaustive match over `Tier` non-exhaustive, and
+it does so because of an evolution that happened *later*, which would make
+`category-model.md:171`'s "every consumer is forced by the type system to handle the absent case"
+untrue of every field in the database.
+
+Requiring the default outright is stronger than requiring *either* a default *or* a `Null`-derived
+variant in the type, and better, because the weaker rule has to infer which variant an old row reads
+and a type may carry two (`Phone | NotGiven | Redacted`). Writing the default removes the inference.
+
+**Nothing is backfilled.** No old row is rewritten; the value is computed at read from the schema
+node that added the field.
+
+Which forces the admissibility criterion, and validation tightened it twice from what this section
+first said:
+
+> **A default is admissible on an added field exactly when it is `Pure` *and* stable for the life of
+> the row** — reproducible at read from the old row plus the schema node, and identical to what an
+> insert after the add would have stored.
+
+"`Pure`" alone is too weak. `= other_field * 2` and `= (OrderStatus where name == "Pending")` take no
+ambient input, but an old row recomputes them at read while a row inserted after the add froze the
+value at insert — so the two populations diverge with nothing in the row saying which regime it is
+under. `tables.md:219-220` already excludes `updated_at` from a key on exactly this ground.
+
+The full form-by-form table is in [50-validation.md](50-validation.md) §B. Three entries matter here:
+
+- **`= next orderRef` is rejected.** It allocates rather than evaluates — a read-modify-write on a
+  counter row (`tables.md:258`) — and it is the only genuinely `Tx` default, which is the sole reason
+  the ladder has a `Tx` cell for defaults at all.
+- **`= authed_user` is rejected, but not for the reason this section originally gave.** It is *not*
+  that no token exists: `railroad.md:913` puts `authed_user` in scope in field defaults and every
+  read carries a token, so the default resolves — **to whoever is reading**, which would make
+  `created_by` differ between two readers of the same row. Silent divergence is worse than failure.
+  The correct reason is that `authed_user` is transaction-ambient input rather than row data, the
+  same shape as *time is a parameter, never ambient*.
+- **A `:>` field to a `Component` target needs no default at all.** Under the table-valued decision
+  its old-row value is the **empty table**, which is inside the declared type — no write, no ambient
+  input, nothing to supply. Only the *constructing* form `= { theme = Dark }` (`tables.md:443`) is
+  rejected, because a construction needs a transaction and a row committed last year has none.
+
+Two rules travel with the table. The default must **satisfy the field's own `where`**, since under
+Rule A it becomes the value of every existing row and a default failing its own predicate marks 100%
+of them in one commit — a schema error, not a migration choice. And **no `unique` field may be added
+to a populated table**, because every admissible default is constant and no injective row-local
+expression is spellable.
+
+**Scope.** State the rule over the **effective field set**, not over table redeclaration: a trait
+gaining a field adds a column to every table extending it, and generated tables (`Doc indexed`
+siblings, rollup levels, connector shadow schemas) reach the same path without a redeclaration
+anywhere. Two citations in the paragraph above are off by a few lines and corrected in
+[50-validation.md](50-validation.md) §D — `evolution.md:39` carries the contradiction, not `:34`,
+which is the compliant example.
+
+### Re-keying records itself on the transaction node
+
+The link between a tombstoned row and its successor is a property of the **transaction node**, not a
+column on the row. A row column would be `DataId | NotSuperseded` on every row of every rooted table
+for something that almost never happens; the deciding objection is not sparsity but placement — a
+supersession is a fact about a *transaction*, so a row column stores it on the wrong object.
+
+Validation corrected three claims this section first made, and the substance survives all three:
+
+- **The record cannot be typed `(old DataId, new DataId)`.** A component has no `DataId`
+  (`traits.md:199`) and its identifier is variable-length (`transaction-graph.md:493`), so that type
+  cannot name a component reparent — which is precisely the case this rule exists to cover, since it
+  is what retires `traits.md:220`. Type the two fields as **`head_index` row keys**
+  (`storage.md:43-45`): a `DataId`, or a `DataId` plus one `Ordinal` per nesting level. That is the
+  key the index is already keyed by.
+- **"Queryable" was false.** No `system.*` table exposes transaction nodes; `TxnCmd`
+  (`railroad.md:818`) is CLI-only. `system.integrity.Violation` is queryable because it is an
+  ordinary table — a property belonging to the alternative this rule rejected. Either declare
+  `system.graph.Transaction` or drop the word. Declaring it is the better answer and the review
+  already wants it for two other reasons (structural defect 6, and `show transactions` having no
+  access story).
+- **"Costs nothing per row" understated it.** A list of structs is a *pointer* field, so it costs one
+  pointer word on every `TxNode` in the cluster forever. `spikes/capnproto/output.txt:89-95` measured
+  a data-section scalar, and `storage.md:186`'s "exactly 8 bytes per message" is a claim about that
+  scalar, not about a pointer field. Re-run the spike before leaning on it.
+
+One gap the record does not close on its own: it is old→new and lives on the **old** row's shard, but
+every consumer starts from the successor — the version-chain walk, `Violation.subject`,
+`TriggerState.subject`, a captured queue payload id, merge reconciliation. A server-local,
+unreplicated **new→old index derived from it** is what makes it usable, and it is derived rather than
+authoritative, so it costs nothing in the graph.
+
+### The re-key trigger is a change of shard root, not of any placement-key field
+
+This narrows the rule two sections above, which was too broad in one direction and unusable in
+another. Validation found both, and the second is serious.
+
+> **Delete-plus-insert applies exactly when the write changes the row's *shard root*.**
+
+- **Too broad as written.** Changing `Order.order_num` — a non-head field of
+  `unique orderRef { customer, order_num }` — was a re-key under the old phrasing, with a new
+  `DataId`, a severed version chain and re-fired events, while none of the stated harms occur: the
+  shard root is unchanged, so no `Ordinal` is invalidated and nothing crosses a shard.
+- **Unusable for root tables, which is the serious one.** A root table is *defined* by its key
+  containing no same-family FK (`tables.md:172`), so no `unique` on a root is headed by an FK
+  reaching a root, and the gate rejected **every root candidate-key change** with no escape: no
+  username change, no email change, no branch rename. The resolution is that a root's candidate-key
+  change is **not a re-key at all** — a shard is named by its root row's `DataId`
+  (`transaction-graph.md:158`), which does not move, so nothing crosses shards and no ordinal is
+  invalidated. It is an ordinary update plus a shard-directory write.
+
+**The gate is also restated**, because the earlier phrasing admitted the collision it was written to
+prevent: a second `unique` headed by a *different* FK, whose value the re-key does not change, passed
+the gate and then collided with its own tombstone.
+
+> **Every `unique` on the table must be headed by the placement key's own head field.**
+
+Unambiguous, strictly stronger, and it is what the worked example two sections above already
+demonstrates.
+
+Ten questions the validation could not close are in [50-validation.md](50-validation.md) §E, each
+with a recommendation. The two that reach other files are whether to declare
+`system.graph.Transaction`, and what an existing rollup bucket reads for a column added to a live
+retention chain — where Rule A as phrased would forbid the answer `aggregates.md:275-282` implies.
+
+### `Reference` rows live on the branch shard; variant tags are allocated cluster-wide
+
+`distribution.md:246` is right and `traits.md:330` is the stale sentence. A `Reference` row *is*
+schema, schema is branch-versioned, and the local-branch workflow depends on it — an administrator
+clones "the schema graph to the branch point plus its `Reference` rows" and works offline
+(`distribution.md:255-258`), which is impossible if those rows live on one global shard.
+
+The **variant tag** is not branch-scoped. Two branches would otherwise allocate tag 7 to different
+names, and a merge would carry two meanings for one tag — unfixable by renumbering, because
+renumbering "would silently change the meaning of every historical row carrying the old tag"
+(`traits.md:340`).
+
+> **The row is branch-versioned; the tag is cluster-wide.**
+
+A tag allocator is a table-wide `next`, and a table-wide `next` already has a home: the constraint's
+own shard, alongside its counter (`distribution.md:281-284`). No new mechanism, and the cost lands on
+an operation that is already a serialized schema commit.
+
+One consequence to state: a genuinely offline branch cannot reach the allocator, so its `Reference`
+rows exist **by name** on the branch and receive tags at upload. Sound, because a local branch holds
+no user data, so nothing on it was ever stored under a tag.
+
+This closes the cross-branch collision question that D12 wanted to raise as an OQ. Do not file it.
+
+### `:<` declares the child's FK and nothing on the parent
+
+The left-hand name is **the field name on the child**, exactly as originally specified. The parent
+retains nothing: no column, no virtual column, no reverse relation. The proposal that came back from
+the design pass added a table-valued reverse column on the parent; that is **withdrawn**, and with it
+every rule written to support it.
+
+Three reasons, the third being the one that decides it:
+
+- **It is a second spelling for a join.** `queries.md:136-146` already covers navigating against the
+  reference direction, with `as` mandatory. A reverse column says the same thing a second way, which
+  is the defect OQ-005 keeps withdrawing things for.
+- **It puts a `*`-exclusion special case in the language** that exists only because the feature does.
+- **The syntax would not look like what it costs.** A non-owned child has its own `DataId` and its
+  own placement, possibly in another shard. Written as a field access, `Order { *, comments { … } }`
+  hides a cross-shard fan-out; written as `Order >< Comment as c`, it looks like the join it is.
+  Nesting stays available through the join plus a sub-projection, where the cost is visible.
+
+**The name goes on the right, with `via`:**
+
+```
+table app.pm.Document : UserData {
+  title : Text unique,
+  :< Comment via document { body : Text, author :> User }
+}
+```
+
+`via` already means precisely this — "names its FK back to the containing row" (`queries.md:227`) —
+and omitting it already has a default: the parent's table name in `lower_snake_case`, the rule
+`group`'s nested tables (`queries.md:230-232`) and split fragments (`evolution.md:146`) both use. Three
+advantages over the left-hand spelling: no phantom field name sitting in a body where it is not a
+field, no new meaning for `via`, and `deprecate` addresses the thing that exists
+(`deprecate app.pm.Comment.document`) rather than a name on a table that does not hold it. The parse
+stays unambiguous because the item begins with `:<`, so no left-hand identifier is needed to
+distinguish it from a `FieldDecl`, and a body item starting with a token scans faster than one whose
+first word is an identifier that means something different from every other identifier in the body.
+
+```ebnf
+BackRefDecl  ::= ':<' QName SubTableTraits? ( 'via' Ident )? SubTableBody?
+```
+
+Supersedes `30-integrated-grammar.md` §B.3, which carries the left-hand `Ident` form.
+
+Superseded by this: the `BackRefDecl` bullets in `30-integrated-grammar.md` §B.9 that describe the
+left-hand `Ident` as "a table-valued virtual column", its `*` exclusion, and its rejection in
+`UniqueDecl`/`DefaultClause`/`RecordLit`/`OrderByDecl`. Also conflict #29 there, which folded D11's
+`parent` virtual column into the reverse name — with the reverse name gone, `parent` on a `Component`
+returns as the open question it was, and it stays parked with recursion.
+
+### Pagination is a cursor, not an offset; no exact total
+
+`LimitClause ::= 'limit' NumLit` — there is **no offset**, and none is added. The absence was never
+recorded as deliberate (`offset` is not in the considered-and-rejected list, and OQ-005 still lists
+"pagination config" as open), so this makes it deliberate, with the reason:
+
+- **A cursor needs no syntax.** Given a total order, "resume after the last row" is
+  `where (ordering tuple) > (last values)` — an ordinary `where`. DataCode gets cursor pagination for
+  free and would have to *add* a production to get offset.
+- **Offset is O(offset) and hides it.** Every shard must produce and discard its prefix so the
+  coordinator can merge, and nothing in the syntax says so.
+- **The one thing offset would have had going for it here does not survive contact.** Unlike SQL,
+  DataCode could make offset stable, because a query pegged to a `(commit node, sample moment)` pair
+  sees the same relation twice — but only if the caller threads the peg, and `at` defaults to request
+  arrival (`queries.md:393`). A cursor threads the peg and the position in one token; an offset
+  requires the caller to remember to.
+
+**No exact total.** `100 of 100+` is the signal, produced by fetching `limit + 1` and discarding the
+extra — exact for the "is there more" bit, one row of cost, no query-language feature. Where a real
+total is wanted it is a separate query, and the language already has it: `count (Order where total >
+100)` is an ordinary function application returning a scalar (`queries.md:251-262`). An exact footer
+would otherwise have meant running the whole query, which is the cost `limit` exists to avoid.
+
+`100 of 100+` is a CLI display convention, not grammar. It applies to the `table` and `json` output
+formats and not to `csv` or `raw`, because a pipe cannot carry a footer and a silently truncated
+export is worse than a slow one.
+
+**`limit` requires a total order**, and it comes from an explicit `order by`, else the source's
+declared one, else candidate key ascending. **Any stated order is extended by the candidate key as a
+final tiebreak**, because `order by placed_at desc` is not total: fifty orders sharing a timestamp
+put a page boundary mid-tie, and a resume predicate then either skips the rest of the tie or repeats
+it. `limit` on a degenerate-keyed source that declares no ordering is a compile-time error.
+
+**A truncated result prints its own continuation.** The admin should not have to reconstruct the
+cursor:
+
+```
+ placed_at            | total
+----------------------+-------
+ 2026-08-27T14:02:11Z | 99.99
+ …
+100 of 100+
+next: Order at "05KG3N0000ZQ8V4T1H7C" where (placed_at, id) < ("2026-08-27T14:02:11Z", "05KG…")
+        order by placed_at desc limit 100
+```
+
+Four rules make it correct rather than merely helpful:
+
+- **It carries the `at` peg.** Without it the continuation runs against a moved relation, which is
+  the exact failure the cursor was chosen over offset to avoid — `at` defaults to request arrival
+  (`queries.md:393`), so a pasted predicate with no peg is unstable.
+- **It uses the effective ordering tuple, tiebreak included.** This is what the rule above is for;
+  without the key in the tuple the printed predicate is wrong at a tie boundary.
+- **It prints only when truncated**, and not in `csv` or `raw`.
+- **Mixed directions degrade honestly.** `order by a desc, b asc` cannot be written as one tuple
+  comparison; it prints the expanded form (`a < x || (a == x && b > y)`), which is uglier and
+  correct. Worth stating so nobody assumes the tuple form always applies.
+
+### `LogData` gets two secondaries; `system.logs.HttpRequest` relaxes geography
+
+`distribution.md:110-136` is right and `transaction-graph.md:117,131-136` is the stale text.
+`LogData` carries two secondaries under the **batched** durability class — the primary commits when
+its own append is durable and ships accumulated deltas afterwards — so log volume never puts two
+network round trips on the hottest path.
+
+`system.logs.HttpRequest` was the case that motivated the "server-local" language, and it needs less
+protection than a violation log does. The relaxation is **geographic, not role count**, which is
+exactly the shape `distribution.md:519-538` already gives cold shards: *three role holders always; a
+dump is not one of them.* One rule, two callers. Its secondaries may sit in the same region, or the
+same rack, which is also what makes the bandwidth cheap.
+
+Both knobs are the same decision seen from two sides — how much do you mind losing this — so they
+belong on one `Configuration` row keyed by table path, resolved most-specific-first:
+`system.shards.DurabilityPolicy`, which `distribution.md:128` already names and never declares.
+
+Six places say the old thing and need correcting: `transaction-graph.md:117` (the shard-type table),
+`transaction-graph.md:131-136` (the paragraph), `traits.md:104` (the replication table),
+`api.md:220` ("not cross-replicated"), `documents.md:164` ("server-local under `LogData`"), and
+`transaction-graph.md:273-274`, whose locality argument survives but whose premise does not — a
+segment is still contiguous on the server that wrote it, it is simply no longer the only place it
+is read.
 
 ## Clusters
 
@@ -358,15 +927,17 @@ theory, Scala, F<:, and Julia, and DataCode's `:` already *means* subtype — `t
 worse than a parse error. `:<` joins the `:` munch family beside `:>`, reads as its mirror, and
 costs no reserved word.
 
-But **settle one thing first**: is a `:>` field to a `Component` sub-table single-valued or
-table-valued? `tables.md:424` writes `headers :> RequestHeader : Component { name, value }` — plural
-name, obviously many. `tables.md:326` says `:>` wraps the referenced table's `DataId`, and
-`traits.md:199` says a `Component` has no `DataId`, so the singular reading is not well-typed.
-`queries.md:234-236` calls a nested table "the same construct as an inline component sub-table". If
-the table-valued reading is right — and the weight of evidence says it is — then **1:many inline
-declaration already exists** for owned children, and `:<` shrinks to the case that actually needs
-it: children that are *not* owned. That is still worth having, and it is a much smaller change. This
-one question also decides items 11, 13 and 14.
+**Settled above**: a `Component` `:>` field is table-valued, so **1:many inline declaration already
+exists** for owned children. `:<` therefore scopes to children that are *not* owned — true linking
+tables, and children with independent lifetime and their own shard placement. That is still worth
+having, and it is a much smaller change than the original proposal, which was trying to cover both.
+
+The remaining live objection is worth answering rather than dismissing: `auth.md:476-500` plus
+`queries.md:527-557` is already DataCode's idiom for "the linking table needs a second statement" —
+declare it once, then bind a writable derived table over it, and the call site never names it. `:<`
+does not replace that; it removes the second *declaration*, where the binding removes the second
+*call site*. Both are worth having, but the docs should say which is for which, or authors will
+reach for `:<` where a binding is the better answer.
 
 ### Where the request was already served
 

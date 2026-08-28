@@ -1,76 +1,61 @@
 # Questions
 
-Grouped by what the answer changes. The first five are blocking — they are the Phase 0 items, and
-each one decides the shape of two or more of the sixteen changes. Everything after that is scoped
-to a single item and can be answered as that item is written.
+Fifteen were answered on 2026-08-28 and are recorded in `00-report.md` under **Decisions taken**:
+a `Component` `:>` field is table-valued and `Component` is 1:many; membership is `` `elem` ``; the
+client kind is `Client` with a separate `Registration` registry; the type is `File` and DataCode is
+the asset origin; storage tiering is (a) default, (b) as a separately named type, (c) an ordinary
+URL; `retain` on `UserData` stands; branch squashing is replaced by pruning a merged branch's
+exclusive schema nodes; connectors carry a per-connector GTID dialect covering MariaDB and MySQL; `Reference` rows live on
+the branch shard with cluster-wide tag allocation; `LogData` carries two secondaries with geography
+relaxed for `system.logs.HttpRequest`; `:<` declares only the child's FK, with no reverse
+relation on the parent, and names it on the right with `via`; and pagination is a cursor with no
+offset and no exact total, `limit` requires a total order extended by the candidate key, a
+truncated result prints its own pasteable continuation; every added column must declare a default;
+and a re-key records itself on the transaction node.
 
 ## Blocking
 
-1. **Is a `:>` field to a `Component` sub-table single-valued or table-valued?**
-   `tables.md:424` writes `headers :> RequestHeader : Component { name, value }` — plural, obviously
-   many. `tables.md:326` says `:>` wraps the referenced table's `DataId` and `traits.md:199` says a
-   `Component` has no `DataId`, so the singular reading is not well-typed. If it is table-valued,
-   1:many inline declaration already exists and `:<` shrinks to non-owned children only. Decides
-   items 11, 13, 14 and 16.
+**None.** All five Phase 0 questions are answered.
 
-2. **Does `retain` reach `UserData`, and is there any row-level `prune`?**
-   `aggregates.md:322` heads a section saying `retain` on `UserData` is admissible. Nothing else
-   in the corpus admits a row-level discard path, and `PruneStmt` takes a schema object. A `UserData`
-   table currently has *no* way to shed data, which is the whole disposal question for `Blob`.
+Validating the last two surfaced **ten new questions**, each already carrying a recommendation — see
+[50-validation.md](50-validation.md) §E. None blocks Phase 0. Two reach other files and are worth
+deciding early:
 
-3. **Do `Reference` rows live on the `system` shard (`traits.md:330`) or the branch shard
-   (`distribution.md:246`)?** Under the first reading there is one variant-tag allocator and the
-   cross-branch tag-collision problem does not exist. Under the second it does.
+- **Declare `system.graph.Transaction`?** Rule B claims the re-key record is "queryable" and nothing
+  currently makes it so; the review wants the table for two other reasons as well.
+- **What does an existing rollup bucket read for a column added to a live retention chain?** Rule A
+  as phrased forbids the answer `aggregates.md:275-282` implies (`T | NotRetained`), because that is
+  a *type* requirement rather than a default.
 
-4. **What does a field added by evolution read on rows written before it?**
-   `evolution.md:34` says it takes the field default; `evolution.md:274` says `NotFound`;
-   `transaction-graph.md:655` says `NotGiven`. `NotFound` is wrong in both readings, because it is
-   outside the field's declared type.
-
-5. **What does `limit` mean?** `LimitClause` is in the grammar and the word appears nowhere in
-   `queries.md`, its normative home. Without a default ordering rule, every pagination and cursor
-   design below is undefined.
+The remaining questions below are scoped to one change each.
 
 ## Naming
 
-6. **The word for a client's kind.** My recommendation is that you do not need one: make the entity
-   a `Client` (`Reference` rows named `Storefront`, `AdminIde`, `Cli`, `Server`), and a client token
-   names a `Client`. If you also want a coarse grouping over clients — the thing that decides
-   whether a client can be restricted at all — the field is `tier` or `class`, three constructors
-   (`Application | Operator | Peer`). Note `standing` is taken: `CredentialMethod.standing` already
-   carries `Primary | SecondFactor`. `Audience` is the OIDC word for exactly this concept and is the
-   runner-up; `Scope` is out because `scoped to <namespace>` is already in the CLI grammar.
-
-7. **`preHashed` or `unsafeHashed`** for admitting a foreign digest? The Haskell `unsafe*`
+6. **`preHashed` or `unsafeHashed`** for admitting a foreign digest? The Haskell `unsafe*`
    convention is the strongest argument for the second; the risk here is authorization rather than
    caller care, which is the argument for the first.
 
 ## Scope
 
-8. **Should frontend `.js`/`.css` live in the database?** My recommendation is no: a bundle is
-   derived and reproducible, an append-only graph has no discard path for it (see question 2), and
-   compaction never drops a version — so every deploy is a permanent full copy. Store a manifest row
-   and serve from a build artifact. I would reverse this only for a single-binary, CDN-free
-   deployment; if that is the target, say so and the rest of the `Blob` design is unchanged.
-
-9. **Is the denormalized-input case real?** Item 13's parent-deduplication rule — two elements
+7. **Is the denormalized-input case real?** Item 13's parent-deduplication rule — two elements
    agreeing on a base table's key denote one row of that base — exists to support pasting a
    denormalized CSV grid. The nested literal form covers everything else and costs far less. If you
    do not actually have that workload, dedup can be dropped.
 
-10. **Is "manually added" about a human, or about any explicit write?** A form POST, a REST PUT and
-    a connector full-row sync all name every column, so a supplied-field mask answers True for all
-    three. If you mean a human specifically, the mask is the wrong instrument.
+8. **Is "manually added" about a human, or about any explicit write?** A form POST, a REST PUT and
+   a connector full-row sync all name every column, so a supplied-field mask answers True for all
+   three. If you mean a human specifically, the mask is the wrong instrument.
 
-11. **Was the `Default` keyword actually about a record-literal expression** — `{ total = default }`,
-    meaning "write whatever the schema's default currently is"? That is a much smaller feature and
-    needs no type.
+9. **Was the `Default` keyword actually about a record-literal expression** — `{ total = default }`,
+   meaning "write whatever the schema's default currently is"? That is a much smaller feature and
+   needs no type.
 
 ## Per-item
 
 The remaining questions are scoped to one change each. They are reproduced verbatim from the
-designers and their critics, so several are sharper about their own item than I would be.
-
+designers and their critics, so several are sharper about their own item than I would be. Questions
+about `Component` arity, the `in`/`elem` spelling, the client-kind word, and whether assets belong
+in the database are now settled and can be skipped.
 
 ### D01-large-files
 
