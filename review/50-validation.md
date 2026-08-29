@@ -8,6 +8,21 @@ re-key-on-the-transaction-node rule against every `DefaultClause` form, every fi
 corrections are folded back there. Section (B) is the deliverable that matters most — it is the table
 an implementer codes against.
 
+## Status of section (E), settled 2026-08-28
+
+| # | Outcome |
+|---|---|
+| 1 | **Adopted as recommended.** Delete-plus-insert triggers on a change of shard root, not of any placement-key field. |
+| 2 | **Adopted as recommended.** Gate restated as "every `unique` headed by the placement key's own head field"; a root's candidate-key change is not a re-key. |
+| 3 | **Adopted as recommended.** Record typed over `head_index` keys; reparenting permitted only within the same shard root. |
+| 4 | **Adopted as recommended.** The `erase` cascade follows re-key links transitively forward, with an outbound-edge entry in the report. |
+| 5 | **Adopted as recommended.** Declare `system.graph.Transaction`. |
+| 6 | **Adopted, and sharpened.** The column is typed `T \| NotRetained` **and defaults to `NotRetained`**. The recommendation had it as a type requirement *instead of* a default, which is why it read as conflicting with Rule A; making `NotRetained` the default is a nullary variant, admissible under the criterion, and semantically exact — `aggregates.md:277-282` already defines `NotRetained` as "the policy did not cover this bucket", which is what an existing bucket holds for an aggregate added after it was written. **Rule A now applies uniformly with no exception for rollup levels.** |
+| 7 | **Adopted as recommended.** A field path is bound to its declared type for the life of the table; re-declaring it identically is an un-deprecate needing no default, a different type is rejected. |
+| 8 | **Adopted as recommended.** A `Violation` on a re-keyed row stays in the source shard and resolves forward. |
+| 9 | **Deferred**, as recommended, with the dependency on merge semantics recorded. New OQ. |
+| 10 | **Decided, differently.** Row construction in a default is rejected; a `Reference` sub-table may instead be **seeded in its declaration** with a `TableLit` and the field defaulted to one of those rows by an eagerly resolved query. See "A `Reference` sub-table may be seeded where it is declared" in `00-report.md`. |
+
 ---
 
 # Integration: Rule A (added-column default) and Rule B (re-key on the transaction node)

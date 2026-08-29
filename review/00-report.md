@@ -16,7 +16,7 @@ reviewer). Every audit finding below survived a verification pass whose default 
 | `30-integrated-grammar.md` | The conflict-resolved EBNF delta across all sixteen, plus the phase plan |
 | `40-bibliography.md` | Annotated bibliography, organised by the design claim each source bears on |
 | `50-validation.md` | Validation of the two Phase 0 rules: the admissible-default table, corpus violations, and ten open items |
-| `90-questions.md` | What I need from you |
+| `90-questions.md` | The five decisions still needed, and the triage of the 187 that are not |
 
 ## Decisions taken
 
@@ -443,6 +443,243 @@ siblings, rollup levels, connector shadow schemas) reach the same path without a
 anywhere. Two citations in the paragraph above are off by a few lines and corrected in
 [50-validation.md](50-validation.md) §D — `evolution.md:39` carries the contradiction, not `:34`,
 which is the compliant example.
+
+### Elevation is automatic; failback is not
+
+A shard whose primary dies promotes a secondary on its own. Moving authority *back* is an operator
+act. The asymmetry is the one OQ-007 already uses to keep a `UserData` split manual: elevation
+restores availability, failback only rebalances, so only the second can wait for a human.
+
+This commits to the whole of the fencing apparatus — epoch numbers in the graph, a two-of-three ACK
+so two secondaries cannot both believe they won, and the rejoin protocol. It answers the first half
+of OQ-006 and leaves the timing question (how long unreachable before promotion) as a
+`Configuration` value.
+
+### Auth is `UserData`, sharded by user
+
+A cluster holds millions of accounts, so `Configuration` is the wrong trait for anything keyed by
+user. `system.auth.Credential`, `Registration`, `ClientToken` and `Contact` become **`UserData`
+rooted at `User`**, which is what `UserData` is for.
+
+The keys already reach the root, so this is a trait change rather than a redesign: `Credential` is
+keyed `{ user, method }` and `user` is the FK to the root. `Role` and `CredentialMethod` stay
+`Reference` — they are code tables, low cardinality, and genuinely identical everywhere.
+
+Three consequences, and the design already anticipated the one that matters:
+
+- **Login is a shard-directory lookup, and that is the good case.** `User.username unique` is the
+  root table's key, which *is* the cluster shard directory (`tables.md:185-190`) — "the one key that
+  must be globally unique is also the one the system already needs a global index for". So
+  `authenticate` resolves username → `DataId` → shard, and everything after that is one shard-local
+  read. A bulk credential import becomes a shard-local operation instead of a cluster-wide event.
+- **Token validation must not touch the user's shard per request**, or every request to any table
+  becomes two shards. It does not have to: `auth.md:534-547` already makes session expiry a
+  `Behavior` sampled at the request's moment, and already says to shorten the session where a
+  tighter revocation bound is wanted. So the user's shard is touched at **login** and at
+  **revocation**, not on every request. That paragraph was written for a different reason and turns
+  out to be what makes distributing auth affordable.
+- **`system.auth.Challenge` is the one that does not fit.** It is `LogData`, so it is rooted at a
+  `LogSegment` and lives on the server that wrote it — not in the user's shard, which is where
+  verification will look for it. Either it becomes `UserData` rooted at `User` (an occurrence with
+  an owner, which is defensible) or verification carries the segment. This needs deciding when
+  `auth.md` is rewritten.
+
+`auth.md:7`'s "User and client credentials are stored in the `system` shard" goes with this, and it
+is one of the sites already flagged for the separate reason that `system` is a namespace rather than
+a shard.
+
+**Any role holder can authenticate, not just the primary.** Validation is a read, secondaries serve
+reads directly (`distribution.md:17`) and tertiaries serve them eventually-consistently, so a
+point-of-presence tertiary resolves the user's shard through the directory and authenticates locally
+with no hop to the primary. That is what tertiaries are for.
+
+It holds on one condition worth stating, because it is the difference between a read and a write:
+**issuing a session must not be a row write.** If a session is a self-describing bearer value whose
+validity is a `Behavior` of its embedded issue moment — which is what `auth.md:536-540` already
+describes — then login is a credential read plus a signature and any replica can complete it. If a
+session were a stored row, login would be a write and only the primary could serve it.
+
+**`LogData` per user is fine and becomes an analytical query.** `system.auth.AttemptDigest` is
+written by whichever server handled the attempt, and each server already roots its own segments —
+`LogSegment` is keyed `{ origin_server, period_start, branch }` — so a tertiary writing its own log
+rows is the existing model rather than a tertiary accepting writes. The cluster-wide comparison the
+table exists for (`auth.md:399-401`) is then a distributed read merged across servers, which is the
+same shape integrity reporting already uses.
+
+### Re-seed from state is the recovery path, and it demotes both connector prerequisites
+
+**Correcting the earlier framing.** GTID and `binlog_row_image` are not split across the two
+products: MariaDB and MySQL each have both. What differs is the GTID *scheme* — MySQL's
+`source_uuid:transaction_id` with `COM_BINLOG_DUMP_GTID`, MariaDB's `domain-server-sequence` with
+`@slave_connect_state` — and the two are mutually unintelligible, which is why one connector carries
+two dialects.
+
+**Re-seeding from current state is sound**, and both servers give the consistent pair it needs
+without a global lock: `START TRANSACTION WITH CONSISTENT SNAPSHOT` alongside `gtid_executed` /
+`@@gtid_current_pos` on InnoDB. So after an outage the connector snapshots, records the position it
+snapshotted at, and resumes — discarding the gap rather than replaying it.
+
+Two consequences reorder the connector work:
+
+- **`binlog_row_image=FULL` is not required, and the earlier claim that `MINIMAL` forfeits the
+  rooted-key shadow was wrong.** Under `MINIMAL` an INSERT still logs every column (all of them are
+  changed by the statement), an UPDATE logs the primary key plus the changed columns, and a DELETE
+  logs the primary key. That is enough to locate and apply, **provided the shadow keeps the source
+  primary key as an indexed column** — the key stays the rooted one and the PK is the lookup path.
+  The only thing lost is the prior value of unchanged columns, which DataCode already stores. Worth
+  confirming against a real source before it is written normatively, since it is load-bearing.
+- **GTID becomes an optimization rather than a correctness prerequisite.** It still buys cheap
+  resumption, failover to a different source without recomputing position, gap detection and
+  idempotent re-apply. But a source that cannot enable it is no longer disqualified: it gets
+  filename-plus-offset and a re-seed whenever the position is in doubt. **Build the re-seed path
+  first** — it is needed for initial load regardless — and GTID lands on top of it.
+
+Three things the model needs that are easy to miss:
+
+- **Re-seed is a diff-and-apply, not a rewrite.** Blindly re-applying a snapshot writes one new row
+  version per source row into an append-only graph, including for rows that did not change. Compare
+  each incoming row against the stored one and write a version only where they differ. The
+  comparison is a keyed lookup, and it keeps the version chain an account of actual changes.
+- **The snapshot must be complete per table, or deletes leak.** A row deleted at the source during
+  the outage is simply absent from the snapshot. Present-locally-and-absent-from-the-snapshot is the
+  only signal that it went, so a partial re-seed silently retains deleted rows.
+- **What is lost is not only audit history.** An order that went `Pending → Shipped → Delivered`
+  during the gap re-seeds as `Delivered`, so `on status is Shipped emit` **never fires** and the
+  shipping notifications never go out. That is a larger cost than the phrase "audit history"
+  suggests, and it is a decision rather than a consequence: a re-seed should be a distinguished
+  transaction kind, and whether it fires event functors should be a per-queue `Configuration` choice.
+  "Send the notifications we missed" and "do not send four thousand emails" are both legitimate and
+  only the deployment knows which.
+
+The `origin : Streamed | Snapshot | Reseeded Text` field the connector design already carries is
+where this is recorded.
+
+### Large files: a documented cap now, swarm distribution later
+
+A size cap ships as a `Configuration` row, with the chunked-and-swarmed path as the way past it
+rather than a bigger number. The target model — named pieces propagating so that every node needing
+the file gets it, not necessarily from one server — is **already most of the way built**, which is
+the reason to design toward it now rather than around it.
+
+| Piece needed | What exists |
+|---|---|
+| Named pieces | A `File`'s chunks are `Component` rows, identified by `<parent DataId>.<ordinal>`. Already named, already ordered, already one contiguous range scan. |
+| Piece verification | Each chunk carries a digest. This is BitTorrent's piece hash. |
+| Swarm transfer | `distribution.md:138-158` already has announce-and-fetch: "each server announces which sequence numbers it holds, and a peer fetches what it lacks from whoever has it rather than from the primary alone". |
+
+Two changes get from here to there, and neither is new architecture:
+
+- **Each chunk is its own transaction**, which is also what removes the size cap's cause: the cap
+  exists because one large synchronous write head-of-line-blocks a linearized shard primary. Chunked
+  writes make that a stream of small transactions instead. The upload path and the distribution path
+  are the same work.
+- **Announce-and-fetch widens from sequence ranges to chunk digests**, so a peer can ask for piece
+  47 without pulling the transaction that carried it.
+
+One trap to name now, because the model invites it: **content-addressed pieces tempt dedup, and dedup
+is already rejected.** Sharing one content row across owners breaks `erase` and collapses N access
+policies onto one row. The digest is for **verification and transfer**, never for identity — which is
+exactly where this design departs from BitTorrent, whose whole model is content-addressed identity.
+
+### Case insensitivity is a storage transform, not a second equality
+
+`==` stays exact. A second equality operator would have to be understood by `unique`, by every
+index, by join matching and by derived-key propagation — a large blast radius for a convenience.
+
+**Canonicalize on write instead.** Step 4 of the field-write order (`functors.md:46-68`) is already
+"apply the type's storage transform", and only `Secret` types use it today; widening it to a
+non-secret transform is small and principled. `type Email : Folded Text` stores the folded form, so
+`==`, `unique` and the index are all ordinary operations over ordinary bytes.
+
+Four details that decide whether this is right or subtly wrong:
+
+- **Fold with `Data.Text.toCaseFold`, not `toLower`.** Full case folding — `ß` → `ss` — is the
+  correct operation, and `toLower` is the classic bug.
+- **Keep the original in a second field where display matters.** `email : Email unique` alongside
+  `email_as_given : Text`. Explicit, free, and it makes the trade visible rather than hidden in a
+  comparison operator.
+- **Normalization is the other half.** NFC is what actually fixes the two encodings of `é`, and it
+  runs at the same hook. That argues for the transform naming a policy row rather than being fixed —
+  `type Email : Canonical Text using system.text.Policy.email`, the `Hashed … using` shape exactly,
+  so one type can say "casefold and NFC".
+- **For regex, put the flag on the pattern row.** `Text.Regex.TDFA`'s `CompOption` carries
+  `caseSensitive`, so a `Reference` pattern table with `{ name, pattern, case_sensitive }` gets it
+  with no grammar at all — the same "a declaration that must name a policy names a row" rule. A bare
+  `StringLit` pattern stays case-sensitive: literals are exact, policies are configurable.
+
+**Rejected: a function in `UniqueDecl`** (`unique emailRef { fold email }`). It keeps the original
+casing, but an index over `fold email` is usable only by a query that spells `fold email`, so every
+lookup carries the function. Storing the canonical form and keeping the original beside it costs the
+same bytes and reads better.
+
+### A schema object may not name a data row
+
+The rule that decides what a `:>` field's default may be, stratified by the target's trait. It is not
+new — `auth.md:330-336` already draws exactly this line for `CipherPolicy`, which "names its key by
+name, not by `:>`", because "which key material stands behind that name is a deployment fact, and
+staging must not share production's key". It now covers three forms instead of one.
+
+| Target | Default admissible? | Why |
+|---|---|---|
+| `Reference` | **Yes** | The FK stores a **2-byte variant tag**, not a `DataId` (`traits.md:332`). A `Reference` row *is* schema, replicated everywhere, versioned by schema node. `status :> OrderStatus = Pending` is a nullary `FieldPath` and already admissible. |
+| `Configuration` | **No** | Replicated everywhere but a deployment fact. This is `auth.md:334`'s case exactly. Resolve by *name* at runtime, as `CipherPolicy.key_name` does. |
+| `UserData`, `LogData` | **No** | Shard-local *and* deployment-specific: the same schema commit means nothing in staging. |
+
+Two forms are rejected by it that would otherwise have needed their own rules. A **literal `DataId`**
+(`owner :> User = "05KG…"`) parses — there is no `DataIdLit` terminal, so it is a `StringLit` told
+apart at resolution, on the `AtClause` precedent — and it passes the `Pure`-and-stable criterion, so
+nothing *else* rejects it. And a **lazily evaluated query** default fails the stability half, because
+old rows re-resolve at every read while post-add inserts froze at insert.
+
+But an **eagerly resolved** query does not fail either test: resolve it once at schema commit, freeze
+the result into the schema node, and it is exactly as stable as a literal. Nothing about the checking
+is hard — telling a `Query` from an `Expr` is `railroad.md:539-543`, already applied in three
+positions; schema commit already runs full table scans to compute a predicate's blast radius
+(`integrity.md:184`), so a single-row lookup is cheaper than something already done; and "exactly one
+resolved row" is the requirement `matches` already carries. **The reason is the stratification, not
+the difficulty.**
+
+For a `Reference` target, where the stratification permits it, the value is a tag rather than a
+`DataId`, so the literal form buys nothing a name does not.
+
+### A `Reference` sub-table may be seeded where it is declared
+
+Constructing a row *as a default* stays rejected — it needs a transaction, and a row committed last
+year has none. What is admitted instead is seeding the sub-table in its **declaration**, then
+defaulting to one of those rows by query:
+
+```
+f :> T : Reference { name : Text unique } [ { name = "a" }, { name = "b" } ] = T where name == "a"
+```
+
+Every part is a schema act, so all of it belongs in one schema commit: an inline sub-table is already
+sugar for "declare a sibling, then reference it" (`tables.md:390`), inserting a `Reference` row is
+already a schema transaction (`traits.md:329`), and the default names a `Reference` row, which the
+stratification above permits. It replaces a declaration plus N scattered insert statements for the
+small code tables that want exactly this — `OrderStatus`, `Tier`, `Priority`.
+
+```ebnf
+FieldDecl    ::= Ident RefToken TypeExpr SubTableTraits? SubTableBody? SubTableRows?
+                 'unique'? IndexedClause? DefaultClause? WhereClause?
+SubTableRows ::= TableLit
+DefaultClause::= '=' ( Expr | Query | SeqAlloc )          /* Query is new */
+```
+
+Unambiguous: after a `SubTableBody`, nothing else in a `FieldDecl` begins with `[`, and widening
+`DefaultClause` is a fourth position for the existing `railroad.md:539` rule rather than a new one.
+
+Three constraints not expressible in the grammar:
+
+- **`SubTableRows` is admissible only where `SubTableTraits` names `Reference`.** On a `Component` or
+  `Configuration` sub-table the rows would be *data* written by a schema commit, which is the
+  cross-table in-commit write `events.md:480-484` refuses.
+- **The default query must resolve to exactly one row**, and the `unique` in the body is what
+  guarantees it. Without it the construct is not merely untidy, it is ill-formed.
+- **The query resolves at schema commit** and the resulting tag is frozen into the node. It is not
+  re-evaluated on read.
+
+Two slips in the worked form, corrected above: comparison is `==` (`=` binds), and a `StringLit` is
+double-quoted.
 
 ### Re-keying records itself on the transaction node
 

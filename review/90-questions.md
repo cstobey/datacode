@@ -1,54 +1,117 @@
 # Questions
 
-Fifteen were answered on 2026-08-28 and are recorded in `00-report.md` under **Decisions taken**:
-a `Component` `:>` field is table-valued and `Component` is 1:many; membership is `` `elem` ``; the
-client kind is `Client` with a separate `Registration` registry; the type is `File` and DataCode is
-the asset origin; storage tiering is (a) default, (b) as a separately named type, (c) an ordinary
-URL; `retain` on `UserData` stands; branch squashing is replaced by pruning a merged branch's
-exclusive schema nodes; connectors carry a per-connector GTID dialect covering MariaDB and MySQL; `Reference` rows live on
-the branch shard with cluster-wide tag allocation; `LogData` carries two secondaries with geography
-relaxed for `system.logs.HttpRequest`; `:<` declares only the child's FK, with no reverse
-relation on the parent, and names it on the right with `via`; and pagination is a cursor with no
-offset and no exact total, `limit` requires a total order extended by the candidate key, a
-truncated result prints its own pasteable continuation; every added column must declare a default;
-and a re-key records itself on the transaction node.
+**Twenty-five answered.** All are recorded in `00-report.md` under **Decisions taken** and in
+`50-validation.md` under **Status of section (E)**.
 
-## Blocking
+**Five remain.** The 187 per-item questions the designers and critics raised were triaged against
+those decisions on 2026-08-28: 58 were made moot by a decision, 109 have a dominant answer and are
+mine to write down, 13 hang off something already deferred, and 11 were genuinely yours — cut to five
+below by dropping those where both answers lead to the same work.
 
-**None.** All five Phase 0 questions are answered.
+All five are **facts about the deployment you are building toward**, not language design. That is the
+shape the residue takes once the syntax is settled, and none of them blocks Phase 0.
 
-Validating the last two surfaced **ten new questions**, each already carrying a recommendation — see
-[50-validation.md](50-validation.md) §E. None blocks Phase 0. Two reach other files and are worth
-deciding early:
+---
 
-- **Declare `system.graph.Transaction`?** Rule B claims the re-key record is "queryable" and nothing
-  currently makes it so; the review wants the table for two other reasons as well.
-- **What does an existing rollup bucket read for a column added to a live retention chain?** Rule A
-  as phrased forbids the answer `aggregates.md:275-282` implies (`T | NotRetained`), because that is
-  a *type* requirement rather than a default.
+# Decisions still needed — final list
 
-The remaining questions below are scoped to one change each.
+## (A) Decisions still needed
 
-## Naming
+Five survive. Six of the eleven THEIRS were demoted (four had a dominant answer on the design's own principles; two merge into one another).
 
-6. **`preHashed` or `unsafeHashed`** for admitting a foreign digest? The Haskell `unsafe*`
-   convention is the strongest argument for the second; the risk here is authorization rather than
-   caller care, which is the argument for the first.
+### 1. When a shard's primary dies, does the cluster promote a secondary on its own, or wait for an operator?
 
-## Scope
+*(D08 critic 1 — OQ-006 has never settled it)*
 
-7. **Is the denormalized-input case real?** Item 13's parent-deduplication rule — two elements
-   agreeing on a base table's key denote one row of that base — exists to support pasting a
-   denormalized CSV grid. The nested literal form covers everything else and costs far less. If you
-   do not actually have that workload, dedup can be dropped.
+**Differs:** Automatic promotion requires all of D08 §4 — the two-of-three ACK, fencing epochs, the elevation protocol, split-brain recovery. Operator-initiated shrinks that to fencing plus rejoin, deletes the ACK question, and costs write availability on a shard until someone acts. It also decides the failback default (D08 Q6), which is parked on this answer.
 
-8. **Is "manually added" about a human, or about any explicit write?** A form POST, a REST PUT and
-   a connector full-row sync all name every column, so a supplied-field mask answers True for all
-   three. If you mean a human specifically, the mask is the wrong instrument.
+**Recommendation:** Automatic elevation, operator-initiated failback. Elevation restores availability; failback only rebalances. Same asymmetry OQ-007 already uses to keep a `UserData` split manual because it moves write authority.
 
-9. **Was the `Default` keyword actually about a record-literal expression** — `{ total = default }`,
-   meaning "write whatever the schema's default currently is"? That is a much smaller feature and
-   needs no type.
+### 2. Roughly how many end-user accounts and registered devices will one cluster hold — thousands, or millions?
+
+*(D07 critic 5)*
+
+**Differs:** `system.auth.Credential` is `Configuration` (`auth.md:78`), and decision 3 put `Registration` and `ClientToken` there too. `Configuration` replicates every row to every server. Correct at thousands; wrong at millions, where all three want to be shard-local `UserData` rooted at `User` — which makes login a shard-directory lookup and a bulk credential import a shard-local operation rather than a cluster-wide event.
+
+**Recommendation:** If millions, re-trait all three before any auth work lands. Re-traiting after is a rewrite; deciding now is three words in `traits.md`.
+
+### 3. Can every MariaDB/MySQL source you replicate from run GTID *and* `binlog_row_image=FULL`?
+
+*(D09 Q6 + D12 Q5 — merged; both recommendations already said "same phone call")*
+
+**Differs:** Yes to both: the connector has one position model with no stored checkpoint, and a shadow table keys on the source's FK chain, so ingested data roots and shards like native data. No to GTID: `mysql_filepos` stays first-class and needs its own at-least-once checkpoint design — the machinery the GTID design was chosen to delete. No to FULL: an UPDATE's before-image carries only the primary key, so every shadow keys on the source PK alone and lands as an unrooted flat table, forfeiting the rooted-key shadow design entirely.
+
+**Recommendation:** Require both. They are the standard CDC prerequisites, and the rooted-key shadow is the whole of what makes ingested data shardable. A source that cannot enable them gets a periodic snapshot, not a streaming connector.
+
+### 4. What is the largest file you actually need to store, and does anything have to upload one in pieces?
+
+*(D01 Q10)*
+
+**Differs:** A few MiB of frontend assets and attachments means one synchronous write plus a size cap, and no ingest path to design. Hundreds of MiB means one upload head-of-line-blocks a tenant's entire write path through the linearized shard primary — so the answer is a batched durability class and a chunked/resumable upload path, not a bigger single-transaction ceiling. The cap number itself is a `Configuration` row and costs nothing; the streaming ingest path is the part that only exists if you say so.
+
+**Recommendation:** If it is first-party CSS/JS/images and document attachments, cap around 16 MiB synchronous and build no resumable upload in v1.
+
+### 5. Does pattern validation need to work on non-ASCII text — accented or non-Latin names and addresses?
+
+*(D04 Q2 — smallest of the five)*
+
+**Differs:** With regex-tdfa, `[[:alpha:]]` does not match `é`, so any class-based predicate silently rejects real names. Yes means regex-rure and a Rust dependency in the build. No means regex-tdfa with the ASCII limit documented beside every class-based predicate. The window is before the first production cluster, not before the docs — a later swap re-interprets patterns already stored in the schema graph.
+
+**Recommendation:** Yes, and pay the engine switch now while it is free. Note the partial escape either way: named predicates are ordinary Haskell functions and `Data.Char.isAlpha` is already Unicode-aware, so only author-written regex classes are exposed.
+
+*Catchall: anything else about the deployment you are actually building toward — cluster count, tenancy shape, hardware, or a workload I have not asked about — that would change any of the above?*
+
+## (B) Answered by a decision
+
+**32** questions were killed outright by the fifteen decisions taken on 2026-08-28. (A further 24 were duplicates or per-file catchalls of the single global catchall, and 2 were already settled in `docs/` — 58 moot in total.)
+
+Most notable:
+
+- **Seven of D16's thirteen** died to *"`:<` declares the child's FK and nothing on the parent"* plus *"a `:>` to a `Component` is table-valued"*. Withdrawing the reverse column removed the default-naming question, the `deprecate`-the-reverse-name question, the table-valued-reverse-path-in-an-assert question, and the `:describe … deep` feature they were all attached to.
+- **D12 Q1 and Q7** died to *"`Reference` rows live on the branch shard; tags are allocated cluster-wide"*, which says so in terms: "this closes the cross-branch collision question that D12 wanted to raise as an OQ. Do not file it."
+- **D08 Q3, Q4 and critic 4** died to *"pagination is a cursor, not an offset; no exact total"* and *"`limit` requires a total order"* — the exact-count flag, the csv/raw exemption, and the meaning of `limit` without `order by`.
+- **D15 #5 and #12** died to *"every added column declares a default"*, which replaced all three contradictory statements about what an evolution-added field reads on old rows.
+
+## (C) Mine to write down
+
+**109.** Ones where the answer is non-obvious enough that you might push back when you see it:
+
+- **`File` gets no content dedup** — one content row shared across owners breaks `erase` and collapses N access policies onto one row. Digest kept for integrity only. (D01 Q7)
+- **Bulk insert gets no parent-deduplication** — the denormalized-grid case is dropped; adding it later changes nothing that already parses. (Scope 7, demoted from THEIRS)
+- **`{ total = default }` gets built regardless of what you meant by `Default`** — nothing today can reset a field to its default, so the feature stands on its own merits. (Scope 9, demoted)
+- **`unsafeHashed`, not `preHashed`** — "make it feel like Haskell" is the stated tie-breaker; close enough that your ear overrides me. (Naming 6, demoted)
+- **The connector's `row_image` mirror ships behind a per-connector flag defaulting off** — the position and the audit mirror are two jobs, only one load-bearing. (D09 Q13, demoted)
+- **Running totals and RANK are parked** — `numbered` ships either way; an ordered prefix-scan aggregate is separable new work. (D11 Q1, demoted)
+- **`show queries` normalizes `query_text` with literals as placeholders** — full text lets a `bypass access on system` token read values out of `app.*` tables it holds no grant on.
+- **The three-way client split is named `reach`, as a seeded `Reference` sub-table** — not `standing` (taken, `auth.md:88`) and not `tier`.
+- **The connector does not generate a `retain` chain** for tables it creates — warning only, because *silence means keep*.
+- **Update-all is spelled `Order where True { … }`** — an explicit `where True` on the one statement that rewrites every row.
+- **A mutation returns a commit node and an affected-row count, not rows** — read the new versions back with a query pegged `at` that commit node.
+- **`preHashed` and `reveal` move to the `BypassKind` axis**, not path grants, because `GrantCmd` is path-recursive by construction.
+- **One new OQ number is spent**, on retiring a population of superseded stored representations (credentials and data keys together). Four designers each claimed "OQ-038"; it can only be spent once.
+
+## (D) Attached to something deferred
+
+**13**, hanging off seven things:
+
+| Deferred thing | Count | Questions |
+|---|---|---|
+| Supplied-field mask | 4 | `updated_at` as "last changed" vs "last named"; the name `provenance`; `provenance` in an `on` condition; what a merge commit writes to the mask |
+| Parameterised regex | 3 | argument character class and 64-char cap; row-path argument outside access asserts; per-tenant pattern-set cardinality |
+| Merge reconciliation | 1 | a table-wide `unique` handed out on both sides of a partition (plus the mask question above) |
+| Recursion / closure | 1 | `parent` as a virtual column on `Component` tables |
+| `.dc` export format | 1 | must re-import replay scrub and erase nodes (also blocked on OQ-036) |
+| `Ephemeral` trait | 1 | does `show queries` cover maintenance-queue and scheduled work |
+| OQ-012 (distributed query protocol) | 1 | lease vs budget-exhaustion for a fragment whose coordinator died |
+
+One more — the `auto_reclaim` / failback default (D08 Q6) — hangs off decision **A1** above rather than off a deferral, and follows from it directly.
+
+---
+
+## Raw, superseded
+
+The 187 original questions, verbatim from the designers and their critics, kept for provenance. Every
+one has been triaged; consult this only to check how a question was disposed of.
 
 ## Per-item
 
