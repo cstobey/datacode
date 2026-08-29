@@ -1,4 +1,4 @@
-# Schema Model
+# Schema model
 
 The DataCode schema language, broken up by topic. This directory is the normative
 reference for schema syntax and semantics. `../cli.md` covers the tooling that
@@ -7,14 +7,14 @@ than restating it.
 
 | Document | Covers |
 |---|---|
-| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, `is`, `Secret`, `Hashed`, `Encrypted` |
-| [tables.md](tables.md) | Table bodies, field declarations, defaults, candidate keys, ordering, foreign keys, sub-tables |
-| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Personal`, `Extensible` |
+| [types.md](types.md) | Primitives, domain types, sum and product types, `Moment` and `Behavior`, `Duration`/`Period`/`Grain`, absence types, canonical types, `File`, `is`, `Secret`, `Hashed`, `Encrypted` |
+| [tables.md](tables.md) | Table bodies, field declarations, defaults, candidate keys, ordering, foreign keys, sub-tables, back-references |
+| [traits.md](traits.md) | Trait declaration, extension, multiple inheritance, replication traits, `Component`, `Keyless`, `Personal`, `Extensible`, `Queue`/`QueueState` |
 | [constraints.md](constraints.md) | `assert`, path constraints, presence and absence, access control |
 | [documents.md](documents.md) | The `Doc` type, shredding, key interning and spill, key shape rules, demotion |
 | [aggregates.md](aggregates.md) | Aggregate functions, mergeable aggregates, `retain` chains, log retention |
 | [evolution.md](evolution.md) | Redeclaration, rename, retype, deprecate, prune, split, merge, ADT extension, visibility |
-| [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, derived tables, mutation, `diff` |
+| [queries.md](queries.md) | Filter, projection, joins, grouping, ordering, limit and pagination, derived tables, mutation, `diff` |
 | [functions.md](functions.md) | Scope, the effect ladder, Haskell functions, auto-wrapping, function types, function-valued columns |
 | [functors.md](functors.md) | The four functor kinds, order of operations, enforcement modes |
 | [templates.md](templates.md) | Text with holes, cardinality as control flow, `using` and render functions |
@@ -26,40 +26,58 @@ tree), [../transaction-graph.md](../transaction-graph.md) (versioning, branches,
 [../events.md](../events.md) (event scheduler), [../auth.md](../auth.md) (tokens),
 [../integrity.md](../integrity.md) (nonconformance and enforcement modes).
 
-## Design Philosophy
+## Design philosophy
 
-DataCode schemas are closer to TutorialD than SQL. The core shift:
+DataCode agrees with TutorialD and *The Third Manifesto* on three things SQL gets wrong: no
+NULL, mandatory candidate keys, and tables as sets of typed tuples. It departs on a fourth —
+`:>` stores a surrogate row identifier, which TTM proscribes — because the transaction graph
+needs an identity independent of any natural key. The core shift from SQL:
 
-- A **table** is a named collection of typed tuples (no row ordering, no implicit keys unless declared)
+- A **table** is a named collection of typed tuples. Every row carries a system-minted
+  `DataId`, which is *not* a candidate key; a candidate key is mandatory unless the table
+  carries `LogData`, `Component`, or `Keyless`
+  ([tables.md](tables.md#candidate-keys-are-mandatory)). Rows are a set — `order by` declares
+  a default ordering for queries, not a stored order.
 - A **field** has a precise type with associated validation functors
 - A **query** is indistinguishable from a table definition. Both denote tables over the transaction graph, and there is no separate schema object called a view.
 - There is **no NULL** — absent values are expressed as typed ADTs with meaningful names
 - Tables are organized in a **namespace tree** — namespaces replace the SQL "database" concept
 - **Traits** provide abstract base types for tables, encoding replication policy, shared fields, and shared functions
 
-### Self-Hosting Principle
+### Self-hosting principle
 
 **DataCode should use DataCode to manage its own operational data wherever practical.**
 
 Every system concern that can be expressed as a table, should be. This includes:
 
+- **The transaction graph itself** — rows in `system.graph.Transaction`
+- **Branches and tags** — rows in `system.schema.Branch` and `system.schema.Tag`
 - **API route registrations** — rows in `system.api.GeneratedRoute` and `system.api.CustomRoute`
-- **Connector configurations** — rows in `system.connectors.*`
+- **Connector configuration and replication position** — rows in `system.connectors.*`
 - **Event queues** — user-defined tables carrying the `Queue` trait, with policy in `system.events.QueuePolicy`
 - **Scheduler state** — rows in `system.events.*`
-- **Auth tokens and sessions** — rows in `system.auth.*`
-- **Schema version promotions** — rows in `system.VersionRef` (branches and tags share one table; the `VersionRef` ADT encodes which)
-- **Operational metrics and logs** — rows in `system.logs.*` (logs shard, prunable)
-- **HTTP request logs** — rows in `system.logs.HttpRequest` (per-server log shard)
+- **Accounts, credentials, tokens, and grants** — rows in `system.auth.*`
+- **Shard roles, placement, and durability policy** — rows in `system.shards.*`
+- **Key custody and hash policy** — rows in `system.crypto.*`
+- **Nonconformance** — rows in `system.integrity.Violation` and `system.integrity.Disposition`
+- **Operational metrics and request logs** — rows in `system.logs.*`, `system.logs.HttpRequest` among them. They carry `LogData`, so they are discarded only by a declared `retain` chain and never automatically ([traits.md](traits.md#replication-traits))
 
 The practical consequences:
 
 - DataCode's own configuration is inspectable and queryable with standard DataCode tooling
 - System operations (connector sync, event dispatch, shard maintenance) are auditable in the transaction log
 - The IDE can show system state the same way it shows application state
-- Bootstrapping is the only exception — the very first system tables must exist before DataCode can use DataCode to manage them
+- **A DataCode upgrade obeys the rules an application author obeys.** A release that adds a field to `system.auth.*` ships a `DefaultClause` with it and backfills nothing ([evolution.md](evolution.md#every-added-field-declares-a-default)). Self-hosting cuts both ways: the product's own author is *further* from an operator's rows than an application author is, so no escape hatch exists here that does not exist there
 
-## Namespace Organization
+Bootstrapping is the one exception, and the genesis path is not yet specified. The first system
+tables must exist before DataCode can use DataCode to manage them, and every route into that
+state is circular against a settled rule: inserting a `Reference` row is itself a schema
+commit, access is default-deny until a grant exists, and a schema shard is rooted at a branch
+row that the schema graph has to hold. The compiled-in seed schema, the order in which the
+first rows are admitted, and how the initial grant and token are minted belong in
+[../transaction-graph.md](../transaction-graph.md), which owns the graph.
+
+## Namespace organization
 
 Every table belongs to a namespace. Namespaces are dot-separated hierarchical paths:
 
@@ -70,19 +88,23 @@ Every table belongs to a namespace. Namespaces are dot-separated hierarchical pa
 Namespaces are created implicitly when a table is first defined in them — no explicit
 creation syntax. Full namespace documentation: [../namespaces.md](../namespaces.md).
 
-## Schema Visibility Layers
+## Schema layers
 
-DataCode maintains multiple layers of schema simultaneously:
+DataCode maintains three layers of schema simultaneously. A layer is a namespace convention.
+It is not the `VisibilityLevel` that `set visibility` assigns, which is a separate five-value
+scale with a home in [../namespaces.md](../namespaces.md#schema-visibility-layers).
 
 1. **Auto-generated connector shadow schemas** (`connectors.*`): created when a connector is added; updated automatically as the external schema changes; hidden from the default IDE view
 2. **User-defined application schemas** (`app.*`): created by schema authors; may be derived from or extend connector schemas; visible by default
-3. **System schemas** (`system.*`): DataCode internals; visible only to admin tokens
+3. **System schemas** (`system.*`): DataCode internals. They default to the `system` visibility level, so the IDE hides them. Read access is default-deny and takes an explicit grant on the subtree, as it does everywhere ([../namespaces.md](../namespaces.md#namespace-access-control)). There is no admin token type and no role check on the read path — administrator status is a `bypass` attribute on an ordinary grant
 
-This layering enables data independence: the human-understood schema (`app.*`) can evolve
-independently of the physical/connector schema underneath it, with coercion handled by
-functors between the layers.
+This layering enables data independence: the human-understood schema (`app.*`) evolves
+independently of the connector shadow schema beneath it. The coercion between the two layers
+is an ordinary `Binding`, not a fifth functor kind — its projected expressions mint the target
+field types ([queries.md](queries.md#field-types)). All three layers are logical; *physical*
+means storage layout and belongs to [../storage.md](../storage.md).
 
-## Notation Conventions
+## Notation conventions
 
 These conventions recur throughout the language. They are defined once here and assumed
 everywhere else.
@@ -114,8 +136,8 @@ one line, and each looks like what it is.
 
 ### `:` versus `:>`
 
-`:` means **is a kind of**. `:>` means **references a row in**. The correct token depends
-on syntactic position:
+`:` means **is a kind of**. `:>` means **references a row in**. `:<` means **is referenced
+by rows in**. The correct token depends on syntactic position:
 
 | Position | Token | Right-hand side must be |
 |---|---|---|
@@ -124,6 +146,7 @@ on syntactic position:
 | `table T : R, S` | `:` | traits |
 | field declaration | `:` | a type — no alternative may be a table |
 | field declaration | `:>` | a table or derived table (see the head rule below) |
+| table body item | `:<` | a table — the child that holds the FK back |
 
 `:>` is meaningful only in field position. Using `:` where the right-hand side names a
 table, or `:>` where it names a type, is a compile-time error:
@@ -155,13 +178,35 @@ This is the same left-to-right guard semantics used by outer joins (see
 [queries.md](queries.md)), so a nullable FK field and an outer join read identically.
 No second `Null` root is needed — absence types are admissible in the tail of either form.
 
+**`:<` is `:>` read from the other end.** It is a body item rather than a field, and it
+declares a *child* table that holds a foreign key back to this one, naming that field with
+`via`. The parent gains nothing from it — no column, no reverse relation — so `:<` removes a
+second declaration, never a second spelling for a join:
+
+```
+:< Comment via document { body : Text, author :> User }
+```
+
+It is spelled `:<` and not `<:` because `<:` is the subtyping operator everywhere else it
+appears, and `:` already means subtype here: `type Email : Text` is `Email <: Text`. So
+`comments <: Comment` would be a well-formed sentence saying the wrong thing, which is worse
+than a parse error. Full treatment in [tables.md](tables.md#back-references).
+
 ### Clause order
 
-Field declarations take up to five trailing clauses, in this order:
+A field declaration takes its optional clauses in one fixed order:
 
-```
-field ( ":" | ":>" ) Type [ unique ] [ indexed ] [ = Default ] [ where Predicate ]
-```
+1. sub-table traits — `: Component`, `: Reference`
+2. an inline sub-table body — `{ … }`
+3. seed rows for a `Reference` sub-table — `[ { … }, { … } ]`
+4. `unique`
+5. `indexed`, with an optional `using`
+6. the default — `= …`
+7. `where`
+
+The production is `FieldDecl` in [railroad.md](railroad.md#fields), which also carries the
+constraint on each clause. This section holds only why the order is fixed, so that the two
+cannot drift apart again.
 
 `where` is last because it is the only clause with an open-ended expression on its right.
 Fixing the order keeps a declaration parseable in one pass, with no lookahead to decide
@@ -174,7 +219,10 @@ Because a bare `=` therefore cannot appear at bracket depth 0 inside a predicate
 
 Operator spelling follows Haskell throughout: `==`, `/=`, `&&`, `||`, `not`, `True`,
 `False`. There are no `!=`, `and`, or `or` tokens. `=~` is regex match, and its right operand
-must be a literal, a `Reference` path, or a `Configuration` path — never user input.
+must be a string literal or a path into a `Reference` or `Configuration` table — never user
+input ([railroad.md](railroad.md#functions-and-expressions) owns the restriction and its
+reasons). Membership is `` `elem` `` over a table literal, not an `in` operator; `in` belongs
+to `let … in` and gains no second meaning ([queries.md](queries.md#membership)).
 
 ### Backticks and `$`
 
@@ -226,6 +274,9 @@ from two traits carries both traits' predicates (see [traits.md](traits.md)).
 
 ### Termination and layout
 
+The token rules are [railroad.md](railroad.md#lexical)'s; what follows is why they are worth
+following.
+
 Comments are `--` to end of line.
 
 **Inside a body** (`table`, `trait`), field declarations are separated by `,` and
@@ -234,8 +285,8 @@ of the next — leading-comma style keeps a block `where` readable, and is the r
 style whenever any field in the body has one. A comma before the closing `}` is permitted:
 
 ```
-table app.commerce.Customer {
-  email : Email
+table app.commerce.Customer : UserData {
+  email : Email unique
     where
       isValidEmail
       maxLen 254
@@ -274,10 +325,9 @@ app.commerce.Customer.email    -- the field's computed type, and its validation
 Active.is_active               -- a trait field's type, and its validation
 ```
 
-This is the same path form already used to reference an inherited field
-(`a_name : Text from A.name`), and it is what `assert` gets from its explicit name. The
-difference is that `assert` must be named because it spans two paths and belongs to no
-single field, whereas a field's `where` already has a path.
+The path is what `assert` gets from its explicit name. The difference is that `assert` must be
+named because it spans two paths and belongs to no single field, whereas a field's `where`
+already has a path.
 
 Origin is preserved under inheritance. A predicate inherited from a trait keeps its trait
 address; a table that merges a field from two traits leaves all the origin addresses live
@@ -297,6 +347,33 @@ Addresses are used for error reporting (a rejected commit names the path that re
 for `:describe`, and for evolution — a validation is changed by redeclaring the field, and
 the diff is taken per path.
 
-Within one block, a predicate is identified by the function it applies
-(`app.commerce.Customer.email` / `isValidEmail`). An anonymous lambda has no name to report,
-so give a predicate a top-level definition when its failure message matters.
+#### Addressing one predicate in a block
+
+Within one block, a predicate is addressed by the **function it applies, with its literal
+arguments appended in order and no separators**. So `isValidEmail` addresses as
+`isValidEmail`, and `minLen 12` addresses as `minLen12`:
+
+```
+enforce app.auth.User.username / minLen12 forward
+```
+
+The arguments are part of the address rather than elided, which is what this replaces. One
+block may apply the same function twice — `inRange 0 10` beside `inRange 5 20` — and the whole
+point of an address is to let a mode statement reach one predicate and not the other
+([../integrity.md](../integrity.md#enforcement-modes)). Under the bare-function-name rule those
+two collide, in exactly the case worth naming.
+
+`ValidationRef` carries a single `Ident`
+([railroad.md](railroad.md#enforcement-modes)), so an address has to lex as one. Two
+predicates therefore have no address:
+
+- an anonymous lambda, which applies no named function
+- an application whose rendered arguments do not lex inside an `Ident` — a string literal, a
+  negative number, any expression
+
+Both are compile-time errors wherever an address is required, which is on a populated field,
+where stating a mode is mandatory
+([../integrity.md](../integrity.md#mode-is-mandatory-on-a-populated-field)). The fix for both
+is the same and the diagnostic names it: give the predicate a top-level definition, which
+gives it a name. Give one a top-level definition whenever its failure message matters, too —
+an unnamed predicate reports the field path and nothing more.

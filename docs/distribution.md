@@ -7,13 +7,18 @@ DataCode uses a three-tier server model per shard. Roles are not fixed to machin
 ### Primary Server
 - **Authoritative serialization point** for all mutations to its shard
 - All writes go through the primary; it determines commit order
-- Not distributed consensus (not Raft/Paxos) — the primary decides, secondaries confirm receipt
+- **The data path uses no consensus** (not Raft/Paxos) — the primary decides and secondaries
+  acknowledge. The *configuration* path does need one, and this document adopts the
+  well-understood shape: a consensus-free data path over a configuration master, as in Chain
+  Replication and Vertical Paxos. See
+  [Elevation Is Automatic; Failback Is Not](#elevation-is-automatic-failback-is-not).
 - Should be geographically close to the heaviest write workload, ideally close to the primary user population
-- If the primary goes down, a secondary is elevated (see Elevation Protocol below)
+- If the primary goes down, a secondary is elevated automatically
 
 ### Secondary Servers (exactly 2 per shard)
 - Maintain a **complete copy of the full transaction graph** including all history
-- Confirm receipt of every transaction before the primary considers it committed
+- **Acknowledge durability** — the frame appended and fsynced, not merely received — before the
+  primary considers a transaction committed, in the synchronous durability class below
 - Can serve read queries directly
 - Eligible for elevation to primary
 - Goal: **geodiverse placement** for disaster recovery — ideally on different continents or at minimum different availability zones
@@ -26,6 +31,18 @@ DataCode uses a three-tier server model per shard. Roles are not fixed to machin
   - Edge nodes close to specific user populations
 - To be elevated to secondary, must first receive the full transaction history
 - Elevation of a tertiary to secondary requires one of the existing secondaries to downgrade to tertiary (only 3 servers may hold primary+secondary roles at any time)
+
+Two consequences of holding current state only:
+
+- **A tertiary cannot answer a history question.** Per-field timestamps, a version-chain walk,
+  and a re-key predecessor all need nodes a tertiary does not keep, so such a query routes to
+  the primary or a secondary. The routing is not a fallback: a tertiary that answered from
+  current state would answer wrongly rather than slowly.
+- **A tertiary can authenticate.** Credential validation is a read, so a point-of-presence
+  tertiary resolves the user's shard through the shard directory and authenticates locally with
+  no hop to the primary. That holds because issuing a session is not a row write — a session is
+  a self-describing bearer value whose validity is a `Behavior` of its embedded issue moment.
+  See [auth.md](auth.md#token-expiry-and-revocation).
 
 ### Host Rotation and Upgrade Cycles
 The tertiary-to-secondary elevation mechanism is explicitly designed to support **rolling hardware upgrades**:
@@ -84,9 +101,10 @@ deterministic function of its key.
 
 This is also why assignment is expressed as ranges rather than per shard. The table must be
 `Configuration` — every server needs it to route — and a per-shard table would be
-`Configuration` at `UserData` cardinality, which is exactly what
-[schema/traits.md](schema/traits.md#traits-are-not-configuration) forbids. Ranges are what keep
-routing metadata inside its cardinality budget.
+`Configuration` at `UserData` cardinality — and the cardinality column in
+[schema/traits.md](schema/traits.md#replication-traits) budgets `Configuration` at Medium, which
+is what a table replicated to every server can afford. Ranges are what keep routing metadata
+inside that budget.
 
 A **shard group** falls out with no additional concept: sibling leaves under a range with no
 override share that range's triple, which is the definition of sharing a primary. See OQ-035.
@@ -96,24 +114,147 @@ table's candidate key for `UserData`, the segment boundary for `LogData`, `DataI
 resort (see [transaction-graph.md](transaction-graph.md#placement-keys-are-not-identity-keys)).
 Since `DataId` is time-major, a range over it is a time range.
 
+### The Range Tree Is Two Tables
+
+```
+type RangeBound = TextBound Text | NumBound Int | TimeBound Timestamp | IdBound DataId
+
+table system.shards.RoleDefault : Configuration {
+  family      : Text unique,
+  primary     :> system.shards.Node,
+  secondary_a :> system.shards.Node,
+  secondary_b :> system.shards.Node,
+  epoch       : Int = 0
+}
+
+table system.shards.RoleRange : Configuration {
+  family      : Text,
+  lower       : RangeBound,
+  upper       : RangeBound,
+  primary     :> system.shards.Node | Quarantined,
+  secondary_a :> system.shards.Node | Quarantined,
+  secondary_b :> system.shards.Node | Quarantined,
+  epoch       : Int = 0,
+  unique rangeRef { family, lower, upper }
+}
+```
+
+Two tables rather than one with an "unbounded" variant, for the reason that already split
+`ExtentPolicy` from `ExtentOverride`: an unbounded end would be a `Null`-derived variant in the
+key, which is rejected
+([schema/tables.md](schema/tables.md#ineligible-key-fields)). `RoleDefault` is the
+family-wide root of the tree and carries no bounds; every `RoleRange` row carries both.
+
+Constraints not expressible in the declaration:
+
+- **Bounds are half-open, `[lower, upper)`**, and both are values of the family's placement
+  order. The `RangeBound` variant must match that order's type, checked at schema commit — a
+  `TimeBound` on a family placed by a `Text` root key is a compile-time error.
+- **A composite root key is bounded on its leading field.** The CLI spells a composite bound as
+  a `RecordLit` ([schema/railroad.md](schema/railroad.md#administration)) and it resolves to
+  that field. Nothing is lost: a leading-field boundary is still a whole number of shards, which
+  is all the coarsening claim needs.
+- **Nesting is derived from containment, not declared.** A row whose interval lies inside
+  another's is its child, so there is no parent foreign key to keep in agreement with the
+  bounds. Most-specific-match is the narrowest interval containing the key.
+- **Siblings may not overlap**, and every interval must lie wholly inside the next-widest one.
+  Both are checked when the row is written, against the rows already in the family.
+- **All three role fields read `Quarantined` together, or none does.** A partially assigned
+  range has no meaning; see [Quarantine](#quarantine-needs-no-mechanism) for the one operation
+  that writes the all-`Quarantined` form.
+
+Storing the *boundary shard* instead of the bound value was considered and rejected. It would
+have made "every range boundary is a partition boundary" true by construction, but comparing an
+incoming key against a boundary named by a root row requires reading that row, which requires
+routing — the routing table would depend on the routing it decides.
+
+## Elevation Is Automatic; Failback Is Not
+
+A shard whose primary stops answering promotes a secondary on its own. Moving authority *back*
+is an operator act.
+
+The asymmetry is the one OQ-007 already uses to keep a `UserData` split manual: **elevation
+restores availability; failback only rebalances.** Only the second can wait for a human, so only
+the second does.
+
+### The Epoch Fences the Old Primary
+
+Every role assignment carries an `epoch`, and every transaction node carries the epoch of the
+term that ordered it. A replica rejects a node whose epoch is below the highest it has seen, and
+a server holding a stale epoch has its writes refused and is told the current assignment. A
+primary that was unreachable rather than dead therefore cannot land its in-flight writes after
+its term ended, and it learns it lost as soon as it talks to anyone.
+
+The epoch is in two places on purpose. On the range-tree row it says *who may write now*; on the
+transaction node it says *which term ordered this*, which is the only one of the two a replica
+can check without consulting a range tree it may itself be behind on.
+
+### Two of Three, Not One of Two
+
+A secondary that has not heard from the primary within the failure-detection window proposes
+itself at `epoch + 1`, and must collect acknowledgements from **two of the three role holders,
+counting itself**, before the range-tree row is written. A role holder acknowledges at most one
+proposal per epoch.
+
+Two candidates each needing a majority of three cannot both succeed, which discharges OQ-006's
+split-brain constraint by counting rather than by coordination. The rule is also why the range
+tree is the one `Configuration` table written by the shard's own role holders rather than by a
+schema-shard primary: the structure that decides who serves cannot depend on a server it chose.
+The winning row is committed on the shard whose roles it names and reaches every other server
+through the ordinary `Configuration` fan-out. No server outside the triple votes; for them the
+row is a read.
+
+**A promoted secondary needs no log-recovery phase**, and that is what the synchronous class's
+cost buys. Requiring both secondaries to acknowledge is a 3-of-3 write quorum, strictly less
+available than a 2-of-3 majority — a deliberate trade, taken because it makes every surviving
+secondary hold every committed transaction. Promotion is then a role change rather than a
+reconciliation: no "which replica has the longest log" question, and no window in which an
+acknowledged write is lost. Under the batched class the trade is not taken, and the cost is the
+one stated with the class — up to one batch.
+
+### Rejoining
+
+A server that lost its term rejoins as a **tertiary**, never as its old role.
+
+1. It reads the current assignment and finds its epoch stale.
+2. It truncates every node it appended under that epoch which the new primary does not hold.
+3. It fetches the sequence ranges it lacks over the announce-and-fetch path, like any other peer
+   that fell behind.
+4. An operator returns it to secondary or primary if that placement is wanted — the host
+   rotation procedure above, unchanged.
+
+Step 2 discards nothing a reader saw. A transaction is not committed until two secondaries hold
+it durably, so a node the new primary lacks was never acknowledged and was never visible.
+
+**What is open is the timing, not the mechanism.** How long a primary may be unreachable before
+a secondary proposes itself is a `Configuration` value rather than a constant — a
+cross-continental secondary and a rack neighbour want different numbers — and which detector
+produces that signal is the rest of OQ-006.
+
 ## Replication Protocol
 
 ### Transaction Propagation
 - Transactions are **sequence-numbered deltas** within a shard
 - The primary assigns sequence numbers; all replicas apply them in order
-- Secondaries acknowledge receipt before a transaction is considered committed, in the
+- Secondaries acknowledge durability before a transaction is considered committed, in the
   synchronous durability class below
 - Tertiaries receive transactions asynchronously — eventual consistency for reads, no durability guarantee
 
 ### Two Durability Classes
 
-Every shard still has exactly two secondaries. What differs is whether the primary waits for
-them.
+Every shard has exactly two secondaries, `LogData` included. What differs is whether the primary
+waits for them.
 
 | Class | Commits when | Default for |
 |---|---|---|
-| Synchronous | both secondaries ACK | `UserData`, `Configuration`, `Reference` |
+| Synchronous | both secondaries have appended and fsynced the frame | `UserData`, `Configuration`, `Reference` |
 | Batched | the local append is durable; secondaries catch up in batches | `LogData` |
+
+**The ACK is durability, not receipt**, and the distinction is the whole content of the class. A
+secondary that acknowledged into memory and then lost power would leave the transaction on one
+copy, so the synchronous class would buy nothing against the correlated power or datacenter loss
+that geodiversity exists to defend against. The cost is stated rather than hidden: one fsync per
+secondary per commit, on top of the round trip.
 
 `LogData` is high-volume, its value is aggregate rather than per-row, and paying two network
 round trips per log append would put the slowest path in the cluster on the hottest one. Batched
@@ -125,10 +266,42 @@ up to one batch, and some `LogData` is audit evidence that cannot be reconstruct
 ([integrity.md](integrity.md#two-classes-of-nonconformance)). Silently making it lossy would
 undo the retention guarantee that answered OQ-032.
 
-So durability is a `Configuration` row, `system.shards.DurabilityPolicy`, keyed by table path
-and resolved most-specific-first — the same shape as `ExtentPolicy` / `ExtentOverride`, and for
-the same reason: staging and production should be able to differ without branching the schema
+So durability is a `Configuration` row keyed by table path and resolved most-specific-first —
+the same shape as `ExtentPolicy`, and for the same reason: staging and production should be able
+to differ without branching the schema
 ([schema/traits.md](schema/traits.md#traits-are-not-configuration)).
+
+```
+table system.shards.DurabilityPolicy : Configuration {
+  table_path : Text unique,
+  durability : Synchronous | Batched,
+  geodiverse : Bool = True
+}
+```
+
+`table_path` rather than `table`, which is a reserved word — the same reason
+`system.integrity.Violation` spells it `subject_table`. There is **no per-server override
+table**, and that is where this policy stops following `ExtentPolicy` / `ExtentOverride`: an
+extent size is a local storage choice, while durability is a property of a shard's commit, and
+a shard's three role holders disagreeing about it would mean the guarantee names nothing.
+
+Two knobs on one row, because they are the same decision seen from two sides: **how much do you
+mind losing this?** `geodiverse` is the placement half, and it is what
+`system.logs.HttpRequest` needs. That table motivated the "server-local" language the batched
+class replaced, and it needs less protection than a violation log does — so its secondaries may
+sit in the same region, or the same rack, which is also what makes its bandwidth cheap. The
+relaxation is **geographic, not role count**, which is exactly the shape
+[Cold Shards](#cold-shards) already gives: *three role holders always; a dump is not one of
+them.* One rule, two callers.
+
+**A commit spanning two policies takes the stricter one.** Durability is a property of an
+append: one shard, one sequence number, one decision about whether to wait. Keying the policy by
+table path is right — it is the granularity an author reasons about, and it matches every other
+`system.shards` policy — but it means a transaction touching two tables in one shard can name
+two classes, and only one of them can be honoured. `Synchronous` wins, because the alternative
+voids a guarantee somebody asked for in order to save a round trip somebody else did not ask to
+save. In practice the case is rare: a `LogData` table is rooted at a `LogSegment` row and a
+`UserData` table at its own root, so they are not in the same shard to begin with.
 
 Nothing else changes. A `LogData` shard is already rooted at a `system.shards.LogSegment` row
 whose key the range tree partitions on, so assigning it two secondaries is ordinary role
@@ -156,6 +329,15 @@ expected to be fully caught up; tertiaries may lag.
 A client that was offline and a tertiary that lagged want the same thing — "deltas since
 sequence N" — so resumption is one protocol serving both.
 
+**Announce-and-fetch also addresses chunk digests, not only sequence ranges.** A large `File` is
+stored as `Component` chunks named `<parent DataId>.<ordinal>`, each carrying a digest, and each
+written as its own transaction — so a peer can ask for one chunk without pulling the transaction
+that carried it, and a file propagates from whoever has the piece rather than from the primary
+alone. Nothing new is required: the pieces are already named, already ordered, and already one
+contiguous range scan. The digest is for **verification and transfer only, never for identity** —
+sharing one content row across owners would break `erase` and collapse several access policies
+onto one row, so deduplication stays rejected.
+
 ### What Gets Pushed Depends on Who Is Listening
 
 > **Payload between servers. Invalidation to clients.**
@@ -168,6 +350,24 @@ more. The client re-reads through the ordinary query path, where its access asse
 evaluated by the code that already evaluates them. Pushing payloads to clients would require
 the commit path to evaluate every subscriber's access asserts per row — an access decision on
 the write path, which this design deliberately does not have anywhere else.
+
+**An invalidation is access-controlled information, so the check moves to subscribe time.** A
+table path plus a row identifier discloses that the row exists and when it changed, and repeated
+invalidations disclose an activity pattern — which is exactly what returning `Redacted` rather
+than an error protects on the read path. So:
+
+- A client **declares an interest set**: a table path, optionally narrowed to one shard. That
+  shape is what lets per-connection state be sized, and it is the coarsest thing a server can
+  match a commit against without a per-row evaluation.
+- The server evaluates the same access asserts against the interest set **when the subscription
+  is created**, and rejects it outright where nothing in it is reachable.
+- An assert whose truth depends on row *data* cannot be settled at subscribe time. Such a
+  subscription is admitted only in its statically decidable form — the client is told the
+  narrowing — because the alternative is a per-row access decision on the write path, which is
+  the thing this section refuses.
+- **A revoked grant drops the subscription.** Revocation is a commit, so the fan-out that
+  carries it is the one already running; the connection is closed and the client re-subscribes
+  under whatever it still holds.
 
 **Push is not faster than a parked keep-alive.** A held long-poll, an SSE stream, and an HTTP/2
 server push are the same thing on the wire: the connection is open and the server writes when
@@ -195,8 +395,10 @@ When a shard's data volume crosses a threshold, it splits:
 The partition function ranges over **shard root rows**, and the key it partitions on is the
 root table's candidate key — which is why that key is mandatory and why every other key in the
 shard must reach the root through its foreign-key chain. A dependent row's placement is
-therefore decided by the same split that placed its root, and no split can separate a row from
-the root it is keyed against. See
+therefore decided by the same split that placed its root, and no split *at a key boundary* can
+separate a row from the root it is keyed against. A single-root shard splitting at a `DataId`
+boundary does separate dependents from their root, which is why its sub-shards form a shard
+group sharing one primary — see below. See
 [transaction-graph.md](transaction-graph.md#shard-roots) and
 [schema/tables.md](schema/tables.md#keys-must-be-rooted).
 
@@ -248,6 +450,23 @@ a merge to `main` serializes at `main`'s primary, which is the only place it cou
 That split is the existing trait/configuration line ([schema/traits.md](schema/traits.md#traits-are-not-configuration)) doing the work: a branch may change what a table *is*, and must not silently
 change how a deployment *treats* it.
 
+### The Row Is Branch-Versioned; the Variant Tag Is Cluster-Wide
+
+A `Reference` row lives on the branch shard, but the 2-byte **variant tag** it is stored under
+does not. Two branches allocating tag 7 to different names would produce a merge carrying two
+meanings for one tag, and renumbering cannot repair it — that would silently change the meaning
+of every historical row already carrying the old tag
+([schema/traits.md](schema/traits.md#reference-tables-are-code)).
+
+A tag allocator is a table-wide `next`, and a table-wide `next` already has a home: the
+constraint group's shard, beside the other cluster-wide counters (see
+[Constraint Shards](#constraint-shards)). No new mechanism, and the cost lands on an operation
+that is already a serialized schema commit.
+
+One consequence: a genuinely offline branch cannot reach the allocator, so its `Reference` rows
+exist **by name** on the branch and receive tags at upload. That is sound because a local branch
+holds no user data, so nothing on it was ever stored under a tag.
+
 ### Local Branches
 
 An administrator can create a branch on a workstation, work in it, and upload it — with no user
@@ -261,10 +480,19 @@ data present. Three consequences fall out, and the first is the useful one:
   path below, reporting per shard. `enforce forward` is what keeps that merge non-blocking.
 - **A local branch is not durable until uploaded.** It has no secondaries. This is the unpushed
   git branch and behaves like one; uploading is role assignment on a shard that already exists,
-  which is the ordinary elevation machinery.
+  the same act as bringing a new host into rotation.
 
 Validation reads merged nodes only, so a local branch is inert with respect to the cluster for
 the same structural reason a prepared transaction node is.
+
+**A local branch is also the one place schema reclamation is free.** A schema node is
+discardable exactly when no row was ever committed under it, and on a local branch none was, by
+construction — the bullet above is the proof. So a merged branch's exclusive nodes become
+prunable once nothing references them, through the refcount `prune` already needs, with no merge
+mode and no rewriting. Squash-merging them away was rejected: a squashed branch is not a parent
+of anything on `main`, so "a branch with any path to `main` cannot be deleted" stops protecting
+it and history destruction arrives by convention. General graph reclamation is the open part;
+this corner of it is not.
 
 ## Constraint Shards
 
@@ -278,10 +506,42 @@ and one primary would then serialize writes to every table in the cluster that d
 constraint. The consequence that decided it: schema-shard unavailability would stop all writes
 rather than only DDL.
 
-Instead, a table-wide `unique` is served by a shard **rooted at that constraint's schema-node
-row**, splittable by digest range, with its primary placeable near the writers and movable by
-ordinary elevation. This also answers OQ-035's open question about where a table-wide `next`
-counter lives: it is a row in that constraint's shard.
+### The Shard Is Rooted at a Group, Not at a Schema Node
+
+```
+table system.shards.ConstraintGroup : Configuration {
+  name    : Text unique,
+  members :> ConstraintMember : Component {
+    constraint : Text unique,
+    generation : Int = 0
+  }
+}
+```
+
+Rooting the constraint shard at the constraint's own schema-node row was the first answer and it
+fails twice. A schema node is branch-versioned, so redeclaring the constraint on a branch mints a
+new node, hence a new root, hence a different shard and a different index — which contradicts
+the index spanning branches. And a shard is identified by its root *row*, so one root per
+constraint makes "one constraint shard per namespace subtree" unrepresentable: a namespace
+subtree is not a row.
+
+A `ConstraintGroup` row is that missing row, and it is what the shard is rooted at. Each member
+names its constraint by the **branch-invariant path** `<table>.<constraint-name>`, which survives
+redeclaration — so the index spans branches by construction rather than by assertion, and
+namespace-subtree grouping is an ordinary default. `generation` is the digest-key generation
+described below; the per-constraint state that used to be imagined on a per-constraint root row
+lives on the member instead.
+
+**A constraint belongs to exactly one group, cluster-wide.** A `unique` on a component is
+checked within its parent, so that declaration alone gives uniqueness within a group. The
+cluster-wide check happens at schema commit instead, against the fully replicated
+`ConstraintGroup` table — which is what stops the regress: the registry that routes table-wide
+`unique` checks must not itself need one.
+
+The shard is splittable by digest range, with its primary placeable near the writers and movable
+by ordinary elevation. This also answers OQ-035's open question about where a table-wide `next`
+counter lives: it is a row in that group's shard, and so is the `Reference` variant-tag
+allocator.
 
 ### The `unique` Index Holds Digests, Not Values
 
@@ -294,8 +554,13 @@ subject's nor prunable, replicated, and reachable by anyone who can read the con
 
 Four things follow, and the third is the one that decided it:
 
-- **Constraint shards hold no personal data**, so erasure has nothing to propagate to them. The
-  cross-shard half of the erasure problem disappears rather than being solved.
+- **Constraint shards hold pseudonymised data, not plaintext.** The plaintext never leaves the
+  subject's shard, so the exposure from reading a constraint shard is bounded. It is not
+  anonymisation and must not be described as such: the keying material is held by the same
+  controller and deliberately retained, so singling-out and linkability survive — GDPR
+  Art. 4(5) calls keyed hashing pseudonymisation, and Recital 26's test is attributability using
+  information reasonably likely to be used. Anyone who can read the shard *and* reach the key can
+  confirm membership for a candidate value.
 - **Enumeration is unchanged.** Any uniqueness constraint tells you "taken" for a value you
   already hold. That is inherent to the construct, and the digest neither adds nor removes it.
 - **Reserving a value costs nothing**, which is what makes the release rule below a semantic
@@ -303,14 +568,27 @@ Four things follow, and the third is the one that decided it:
 - **Cluster-wide ordering on the column is given up.** There was never a usable one — a
   cross-shard `order by` is a distributed merge regardless.
 
-The digest key is scoped **per constraint** and lives in that constraint shard's root row,
-beside the `next` counter, replicated to its three role holders. Key scope must equal comparison
-scope: a per-server key would produce two digests for one value and the constraint would
-silently never fire. It is an ordinary data key under the envelope in
-[auth.md](auth.md#envelope-encryption-and-key-custody).
+**Erasure still reaches the index, and it reaches it twice.** The entry is tombstoned, which
+removes it from the current state; and retiring the member's digest-key generation renders every
+entry written under it unrecoverable. That second half is crypto-shredding in the one place it is
+free (OQ-037) — the key already exists, generations already exist, and nothing has to be
+re-encrypted. What the digest construction buys is that the cross-shard half of the erasure
+problem is *bounded*, not that it disappears: an `erase` propagates a tombstone to the
+constraint shard like any other cascade.
+
+The digest key is scoped **per constraint**, and it needs no new mechanism: it is a
+`system.crypto.DataKey` named for the constraint's branch-invariant path, resolved by name
+exactly as `CipherPolicy` resolves its key material, wrapped under the envelope in
+[auth.md](auth.md#envelope-encryption-and-key-custody). The `ConstraintMember` row records which
+generation is current, so nothing about the key is stored beside the digests it produced.
+
+Key scope must equal comparison scope: a per-server key would produce two digests for one value
+and the constraint would silently never fire.
 
 Rotating it cannot recompute entries whose plaintext is gone, so entries carry a generation tag
 and a check probes every live generation. Generations are rare; the probe count is one or two.
+That is also the mechanism the erasure paragraph above spends: `DataKey` is already keyed
+`{ name, generation }` precisely so a rotation adds a generation instead of replacing a row.
 
 ### A Reserved Value Is Released Only Deliberately
 
@@ -326,13 +604,22 @@ moment. Routing would stop being a function.
 | Any other | Reserved, and releasable by an explicit `release`, recorded with authority and reason. |
 
 `release` applies only to a value whose owning row is deleted or erased. Releasing a live row's
-value would break the constraint it is declared under, so that is a compile-time rejection
-rather than a runtime one.
+value would break the constraint it is declared under, so the command is **rejected when it
+runs, naming the live row**. It cannot be a compile-time check: whether the owning row is
+deleted is row state, and `release` takes a value, not a declaration. The genuinely static
+rejection is the one in the table above — a placement-key release is refused unconditionally.
 
 After a release and re-registration the value identifies different rows at different sample
 moments. That is correct and already handled — key resolution happens at the query's moment —
 but it makes one thing normative: a lookup by unique value resolves **at the query's sample
 moment**, not at HEAD.
+
+The rule also decides what a re-key may do. A write that changes a row's shard root is a delete
+plus an insert, and the delete tombstones every `unique` value the row held — so a second
+`unique` whose value did not change would collide with its own tombstone. The mutation is
+therefore rejected, naming the constraint, and the escape is this command: `release` the value
+deliberately, with its authority and reason, then re-key. Auto-releasing inside an ordinary
+update would defeat exactly the property this section exists to protect.
 
 ### Constraint Groups
 
@@ -341,10 +628,12 @@ cross-shard transaction, which costs a second hop. Constraints that tend to be t
 should therefore share a primary.
 
 "Together" has to be **declared**, because inferring which constraints an interactive or API
-transaction might touch is not decidable. The default grouping is **one constraint shard per
+transaction might touch is not decidable. The default grouping is **one `ConstraintGroup` per
 namespace subtree** — namespaces are already the grouping axis with inheritance semantics
-(OQ-024), and a transaction spanning namespaces is already the unusual case. An explicit
-`Configuration` row reassigns a constraint to another group, resolved most-specific-first.
+(OQ-024), and a transaction spanning namespaces is already the unusual case. Reassigning a
+constraint moves its `ConstraintMember` row to another group — a change of shard root, so a
+delete plus an insert, carrying that constraint's index entries with it. It is an operator act
+with a bulk cost, which is the honest shape for something that relocates an index.
 
 **Colocation is an optimization, not a correctness requirement.** A transaction spanning two
 groups is an ordinary multi-participant prepared-node transaction: it costs hops and nothing
@@ -384,9 +673,9 @@ partial result is never mistaken for a clean one. See [integrity.md](integrity.m
 
 ```
 Client → Primary: mutation request
-Primary → Secondary1, Secondary2: proposed transaction (sequence N)
-Secondary1 → Primary: ACK
-Secondary2 → Primary: ACK
+Primary → Secondary1, Secondary2: proposed transaction (sequence N, epoch E)
+Secondary1 → Primary: ACK (appended and fsynced)
+Secondary2 → Primary: ACK (appended and fsynced)
 Primary: commit (sequence N confirmed)
 Primary → Client: success
 Primary (async) → Tertiaries: propagate via peer swarm
@@ -400,44 +689,94 @@ moves.
 
 ## Cross-Shard Transactions
 
-There is no distributed lock. A cross-shard transaction is a **prepared node per participant
-plus one commit node**, which is the graph's existing branch-and-merge shape applied at
-transaction scale:
+There is no distributed lock. A cross-shard transaction is a **prepared node per participant, one
+commit node at the coordinator, and one acknowledgement node in each other participant's shard**
+— the graph's existing branch-and-merge shape applied at transaction scale:
 
 ```
-1. A validates against pinned graph point P_A; appends a PREPARED node (operation + P_A).
-   Invisible to reads. A keeps accepting unrelated writes.
+1. A validates against pinned graph point P_A; appends a PREPARED node carrying the operation,
+   P_A, and the read set it validated over. Invisible to reads. A keeps accepting other writes.
 2. A sends (operation, P_A, prepared id) to B's primary.
-3. B validates against its own pinned point; appends its PREPARED node; answers yes or no.
-4. yes → A appends the COMMIT node; both sides become visible, B learns through the
-          ordinary commit fan-out.
-   no  → A appends an ABORT node; nothing was ever visible.
+3. B validates against its own pinned point P_B; appends its PREPARED node, carrying the
+   operation, P_B and its own read set; answers yes or no.
+4. yes → each side re-checks its read set against its current head. Both unchanged → A appends
+          the COMMIT node and B appends a COMMIT-ACK node in its own shard; both halves
+          become visible.
+   no, or either read set advanced → A appends an ABORT node; nothing was ever visible.
 ```
 
-What crosses the wire is the **operation**, not a row set, and each participant validates once,
-locally, against a point it pinned itself. There is no global coordinator — the coordinator is
+What crosses the wire is the **operation**, not a row set, and each participant validates
+locally against a point it pinned itself. There is no global coordinator — the coordinator is
 whichever server accepted the mutation.
 
 This replaces the cross-server lock on a `transaction_id` held until all operations complete
 (OQ-027). A prepared node is not a lock: it excludes nothing, and A serializes only its own
 writes, as it always did.
 
+**Step 4's re-check is the validation phase, and the protocol is unsound without it.** Two
+failures follow from omitting it:
+
+- **The coordinator's own writes go unchecked.** A validated at P_A in step 1 and kept
+  accepting writes, and nothing defines which of them are "unrelated".
+  `assert underLimit { count (self.orders where status is Open) < 5 }` passes at A with four
+  open orders, a purely local write opens a fifth, A appends COMMIT, and the constraint is false
+  with no violation recorded. The read set is what makes "unrelated" a checkable property
+  instead of a hope.
+- **Symmetric transactions both commit.** If a transaction coordinated at A and one coordinated
+  at B each touch rows in both shards, neither sees the other's prepared node, so both validate.
+  Invisibility removes the wait *and* the detection.
+
+That second case is why the earlier claim — "the only outcome is an abort" — was backwards:
+without a re-check the outcome is a *lost* conflict, not an abort. Restated:
+
+> **Neither participant waits, so deadlock is unrepresentable. Conflicts are detected at commit
+> by re-checking the read set, never avoided by exclusion.**
+
 **Validation reads merged nodes only.** This one invariant does three jobs — it is why a
 prepared node is invisible, why an unmerged schema branch does not affect the cluster, and why
-an administrator's local branch is inert until uploaded. It is also what makes deadlock
-unrepresentable: concurrent `A → B` and `B → A` chains cannot wait on each other's prepared
-nodes, because neither can see them. The only outcome is an abort.
+an administrator's local branch is inert until uploaded. Concurrent `A → B` and `B → A` chains
+cannot wait on each other's prepared nodes, because neither can see them, so there is no
+wait-for edge to close.
+
+**B appends its own commit-acknowledgement node.** A's commit node is in A's shard and reaches
+A's replicas; B's replicas hold no record of the outcome, so without the ack a reader on B
+cannot tell a committed transaction from an abandoned prepare. The ack is B's local statement of
+the outcome, and it is what makes B's half of the transaction readable on B's own replicas.
 
 Prepared nodes are named by their own `DataId`, which satisfies OQ-026's prohibition on
 anonymous DAG forks without a carve-out for transaction-scoped branches.
 
+### A Re-key Is an Ordinary Two-Participant Transaction
+
+A write that changes a row's shard root is a delete in the source shard plus an insert in the
+destination shard, which needs no new machinery — it is the protocol above with two
+participants. Four rules make the supersession record it carries legible:
+
+- **Both prepared nodes carry an identical record.** A record on the source alone is invisible
+  to the destination forever, which defeats it for the reader who needs it.
+- **The commit node carries none**, and nothing in the record may be a value unknown at prepare
+  time — not the commit node's id, not the outcome. B writes at step 3; A appends the commit node
+  at step 4.
+- **The record inherits its carrier node's visibility.** It is a historical statement about one
+  transaction, not a live successor pointer, so an unresolved or aborted prepared node renders as
+  pending or aborted rather than as a move.
+- **Its content is a pure function of the operation both participants validated**, so the two
+  copies agreeing is a property of the definition rather than of a check. Nothing existing could
+  verify it — `verify shard` compares replicas of one shard, and these are two shards with
+  different replica sets — so a detected divergence is a bug, recorded as a
+  `system.integrity.Violation` with `origin = Forced`.
+
+The record's fields and its place in the frame are in
+[storage.md](storage.md#wire-format-for-replication).
+
 ### Why Re-validation Rarely Fails
 
 The optimism is derived rather than hoped for. An assert's query must be rooted at `self`
-([schema/constraints.md](schema/constraints.md#anchoring)), so its predicate depends only on
-the subject row's connected component. B's re-validation can therefore fail only if something
-committed at B between the pin and the handoff that touched those same rows — which is a
-genuine write conflict and has to fail regardless of how the transaction was coordinated.
+([schema/constraints.md](schema/constraints.md#anchoring)), so its predicate depends only on the
+subject row's connected component — which is also what bounds the read set each side records and
+re-checks. A re-check can therefore fail only if something committed in the same shard, between
+the pin and the commit, that touched those same rows. That is a genuine write conflict and has
+to fail regardless of how the transaction was coordinated.
 
 ### Constraints That Cross Shards Cannot Promise `enforce always`
 
@@ -501,11 +840,16 @@ and the answer is the one already in this document: dedicated tertiary servers, 
 work item: a verified operation pinned to a graph point, admitted by a shard primary when its
 queue position comes up. One mechanism, two callers.
 
-Admission is on a condition readable off data, not off a clock: **the shard's write queue
-reaches zero, or the item's age exceeds the aging threshold.** The first gives local work
-precedence and lets global work resolve while a shard is quiet. The second is what prevents a
-steady local stream from starving it forever — "wait for the server to be idle" alone has no
-guarantee of progress on a busy server, and inactivity is a clock property besides.
+**Admission never depends on another operation**: **the shard's write queue reaches zero, or the
+item's age exceeds the aging threshold.** The first gives local work precedence and lets global
+work resolve while a shard is quiet. The second is what prevents a steady local stream from
+starving it forever — "wait for the server to be idle" alone has no guarantee of progress on a
+busy server.
+
+The age half does read a clock, and that is admissible here for a reason worth stating rather
+than eliding: the age is a `Behavior Duration` sampled by the scheduler in `Effect`, which is
+the one context permitted to read the clock. Nothing inside a functor reads it, so *time is a
+parameter, never ambient* holds unchanged.
 
 Which yields the property the whole arrangement exists for:
 
@@ -540,6 +884,16 @@ What may be relaxed instead:
 Moving a cold shard to cheaper hosts is a range-tree edit, which is what the coarsening of the
 partition function was designed to make free.
 
+**One sanctioned exception to "three role holders always": a range may name zero serving
+roles.** That is the quarantine form, and it is an exception to *serving*, not to *holding* —
+the three hosts keep their copies and stop answering, so durability is untouched and the shard
+is simply unreachable. It is recorded here, beside the invariant it qualifies, rather than only
+at the recipe that uses it.
+
+The relaxation also has a second caller. `system.logs.HttpRequest` gives up geodiversity, not
+role count, through `system.shards.DurabilityPolicy.geodiverse` — the same rule read from the
+opposite end. See [Two Durability Classes](#two-durability-classes).
+
 Where an operator insists on one copy plus a dump, the honest form of that is a dump that is
 content-addressed, whose checksum is recorded as a graph node, and which a scheduled event
 re-reads and reports on. That makes it a replica with a slow protocol rather than a hope, and
@@ -552,25 +906,34 @@ and **proposes** sunsetting it. An operator accepts.
 
 This is the rule that already governs materialized views ([storage.md](storage.md#views-are-proposed-not-created-silently))
 and the per-field timestamp cache, applied one scope wider, and it lands on the same side of the
-line as `split shard`: an operation that moves authority is not automatic, and inactivity is a
-clock reading besides.
+line as `split shard`: an operation that moves authority is not automatic. Reading the
+inactivity threshold is the maintenance queue's business, in `Effect`; deciding on it is the
+operator's.
 
 **Rolling up `UserData` history is a `retain` chain, not a command.** Collapsing a row's version
 range is prunable-data semantics, and it is subject to the same rule as every other prune —
 [it is only ever the consequence of a declared chain](schema/aggregates.md#pruning-is-only-ever-a-consequence).
 The ordered `where` / `otherwise` branch form is what makes "these specific rows" expressible
-without a manual prune. Two consequences to expect: the version chain over the pruned range is
-gone, so anything derived from it — per-field timestamps most of all — reads `NotRetained`
-rather than a wrong answer.
+without a manual prune. What to expect of the result is in
+[schema/aggregates.md](schema/aggregates.md#retain-on-userdata-is-admissible-and-rare), which
+owns it.
 
 ### Quarantine Needs No Mechanism
 
-"Make this shard unreadable and unreplicated pending review" is two rows: revoke the namespace
-grant, and assign the shard a range-tree entry with no serving roles. Both operations exist, and
-both are reversible, which is what an operator wants in the first hour of an incident.
+"Make this shard unreadable and unreplicated pending review" is **one row**: assign the shard a
+range-tree entry naming no serving roles. Nothing serves it, so nothing reads it and nothing
+replicates to it; the three former holders keep their bytes, so nothing is lost; and restoring
+service is rewriting the triple, which is what an operator wants in the first hour of an
+incident.
+
+Revoking the namespace grant was the other half of this recipe and it is **withdrawn**. Grants
+are namespace-scoped and recurse to descendants (OQ-024), while a shard is one row-rooted slice
+of a family — so revoking the grant on `app.commerce` would make every customer's shard
+unreadable rather than the one under investigation, which is the outage quarantine exists to
+avoid. There is no per-shard grant, and the zero-role range does not need one.
 
 It is documented as a recipe rather than built as a keyword. A dedicated `quarantine` verb would
-add a second way to say what grants and role assignment already say, and the two would drift.
+add a second way to say what role assignment already says, and the two would drift.
 
 ## Geo-Diversity Goals
 
@@ -581,14 +944,18 @@ add a second way to say what grants and role assignment already say, and the two
 | Secondary 2 | Different region from both primary and Secondary 1 |
 | Tertiaries | Anywhere — near read workloads or analytical clusters |
 
+These are the defaults. A table whose loss is cheap relaxes them through
+`system.shards.DurabilityPolicy.geodiverse`, and `system.logs.HttpRequest` is the one table that
+does today — see [Two Durability Classes](#two-durability-classes). Role *count* relaxes in one
+case only, and it is quarantine: a range naming no serving roles at all
+([Cold Shards](#cold-shards)).
+
 ## Open Questions
 
-- What is the failure detection mechanism? Heartbeats? Lease-based? (Affects elevation latency)
-- How long can a primary be unreachable before a secondary auto-elevates vs. requiring manual intervention?
-- What are the default extent size and segment grain, and is a shard group formed automatically or by an operator? (OQ-035 — the split *trigger* itself is settled above)
-- How are network path hints declared and stored? (Likely a `system` shard table)
-- How many parked client subscriptions should a node hold, and what is the eviction policy when
-  that ceiling is reached? The latency question is settled — a parked connection is a push
-  channel — but the capacity question is not.
-- What is the I/O budget mechanism for analytical reads on a tertiary, and is it expressed per
-  connection, per token, or per query?
+- Failure detection and the unreachability threshold before a secondary proposes itself
+  (OQ-006 — the elevation *mechanism* is settled above).
+- Default extent size and segment grain, and whether a shard group forms automatically or by
+  operator action (OQ-035 — the split *trigger* is settled above).
+- How network path hints are declared and stored (OQ-012).
+- The parked-subscription ceiling and its eviction policy (OQ-012).
+- The I/O budget mechanism for analytical reads on a tertiary (OQ-012).

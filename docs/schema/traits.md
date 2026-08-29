@@ -4,17 +4,24 @@ Traits are abstract table types. They cannot be instantiated directly — they a
 by concrete tables. A trait adds fields, functions, replication policy, and (optionally) UI
 template hints to every table that extends it.
 
-## Declaring a Trait
+## Declaring a trait
 
 ```
 trait Active {
   is_active : ActiveStatus | InactiveStatus,
 
-  -- Functions defined in a trait are available on any table extending it
-  active   self = self where is_active is ActiveStatus,
-  inactive self = self where is_active is InactiveStatus
+  -- Functions declared in a trait are available on every table extending it
+  active   = is_active is ActiveStatus,
+  inactive = is_active is InactiveStatus
 }
 ```
+
+**A trait function declares no parameter for the row.** `self` is bound to the row under
+evaluation by the context the function runs in, and no declaration may introduce a name that
+collides with a binding in scope, so `active self = …` is rejected — see
+[railroad.md](railroad.md#contextual-bindings). Bare field paths resolve against that row;
+write `self` explicitly only where a query needs a root, as an
+[assert](constraints.md#anchoring) does. See [functions.md](functions.md#trait-functions).
 
 A trait may extend another trait with `:`:
 
@@ -29,12 +36,12 @@ references and `where` for validation:
 
 ```
 trait Owned {
-  owner :> system.auth.User,
+  owner      :> system.auth.User,
   claimed_at : Timestamp | Pending
 }
 ```
 
-## Extending a Table from Traits
+## Extending a table from traits
 
 The `:` operator after the table name declares which traits the table extends. Same
 colon-as-"is a kind of" convention used throughout the type system — the right-hand side
@@ -46,25 +53,19 @@ table app.commerce.Customer : Active, UserData {
   name  : Text
 }
 
--- active/inactive functions now work on Customer
-active (app.commerce.Customer where email is not NotGiven)
+-- active and inactive are now predicates on a Customer row
+app.commerce.Customer where active
 ```
 
-## Multiple Inheritance
+## Multiple inheritance
 
-Tables may extend multiple traits. If two traits define a field with the same name, the
-concrete table must resolve the conflict explicitly:
+Tables may extend multiple traits. Two traits declaring a field with the same name is a
+collision, and there is exactly one resolution: **merge, by bare redeclaration**.
 
 ```
 trait A { name : Text where isNotEmpty }
 trait B { name : Text where maxLen 100 }
 
--- Keep both fields separately: rename A's field
-table Foo : A, B {
-  a_name : Text from A.name   -- rename; keeps A's validations; B's name unchanged
-}
-
--- Or merge into one field: inherits validations from both A and B
 table Bar : A, B {
   name : Text   -- bare redeclaration; validations from A and B are both applied
 }
@@ -87,22 +88,87 @@ table Bar : A, B {
 -- all three are enforced on Bar.name
 ```
 
-`from A.name` in the rename form uses the same path syntax, which is why renaming keeps the
-originating trait's validations rather than dropping them. See
+Those paths are the ordinary inherited-field path form. See
 [README.md](README.md#addressing-validations).
 
-## Replication Traits
+The merge is rejected where the two declarations disagree on anything but predicates:
+different types, different `:>` targets, or a `Behavior` on either side. Predicates conjoin;
+definitions do not.
+
+### Keeping both fields is not available
+
+A field-level `from A.name` clause used to spell a rename that kept `A.name` and `B.name` as
+two columns. It went with `SourceClause` ([railroad.md](railroad.md#fields)) and nothing
+replaces it, because a per-table rename cannot work: **a trait's functions and validations name
+its own fields**, so renaming `A.name` to `a_name` on one extending table would leave `A`'s
+functions naming a field that table does not have. The rename would have to rewrite the trait
+for one extender, which is the opposite of what extending a trait means.
+
+Where the two fields genuinely mean different things, do not extend both traits — rename the
+field in one of them, or split the trait. Renaming *downstream* of the table, for a caller or
+an export, is a projection and stays available:
+`Bar2 = Bar { *, name as display_name }` ([evolution.md](evolution.md#rename-a-field)).
+
+### A table may supply a default for an inherited field
+
+Bare redeclaration also carries a `DefaultClause`, for that table only:
+
+```
+-- Customer already has rows; gaining Active adds is_active as a new column
+table app.commerce.Customer : Active, UserData {
+  *,
+  is_active : ActiveStatus | InactiveStatus = ActiveStatus
+}
+```
+
+The redeclaration changes nothing on the trait and nothing on any other extender. It is the
+discharge route for the rule below.
+
+## Adding a field to a trait
+
+A trait adds its fields to every table extending it, so **the added-field default rule reaches
+the trait path** ([evolution.md](evolution.md#every-added-field-declares-a-default)). It is
+checked at two sites, and both are needed:
+
+- **At the trait.** A field added to an existing trait carries a `DefaultClause`. The check
+  cannot be conditional on whether a table has rows, because the set of extending tables grows
+  after the commit — a table that extends the trait tomorrow is populated today.
+- **At the table gaining a trait.** Extending a trait adds its fields as columns to a table
+  that may already have rows, and those fields may predate the rule. Every field the trait
+  contributes must carry a default — on the trait, or on the table by
+  [bare redeclaration](#a-table-may-supply-a-default-for-an-inherited-field).
+
+The second site is a stronger argument for making the rule unconditional than the
+development-versus-production one: most traits in this document declare no defaults, so they
+are unaddable to a populated table until a default appears somewhere. [`Accruing`](#behaviors-in-traits)
+is the clearest case — its `balance` behavior needs nothing, because a behavior is computed at
+read and stores nothing, while `principal`, `rate`, and `opened_at` each need a default before
+any populated table may extend it.
+
+A trait is redeclared like a table: `*` carries forward every field the new body does not
+mention, and without it omission deprecates. See
+[evolution.md](evolution.md#redeclare-a-table).
+
+## Replication traits
 
 The shard types map to built-in traits. Tables declare their replication policy by
 extending one of these.
 
 | Trait | Replication | Cardinality |
 |---|---|---|
-| `Reference` | All servers | Low–medium |
-| `Configuration` | All servers | Medium |
+| `Reference` | Every server | Low–medium |
+| `Configuration` | Every server | Medium |
 | `UserData` | Shard-local | High |
-| `LogData` | Server-local, prunable | Very high |
-| `Component` | Wherever the parent is | Bounded by the parent |
+| `LogData` | Shard-local, prunable | Very high |
+
+**`LogData` replicates.** Every shard has two secondaries, `LogData` included. What differs is
+that a `LogData` primary commits when its own append is durable and ships accumulated deltas
+afterwards, so log volume never puts two network round trips on the hottest path in the
+cluster. This replaces an earlier "server-local, not cross-replicated" reading: a segment is
+still contiguous on the server that wrote it, and it is no longer the only place it is read.
+The class is a default rather than a property of the trait — some `LogData` is audit evidence
+that cannot be reconstructed — so `system.shards.DurabilityPolicy` overrides it per table. See
+[../distribution.md](../distribution.md#two-durability-classes).
 
 `LogData` means **prunable, not pruned**. A `LogData` table is discarded only by a `retain`
 chain, and one with no `retain` statement is never discarded at all — silence means keep,
@@ -117,19 +183,19 @@ and who may see it ([../namespaces.md](../namespaces.md)); the trait says how it
 Neither implies the other. `system` was previously listed as a fifth shard type in
 [../transaction-graph.md](../transaction-graph.md#data-shards), which is corrected there.
 
+**`Component`, `Keyless`, `Personal`, and `Extensible` are marker traits.** They occupy no
+replication slot and compose with whichever one the table carries, so
+`table app.commerce.OrderTag : UserData, Component` is legal.
+
 Built-in replication traits are regular traits — user-defined traits can extend them
 freely:
 
 ```
-trait Catalog : Reference {
-  is_visible : Bool = True
-}
-
 table app.commerce.Product : Catalog, Active {
   name  : Text unique,
   price : Amount
 }
--- Product replicates to all servers (inherits Reference via Catalog)
+-- Product replicates to every server: Catalog extends Reference
 ```
 
 Having multiple replication base traits in a single inheritance hierarchy is a compile-time
@@ -138,7 +204,7 @@ error.
 See [../distribution.md](../distribution.md) for what each replication policy means
 operationally.
 
-## Traits Are Not Configuration
+## Traits are not configuration
 
 A trait is part of a table's declaration, so changing one is a schema commit that replicates to
 every server. That makes it the wrong home for anything an operator tunes per deployment:
@@ -176,25 +242,36 @@ like anything else.
 with it, live in its shard, and are destroyed with it. This is composition in the strict
 sense — the part has no independent existence.
 
-It is a member of the replication-trait family rather than a separate axis, because a
-component's replication policy genuinely is determined: it must be wherever its parent is.
-The existing "one replication base trait per hierarchy" rule therefore applies unchanged, and
-`table T : Component, UserData` is an error for exactly the reason `UserData, LogData` is.
+**It is a marker trait, not a replication trait.** It occupies no slot, so
+`table app.commerce.OrderTag : UserData, Component` is legal. "Wherever the parent is" is not a
+replication *policy* — it is what rooted placement already means — and the row's real
+replication answer comes from `UserData`. This replaces the earlier rule that made
+`Component, UserData` an error for the reason `UserData, LogData` is one.
+
+**What `Component` declares is one bit: does deleting the owner destroy the owned?**
+`Component` means cascade; its absence means restrict. Everything it used to bundle beyond that
+— the ordinal representation, `created_at` inheritance, placement — follows from the key
+instead. The declaration side, with the cardinality rules, the many:many guidance and the cost
+tables, is in [tables.md](tables.md#component-sub-tables).
 
 ```
 table app.commerce.Customer : UserData {
   email   : Email unique,
-  address :> Address {           -- inline sub-table, as always
+  address :> Address : Component {   -- inline sub-table
     street : Text,
     city   : Text,
     zip    : Zip
   }
 }
 
-table app.commerce.Address : Component { ... }   -- the generated sibling
+table app.commerce.Address : UserData, Component { ... }   -- the generated sibling
 ```
 
-### What `Component` Changes
+`: Component` on the inline declaration is what makes the sibling a component. Without it the
+generated table is an ordinary one, needing a candidate key and a `DataId` of its own. The
+sibling takes the parent's replication trait and adds the marker.
+
+### What `Component` changes
 
 **Identity.** A component row has no `DataId`. It is identified by its parent's identifier
 plus a 4-byte `Ordinal`, and only the ordinal is stored — the timestamp, server node, and
@@ -203,29 +280,57 @@ zero bytes, because the parent *is* the identifier prefix. See
 [../transaction-graph.md](../transaction-graph.md#component-ordinals).
 
 The inheritance shows up in the virtual columns: `created_at` and `origin_server` come from
-the parent, since a component has no identifier bytes of its own beyond its ordinal. In
-exchange it gains a fourth, **`ordinal`** — its position under that parent, at its own nesting
-level — which is how document order is stated in a query rather than merely received from a
-range scan. See [tables.md](tables.md#basic-syntax).
+the parent, since a component has no identifier bytes of its own beyond its ordinal. Declare a
+`Timestamp` field where the component needs a creation time of its own; decide that at
+declaration rather than finding it later. In exchange the row gains a fourth virtual column,
+**`ordinal`** — its position under that parent, at its own nesting level — which is how
+document order is stated in a query rather than merely received from a range scan. See
+[tables.md](tables.md#basic-syntax).
 
 **Locality.** A component is always in its parent's shard. Ordinal assignment is a
 read-modify-write against the parent's current maximum, which needs no coordination because
 the shard primary linearizes writes. This is the invariant that makes the compact identifier
-sound rather than merely small.
+sound rather than merely small. It is still a serialization point on that parent, so schema
+commit prices it with the same diagnostic a table-wide `next` gets, naming the serialization it
+introduces ([tables.md](tables.md#sequences)).
+
+**Keys.** A component is exempt from *needing* a candidate key and is not forbidden one. Its
+identity is already the parent plus its `Ordinal`, which is why the key is optional rather than
+unavailable. A `unique` declared on a component is checked within the parent, so it costs one
+shard-local check: `unique linkRef { order, tag }` on a component of `Order` means "this order
+has at most one link to this tag". See
+[tables.md](tables.md#candidate-keys-are-mandatory).
 
 ### Invariants
 
 | Rule | Reason |
 |---|---|
-| A component cannot be reparented | The parent is the identifier; moving it would change its identity |
-| Nothing outside the parent's subtree may reference a component | Otherwise the subtree is not wholly dependent and cannot be pruned as a unit |
+| A component may be reparented only within its shard root | The parent is the identifier prefix; a write that changes the shard root is a delete plus an insert, which mints a new identity |
 | A component may reference outward freely | An outbound FK creates no inbound dependency |
+| Nothing outside the parent's subtree *should* reference a component | Warned, not forbidden: an outside reference makes the subtree non-prunable as a unit, and blocks the parent's delete while it is live |
 | Pruning the parent prunes the subtree | Composition; the subtree is orphaned by definition |
-| At most 2^32 components per parent | Overflow is a schema design error, not a runtime condition, and is rejected |
+| A parent holds at most 2³² − 1 components at each nesting level | The ordinal is four bytes |
+
+The reparenting rule used to be absolute. It is now narrower and derived rather than declared.
+A reparent within one shard root keeps the shard and re-prefixes the subtree. A write that
+changes the shard root is [a delete plus an insert](tables.md#changing-a-placement-key) — two
+ordinary mutations in one two-participant transaction, not an update to forbid — and what lands
+is a new row with a new identity. Ordinals inside a moved subtree are preserved by prefix
+substitution rather than reassigned, which is what keeps one key pair sufficient to name the
+whole subtree.
+
+Ordinals are allocated at insert against a running maximum, so exhaustion is by construction a
+runtime condition and cannot be detected at schema commit. The overflowing insert is rejected
+with a diagnostic naming the parent row and the nesting level, and the diagnostic says what the
+number means: a parent that can plausibly reach the bound has a child that should not be a
+component. Tombstoned ordinals are not reclaimed, because "never reused" is what keeps a
+deleted component's history addressable — editing costs no ordinal, since a new version lands
+under the same one, so the bound is reached only by inserting and deleting 2³² siblings under
+one parent. This matters most for shredded documents, where component subtrees are generated
+from external payloads rather than authored.
 
 Components are versioned and updated like any other row — a 1:1 component such as an address
-is edited normally, producing a new version under the same ordinal. What is forbidden is
-moving one, not changing one.
+is edited normally, producing a new version under the same ordinal.
 
 Nesting is permitted and appends another ordinal per level. Because every descendant shares
 the parent's byte prefix, an entire component subtree is one contiguous LMDB range scan; this
@@ -243,8 +348,7 @@ table app.staging.Import : UserData, Keyless {
 }
 ```
 
-It is not a replication trait and occupies no slot; it composes with whichever one the table
-already carries.
+It occupies no replication slot and composes with whichever one the table already carries.
 
 The polarity is deliberate. A rule you have to remember to opt into is absent from exactly
 the table that most needed it, so the key requirement is on by default and `Keyless` is the
@@ -274,10 +378,9 @@ table app.crm.Contact : UserData, Personal {
 }
 ```
 
-It is not a replication trait and occupies no slot. What it changes is what history returns
-after an `erase`: on an ordinary table a tombstoned row stays readable at earlier sample
-moments, and on a `Personal` table an erased row reads `Erased` at every moment unless the token
-holds `bypass erasure`.
+It occupies no replication slot. What it changes is what history returns after an `erase`: on an
+ordinary table a tombstoned row stays readable at earlier sample moments, and on a `Personal`
+table an erased row reads `Erased` at every moment unless the token holds `bypass erasure`.
 
 Eligibility is opt-in because erasure is the one act that closes history, and a table whose rows
 are not about a person has no reason to admit it. Scrubbing has the opposite polarity and needs
@@ -294,9 +397,9 @@ trait Queue : LogData {
 }
 ```
 
-Beyond that field the trait body is empty, because what makes a queue a queue is four rules
-about field *types*, and the grammar has no way to say "a foreign key to any table carrying
-trait X". They are checked at schema commit:
+Beyond that field the trait body is empty, because what makes a queue a queue is four rules,
+two of them about field *types*, and the grammar has no way to say "a foreign key to any table
+carrying trait X". They are checked at schema commit:
 
 1. Exactly **one** `handler`.
 2. Exactly **one** `:>` field to a table carrying `QueueState`.
@@ -313,21 +416,29 @@ trait QueueState : Reference {
 }
 ```
 
-The `QueueState` field is the **one exemption from append-only in the whole system**, and it is
-narrow: one field, on a `Queue` table, written only by the handler bound to that queue. That
-exemption is what makes a queue row pollable by a client — it reads a domain-meaningful state
-(`Bound`, `Applied`) while the scheduler reads that state's `disposition`. Anything else needing
-a record after the fact goes in its own `LogData` table with a `:>` back to the queue row, which
-is what the [attempt history](../events.md#attempt-history) is.
+The `QueueState` field is the **one exemption from append-only**, and it is narrow: one field,
+on a `Queue` table, written only by the handler bound to that queue. That exemption is what
+makes a queue row pollable by a client — it reads a domain-meaningful state (`Bound`,
+`Applied`) while the scheduler reads that state's `disposition`.
+
+**Every other after-the-fact state on a `LogData` table goes in its own `LogData` table** with a
+`:>` back to the row it describes, and the current state is a read over the latest such row.
+That is the general rule the exemption is an exception to, and it covers a consumed challenge, a
+waived violation, and a sampled trigger's held bit as much as it covers a queue's attempt
+record; the [attempt history](../events.md#attempt-history) is the worked case.
 
 `handler` was previously valid on any `LogData` table and is now valid only on a `Queue`. A log
 is not a work list. Full treatment in [../events.md](../events.md#queue-tables).
 
-## `Reference` Tables Are Code
+## `Reference` tables are code
 
 `Reference` has always been described as "code tables, treated as code, propagated
 everywhere". That is meant literally: **inserting a row into a `Reference` table is a schema
-transaction**, committed to the schema graph in the `system` shard, not a data transaction.
+transaction**, committed to the schema graph rather than to a data shard. The schema graph is
+rooted at a branch, so a `Reference` row lives on the branch shard with the declarations beside
+it — which is what makes the offline local-branch workflow possible, since an administrator
+clones the schema graph to the branch point plus its `Reference` rows and nothing else. See
+[../distribution.md](../distribution.md#schema-shards-are-rooted-at-a-branch).
 
 Four consequences:
 
@@ -335,20 +446,30 @@ Four consequences:
   `DataId`. On a billion-row table with three code fields that is 30 GB.
 - **`is` against a `Reference` row is checked at schema-commit time.** `status is Shipped`
   fails to compile if no row named `Shipped` exists at that schema node, so a mistyped code
-  name is a compile error rather than a query that silently returns nothing.
+  name is a compile error rather than a query that silently returns nothing. The operator's own
+  two readings are in [types.md](types.md#the-is-operator).
 - **Variant tags are assigned monotonically and never reused.** `shrink` tombstones a tag
   rather than renumbering, because renumbering would silently change the meaning of every
-  historical row.
+  historical row ([evolution.md](evolution.md#variant-tags-are-permanent)).
 - **Past 65 535 variants the table is not a code table.** This is rejected at commit with
   that diagnostic, which gives the "low–medium cardinality" guidance actual teeth.
 
+**The row is branch-versioned; the tag is cluster-wide.** Tag allocation cannot be
+branch-scoped for the reason renumbering is forbidden: two branches would allocate tag 7 to
+different names, and a merge would carry two meanings for one tag with no repair available. The
+allocator is an ordinary table-wide `next` living on the constraint's own shard. A genuinely
+offline branch cannot reach it, so its `Reference` rows exist **by name** on the branch and
+receive tags at upload — sound, because a local branch holds no user data, so nothing on it was
+ever stored under a tag. See
+[../distribution.md](../distribution.md#the-row-is-branch-versioned-the-variant-tag-is-cluster-wide).
+
 The token does not change. A field referencing a `Reference` table is still declared with
 `:>`, still carries an FK functor, and still adds an edge to the join graph — the FK functor
-simply resolves a tag instead of a `DataId`. The
+resolves a tag rather than a `DataId`. The
 [`:` versus `:>` rule](README.md#-versus-) is load-bearing and stays exactly as it is; every
 benefit above is a storage and checking change underneath it.
 
-### When a `Reference` Table Is Warranted
+### When a `Reference` table is warranted
 
 > **A `Reference` table is needed exactly where a fact originates outside the schema graph.**
 
@@ -416,7 +537,7 @@ trait DocKeys : Reference, Extensible {
 Key tables are generated per field. See
 [documents.md](documents.md#keys-are-interned-per-field).
 
-## Behaviors in Traits
+## Behaviors in traits
 
 A [behavior](types.md#behaviors) closes over the row's stored fields, so a reusable behavior
 has to be able to *require* those fields. That is what a trait already does, which is why
@@ -446,11 +567,14 @@ of them — it is a projection, and specifically it is the field-scoped computed
 already creates at `<namespace>.<table>.<field>`, whose inhabitants happen to be functions of
 `Moment`. See [functors.md](functors.md).
 
-Behaviors merge across multiple inheritance the same way fields do: two traits defining the
-same behavior name is a conflict the concrete table must resolve, by rename or by
-redeclaration.
+Two traits defining the same behavior name is a collision, and **unlike a field collision it
+cannot be merged**. A field merge conjoins predicates, which compose; a behavior's content is a
+definition, and two definitions do not conjoin — one would have to win, and nothing says which.
+The concrete table restates the definition, which supersedes both. The same holds for a `:>`
+field inherited from two traits with different targets: there is no conjunction of two target
+tables, so the table restates the field and names one.
 
-## UI Template Hints
+## UI template hints
 
 Traits can declare UI hints that are stored in system tables and used by the HTML rendering
 engine (see [../api-and-rendering.md](../api-and-rendering.md)):
@@ -461,4 +585,8 @@ trait Card {
 }
 ```
 
-Exact syntax for UI hints is TBD.
+The syntax is settled — `ui` is a reserved word and `UiHint` is a `TraitItem`, never a
+`BodyItem`, so hints attach to traits only. See
+[railroad.md](railroad.md#tables-bindings-traits). What remains open is the hint *vocabulary*:
+which keys a theme is obliged to honour, and what a theme does with one it does not recognize.
+That is [../api-and-rendering.md](../api-and-rendering.md)'s to settle.

@@ -41,26 +41,37 @@ meaningful at any node. Three consequences follow, and all three are load-bearin
 
 ## Two Classes of Nonconformance
 
-The distinction determines whether any state has to be stored at all.
+The distinction determines whether losing a record loses the finding.
 
 | | **Derivable** | **Observational** |
 |---|---|---|
 | Definition | The functor is a pure function of stored data, so validity can be recomputed at any time, at any schema node | The functor needs an input that exists only transiently and is never stored |
 | Examples | `minLen 12` on a username; an FK whose target was pruned; an `assert` broken by a third-party update; a hash written under a superseded policy | "this password is shorter than the policy now requires" — the plaintext exists only during a login attempt |
 | Reconstructable? | Yes, always | **No.** If the record is lost, the finding is lost |
-| Storage | None required — it is a query | Must be written when observed |
+| Recorded by | the background scan, which re-appends what still holds | the code that saw the witness, once |
+| Discardable? | Yes — [Retention](#retention) drops one after 90 days | Never |
 
-**Derivable nonconformance needs no state.** The authoritative definition is a query over the
-transaction graph, evaluated at a chosen schema node. `system.integrity.Violation` is a
-**materialized view** over that query — pegged to a commit node, computed in the background,
-refreshable, and droppable without losing anything. This is the existing materialization
-machinery (see [storage.md](storage.md#materialization)), not a new mechanism, and it
-means there is no derived state that can drift out of agreement with the data.
+**Derivable nonconformance needs no state to be true.** The authoritative definition is a query
+over the transaction graph, evaluated at a chosen schema node. It stores nothing, so nothing can
+drift out of agreement with the data, and running it at a *candidate* node is what answers "what
+would this rule break?" before the rule is committed.
 
-**Observational nonconformance must be recorded.** The transient witness is gone by the time
-anyone could ask again. These rows are appended to the same table with `origin = Observed`
-and are *not* recomputed by a view refresh. The only place this currently arises is the
-`Hashed` type — see [schema/types.md](schema/types.md#hashed-types) and
+**`system.integrity.Violation` is a stored table even so.** A background scan evaluates the
+derivable definition and **appends** a row for every finding it has not already recorded, matched
+on `(subject_table, subject, functor, schema_node)` — which is why those four fields are the ones
+the table carries. The scan is not a view refresh, and the difference decides what an operator
+can rely on: a refresh recomputes and drops, and `Observed` and `Forced` rows cannot be
+recomputed. This corrects an earlier reading that called the table a materialized view; the
+materialization claim survives, one level up, for the per-functor
+[report](#attachment-to-the-functor-is-logical-not-physical).
+
+So the two classes decide not whether a row exists but whether losing one loses anything, which
+is what [Retention](#retention) branches on.
+
+**Observational nonconformance must be recorded when it is seen.** The transient witness is gone
+by the time anyone could ask again. These rows carry `origin = Observed` and no scan re-derives
+them. The only place this currently arises is the `Hashed` type — see
+[schema/types.md](schema/types.md#hashed-types) and
 [auth.md](auth.md#password-policy-rotation).
 
 ## Enforcement Modes
@@ -89,16 +100,49 @@ rule cannot retroactively rename people who are already logging in with the old 
 table — the same binding `on … emit` makes, keeping a different spelling only because a
 repair's payload is fixed (it is the violating row) where `emit`'s is a literal.
 
+**A mode governs the write path only.** An access assert — one whose body mentions
+`authed_user` ([schema/functors.md](schema/functors.md#path-constraints-and-their-two-varieties))
+— is evaluated on read as well as on write, and it redacts on read under **every** mode. So
+`monitor` on such an assert means "accept the write, record it"; it never means "stop checking
+reads". `enforce forward` grandfathers values, not readers.
+
+The alternative reading is worse than wrong, it is invisible: a mode that switched redaction off
+would disable access control from a statement whose only documented effect is what happens to a
+write, and the mode table above gives an operator nothing to see it by. The same rule stated from
+the other side is [Not a blocker for reads](#what-this-is-not) — a mode neither hides a row nor
+reveals one.
+
 ### Ingestion Must Not Enforce
 
 **A rule applied over connector-sourced data must not default to `enforce`.** A MariaDB
 binlog stream whose commit fails stops at that offset and never advances — one malformed row
 halts replication for the whole connector. The same applies to webhook ingestion, where a
-rejected commit becomes a delivery failure and a retry storm at the source.
+rejected commit becomes a delivery failure and a retry storm at the source. Bad external data
+has to become a reportable violation instead of an outage.
 
-Connector-sourced tables therefore default every `app.*`-layer rule to `monitor`. Bad
-external data becomes a reportable violation instead of an outage. See
-[connectors.md](connectors.md#nonconforming-external-data).
+> **A validation attached to a table under `connectors.*`, or to a binding whose sources are all
+> such tables, defaults to `monitor`. Everywhere else the default is `enforce always`.**
+
+Three things in that sentence are deliberate:
+
+- **The default is read off the attachment, not off the data.** "Connector-sourced" is not a
+  property a row carries, and no trait means it. What is checkable is where the shadow schema
+  lands: a connector named `production` generates `connectors.mariadb.production.*`
+  ([namespaces.md](namespaces.md#connector-namespaces)), the same namespace rule that already
+  decides default visibility. So the default is derivable at schema commit.
+- **It covers every layer, not only `app.*`-layer rules.** An earlier phrasing said `app.*`, which
+  left the rules on the shadow table itself undecided. The binlog does not stop more politely
+  because the predicate was declared one namespace up.
+- **It is a default, not a ceiling.** A `ModeStmt` overrides it in either direction, and
+  overriding it is the recorded, access-controlled act [Declaring a Mode](#declaring-a-mode)
+  describes.
+
+Writing `system.integrity.Mode` rows at connector setup would express the same thing, and it is
+rejected for the reason [scrub rules](#scrub-rules-are-configuration) are never inserted
+automatically: a commit that writes configuration rows leaves the table half-authored and
+half-derived, and a diff can no longer say who decided what.
+
+See [connectors.md](connectors.md#nonconforming-external-data).
 
 ### Connector Tables Without a Source Key
 
@@ -114,19 +158,24 @@ and the connector writes a violation recording why:
 
 ```
 system.integrity.Violation {
-  subject_table = connectors.mariadb.production.LegacyAudit,
-  subject       = <the shadow table's schema node>,
-  functor       = system.schema.candidateKey,
-  origin        = Forced,
-  state         = Open
+  subject_table = system.schema.Table,
+  subject       = "05KG3N0000QF7T2B9M4H",   -- the row for connectors.mariadb.production.LegacyAudit
+  functor       = CandidateKeyRequired,
+  schema_node   = "05KG3N0000QF7T2B9K3P",
+  origin        = Forced
 }
 ```
 
-`Forced` is exactly right here: it is how something is marked suspect when the reason is not
-expressible as a functor, and it is never closed by a view refresh. The effect is that "this
-table has no natural key" lands in the same review queue as everything else instead of being
-a waiver granted silently at schema generation time. An operator can waive it with a reason,
-and the waiver is itself in the audit trail.
+The subject here is a **schema object**, not a user row, and no second mechanism is needed to say
+so: the schema is data, so the shadow table has a row in `system.schema.Table` and the ordinary
+`(subject_table, subject)` pair names it. `CandidateKeyRequired` is the one thing a violation can
+name that is not a functor — see [the declaration below](#the-violations-table).
+
+`Forced` is exactly right too: it is how something is marked suspect when the reason is not
+expressible as a functor, and no scan ever closes it. The effect is that "this table has no
+natural key" lands in the same review queue as everything else instead of being a waiver granted
+silently at schema generation time. An operator can waive it with a reason, and the waiver is
+itself in the audit trail.
 
 A derived table an author binds over a keyless connector table is an authored table and is not
 exempt. If the underlying rows cannot be identified, that is a fact worth being made to
@@ -172,14 +221,18 @@ the schema graph, versioned, and queryable like anything else.
 
 ### Mode Is Mandatory on a Populated Field
 
-> **Adding a predicate to a field that already has rows is a compile-time error unless a mode
-> is stated in the same transaction.**
+> **Adding a predicate to a field of a table that already holds rows is a compile-time error
+> unless a mode is stated in the same transaction.**
+
+The antecedent is the **table's** population, not the field's. That is the number the diagnostic
+below reports, and the two readings disagree exactly where it matters: a field added with a
+`where` block in one commit has no rows of its own and every row of the table.
 
 Because derivable nonconformance is a query, the system knows the blast radius before the
 commit. The REPL and IDE report it and refuse to proceed without a decision:
 
 ```
-datacode[app.auth]> table User { username : Username where minLen 12 }
+datacode[app.auth]> table User { *, username : Username where minLen 12 }
 datacode[app.auth]> :commit
 error: app.auth.User.username / minLen12 is new and app.auth.User has 41 208 rows.
        1 284 rows (3.1%) do not satisfy it.
@@ -193,22 +246,38 @@ This is the point of the whole mechanism. A rule change that silently locks out 
 of a user base is a decision someone should make deliberately, at the moment they have the
 number in front of them.
 
+The `*` in that declaration is load-bearing: a redeclaration carries existing fields forward only
+if it says so, and without it the transcript deprecates every other column of `User`
+([schema/evolution.md](schema/evolution.md#redeclare-a-table)).
+
 An empty table needs no mode; the default `enforce always` applies, and there is nothing to
 grandfather.
+
+**A newly added field needs no mode either, and cannot usefully take one.** Every field added to
+an existing table carries a default, and every admissible default is closed
+([schema/evolution.md](schema/evolution.md#redeclare-a-table)) — so a predicate on it has a blast
+radius of 0% or 100%, decided by evaluating one value once. Satisfied, there is nothing to
+choose; failed, the commit is rejected outright rather than offered three modes, because a
+default failing its own predicate marks every existing row in one commit. That is a schema error,
+not a migration decision. Modes exist for rows the author did not write.
 
 ## The Violations Table
 
 ```
+type SchemaRule = CandidateKeyRequired
+
 table system.integrity.Violation : LogData {
   subject_table :> system.schema.Table,
   subject       : DataId,
-  functor       : FunctorRef,
+  functor       : FunctorRef | SchemaRule,
   schema_node   : DataId,
   origin        : Derived | Observed | Forced,
-  observed      : Bytes | Redacted | Erased | NotGiven,
-  state         : Open | Acknowledged | Waived Text | Repaired,
+  observed      : Bytes | Redacted | Erased | NotGiven = NotGiven
+}
 
-  assert readableAccess { authed_user `canRead` subject_table }
+table system.integrity.Disposition : LogData {
+  violation :> system.integrity.Violation,
+  state     : Acknowledged | Waived Text | Repaired
 }
 ```
 
@@ -226,16 +295,76 @@ point at a row in any table at all. The alternatives were considered and rejecte
 The pair `(subject_table, subject)` *is* the existential, written out by hand. It is also how
 the graph is physically keyed, so nothing is being faked.
 
-### Violations Live in the Subject's Shard
+**A bare `DataId` still resolves through a re-key.** Changing a row's shard root is a delete plus
+an insert, so the subject of an old violation is a tombstone with a successor. A `DataId` follows
+the re-key link forward wherever it is read
+([transaction-graph.md](transaction-graph.md#re-keying-is-recorded-on-the-node)) — one rule
+serving `Violation.subject`, `TriggerState.subject` and a captured queue payload alike. The
+violation itself is never rewritten: it is a historical fact about a transaction, so it stays in
+the log segment it was written to and resolves forward on read.
+
+`functor` names what was violated, and the field is named for the head of its alternation, as
+every alternation is. Almost always the head is right — a violation names one of the four functor
+kinds ([schema/functors.md](schema/functors.md)). One thing that can fail against data is not a
+functor of any kind: the mandatory candidate key is a schema-commit check
+([above](#connector-tables-without-a-source-key)). `SchemaRule` is the closed set of such checks,
+with one member today, so a commit check can be named, grouped and reported exactly as a functor
+is without being typed as one.
+
+### The State of a Violation Is Appended, Not Written Onto It
+
+A violation is `Open` from the moment it is recorded. Acknowledging, waiving and repairing one
+each **append a `Disposition`**, and the current state of a violation is the state of the latest
+disposition naming it — an ordinary query. `Open` is therefore the absence of a disposition and
+needs no stored value.
+
+This replaces a mutable `state : Open | Acknowledged | Waived Text | Repaired` column on the
+violation itself, and it is what [traits.md](schema/traits.md#queue-and-queuestate) already
+prescribes: anything needing a record *after the fact* goes in its own `LogData` table with a `:>`
+back. Three things follow, and each is a defect closed rather than a preference:
+
+- **`LogData` keeps its one append-only exemption.** That exemption is the `QueueState` field on
+  a `Queue` table, written by that queue's handler. A second mutable column here would have made
+  the claim false, and the design advertises it.
+- **Every column of `Violation` is fixed at write**, which is what lets [Retention](#retention)
+  branch on one and stay decidable when the row is written.
+- **The waiver records who and when.** The disposition is its own row, so its `created_at` and
+  the transaction that wrote it answer "who waived this, and when" without an authority column —
+  the acting token is recoverable through `system.logs.HttpRequest.tx_id`, the same argument
+  [storage.md](storage.md#views-are-proposed-not-created-silently) makes for accepting a
+  proposal.
+
+**Read access to a violation follows the subject table's own grants**, evaluated where every
+other grant is ([auth.md](auth.md#schema-level-access-and-bypass)). An earlier declaration carried
+an `assert readableAccess` applying a `canRead` function to `authed_user` and `subject_table`.
+That is withdrawn: the function exists nowhere, and defining it would mean re-implementing the
+recursive grant walk inside an assert body — one decision with two authorities, which is what
+schema-level reach is kept out of asserts to prevent.
+
+### Violations Are Written Where They Are Observed
 
 A single global violations table would be a cluster-wide write hotspot and would break the
 `UserData` shard-local invariant — a violation about a row in a user shard would force a
-cross-shard write on every ingest. Violations are written to **the shard that holds the
-subject row**.
+cross-shard write on every ingest. That alternative is rejected, and what replaces it is more
+local still: `Violation` carries `LogData`, so a row is appended to **the log segment of the
+server that observed it**, and no other server is written to at all.
 
-The consequence is that the admin report is a distributed query rather than a table scan.
-This is already supported: a server broadcasts the query fragment to its neighbours, each
-computes its local contribution, and the requesting server merges them (see
+Co-locating a violation with its subject was the earlier rule and it is not achievable. Placement
+follows the key's foreign-key chain to a shard root — the key declaration is the sharding
+declaration ([schema/tables.md](schema/tables.md#keys-must-be-rooted)) — and this table declares
+no key and no chain: `subject` is deliberately not a foreign key, so there is no edge along which
+co-location could even be computed. A `LogData` table roots at a `system.shards.LogSegment` row
+instead ([transaction-graph.md](transaction-graph.md#logdata-shard-roots)).
+
+Nothing about the audit trail is weakened by that, because what is server-local about `LogData`
+is authorship, not replication: the segment shard has the ordinary three role holders under the
+batched durability class, so losing the observing server does not lose the evidence
+([distribution.md](distribution.md#two-durability-classes)).
+
+The consequence is that the admin report is a distributed query rather than a table scan — and
+that is now the *reason* for it rather than a side effect. This is already supported: a server
+broadcasts the query fragment to its neighbours, each computes its local contribution, and the
+requesting server merges them (see
 [distribution.md](distribution.md#materialized-view-distribution)).
 
 ### Attachment to the Functor Is Logical, Not Physical
@@ -247,22 +376,28 @@ It cannot also be the *physical* clustering, and the reason is worth stating bec
 not obvious. Physical clustering would mean the `Component` trait — violations identified
 relative to a parent and stored in its subtree — and that is unavailable here twice over:
 
-- **The functor is the wrong parent.** Functors are schema objects in the `system` shard,
-  replicated to every server. Making violations components of them would replicate every
-  violation everywhere, which is precisely the write amplification the shard-local rule above
-  exists to prevent.
+- **The functor is the wrong parent.** A functor is a schema object, so it lives on the branch
+  shard and reaches every server with the schema graph. Making violations components of one would
+  replicate every violation everywhere, which is precisely the write amplification the placement
+  rule above exists to prevent.
 - **The subject is not a legal parent either.** A `Component` table has exactly one parent
   table, and a violation's subject may be a row in any table at all — the same polymorphism
   that forces `subject` to be a bare `DataId`.
 
-So `system.integrity.Violation` is an ordinary `LogData` table sharded with its subject, and
-the functor attachment is an FK. The per-functor report is a **materialized view grouped by
-`functor`** — computed in the background, pegged to a commit node, and cheap to read
-repeatedly, which is what a dashboard actually needs. The grouping cost is paid once per
-refresh rather than once per view.
+So `system.integrity.Violation` is an ordinary `LogData` table rooted at the observing server's
+log segment, and the functor attachment is a reference rather than a containment. The per-functor
+report *is* a **materialized view grouped by `functor`** — computed in the background, pegged to
+a commit node, and cheap to read repeatedly, which is what a dashboard actually needs. That is
+the existing materialization machinery (see [storage.md](storage.md#materialization)), not a new
+mechanism, and the grouping cost is paid once per refresh rather than once per read.
 
-Violations do not outlive the rule they refer to: `prune`ing a functor drops its violations,
-because the finding has no meaning once the rule is gone.
+**A violation outlives the rule it refers to.** `prune` removes a schema object and never removes
+log rows — those go only by a `retain` chain
+([schema/aggregates.md](schema/aggregates.md#pruning-is-only-ever-a-consequence)) — so pruning a
+functor cannot drop its violations, and it should not: a `Waived` finding is audit evidence, and
+losing it to an unrelated schema tidy-up would reopen the hole [Retention](#retention) closes. The
+report renders a pruned address as pruned. The predicate behind it is content-addressed and stays
+in the transaction graph, so the finding remains legible; only the attachment is gone.
 
 ### Secrets Never Appear in `observed`
 
@@ -302,33 +437,42 @@ Everything else is an ordinary query or mutation, because
 can be expressed as tables should be:
 
 ```
--- What is open, worst first
-system.integrity.Violation
-  where state is Open
+type NoDisposition : Null
+
+-- What nobody has acted on, worst first
+system.integrity.Violation >< system.integrity.Disposition | NoDisposition as d
+  where d is NoDisposition
   group { functor }
   { functor, count rows as affected }
   order by affected desc
 
 -- Waive one, with a reason
-system.integrity.Violation where id == "05KG3N0000ZQ8V4T1H7C"
-  { state = Waived "legacy import, tracked in TICKET-4471" }
+system.integrity.Disposition {
+  violation = "05KG3N0000ZQ8V4T1H7C",
+  state     = Waived "legacy import, tracked in TICKET-4471"
+}
 
 -- Raise one by hand against a row that passes every automated rule
 system.integrity.Violation {
   subject_table = app.auth.User,
-  subject       = "05KG3N0001BB2M9X4E",
+  subject       = "05KG3N0001BB2M9X4E7D",
   functor       = app.auth.User.manualReview,
-  origin        = Forced,
-  state         = Open
+  schema_node   = "05KG3N0000QF7T2B9K3P",
+  origin        = Forced
 }
 ```
 
-Waiving appends a new state rather than deleting the row, so the waiver and its reason are
-themselves part of the audit trail.
+The first query is an outer join used as an anti-join: `NoDisposition` is `Null`-derived, so it
+always matches, and the rows it matches are the violations with no disposition
+([schema/queries.md](schema/queries.md#outer-joins)). "Open" is the absence of a disposition, so
+there is no state column to filter on.
+
+Waiving appends rather than overwriting, so the waiver and its reason are themselves part of the
+audit trail, and so is the order the decisions were made in.
 
 A `Forced` violation is how an operator marks data as suspect when the reason is not
-expressible as a functor. It is never closed by a view refresh — only an operator can resolve
-it — which is the same rule that protects `Observed` violations.
+expressible as a functor. No scan ever closes one — only an operator can — which is the same
+rule that protects `Observed` violations.
 
 The IDE surfaces the same data as a review queue, unified with the connector conflict queue —
 they are the same workflow, and an operator should not have to check two places to find out
@@ -345,8 +489,8 @@ a rule was tightened, and it would destroy the entire point of `enforce forward`
 that grandfathered values keep working exactly as before. Nonconformance is a fact *about* a
 row, reported out of band; it is not a change to the row's value or its type.
 
-**Not a blocker for reads.** No mode causes a read to fail or a field to disappear. Access
-control is the only thing that changes what a read returns.
+**Not a blocker for reads.** No mode causes a read to fail, a field to disappear, or a redacted
+field to become visible. Access control is the only thing that changes what a read returns.
 
 ## Erasure Restricts, Scrub Destroys
 
@@ -371,25 +515,58 @@ readable ([schema/queries.md](schema/queries.md#delete-appends-a-version)) — w
 row, and unlike a deleted row it reads `Erased` at every *earlier* sample moment as well, for
 every token that does not hold `bypass erasure`.
 
-Call this what it is. It is **restriction of processing** — GDPR Art. 18(2) — not Art. 17
-destruction, and describing it as erasure invites someone to assume the bytes are gone. The
-retained copy is defensible only while it stays inert: unreachable by ordinary query, absent
-from derived state, and unused for any purpose beyond the audit obligation that justifies
-keeping it. Where an authority orders actual destruction, or a regime offers no audit
-carve-out, the operation is `scrub`.
+Call this what it is. Naming it erasure invites someone to assume the bytes are gone, and they
+are not: the row is retained and its **processing is restricted**, which is the shape GDPR Art. 18
+gives that phrase and not the destruction Art. 17 describes.
+
+Be exact about the basis, because an earlier reading of this section was not. Art. 18(2) governs
+data whose processing has *already* been restricted on one of the four grounds in Art. 18(1). It
+is a temporary measure tied to resolving that ground, not a basis a controller may elect for
+indefinite retention — and storage is itself processing (Art. 4(2)), so "kept forever behind an
+access check" needs a basis of its own. Where a subject exercises Art. 17 and the controller keeps
+the record, that basis has to be an **Art. 17(3) exemption**, with a period established under
+Art. 5(1)(e).
+
+The division of labour follows. The exemption, and the retention period it justifies, are the
+deployment's to establish. DataCode's guarantee is narrower and is the only one a database can
+make: the retained copy stays inert — unreachable by ordinary query, absent from derived state,
+and unused for any purpose beyond the obligation that justifies keeping it. Where no exemption
+applies, or an authority orders actual destruction, the operation is `scrub`.
 
 Three properties follow from rules already settled rather than being new:
 
 - **Erasure is retroactive by construction.** A historical read is checked against HEAD's access
   rules, never the moment's (OQ-027), so an erasure decided today closes history today and needs
   no new evaluation path.
-- **Erasing a shard root cascades.** Every dependent row reaches the root through its foreign-key
-  chain ([schema/tables.md](schema/tables.md#keys-must-be-rooted)), so "erase this customer" is
-  one act rather than a traversal someone writes.
+- **Erasing a shard root cascades**, along two edges rather than one. Every dependent row reaches
+  the root through its foreign-key chain
+  ([schema/tables.md](schema/tables.md#keys-must-be-rooted)), so "erase this customer" is one act
+  rather than a traversal someone writes. But re-keying a row is a delete plus an insert
+  ([transaction-graph.md](transaction-graph.md#re-keying-is-recorded-on-the-node)), which copies
+  every non-key field into another shard — so a row that left the subtree carries the erased
+  subject's data and no foreign key reaches it. **The cascade therefore also follows re-key links
+  forward, transitively**, from every row in the erased subtree, and the report carries an
+  outbound-edge entry naming each hop, the shape a crossing FK edge already gets at schema commit
+  ([schema/constraints.md](schema/constraints.md#anchoring)). The cheaper alternative — forbid a
+  re-key on any table carrying `Personal` — is rejected: it removes a routine operation to avoid
+  writing one traversal. Said plainly, the FK chain is no longer a complete account of
+  reachability.
 - **A prior `delete` is unnecessary.** Erasure implies deletion at HEAD.
 
 What must survive the act is the record of it — which row, ordered by whom, under what
-authority, and why — for the reason a `Waived` violation carries its reason.
+authority, and why — for the reason a `Waived` disposition carries its reason.
+
+Two consequences of that survival, both about the re-key record:
+
+- **The record outlives the subtree it left.** Transaction nodes are immutable, so a record
+  saying a row was superseded remains after its predecessor's root is erased, disclosing that
+  something moved out. The residue is real, and it gets the treatment a scrub node already gets:
+  the record stays, and its counterpart identifiers render `Erased` to any token without
+  `bypass erasure` — the same honest disclosure `observed` makes.
+- **A version-chain walk stops at an erased predecessor.** Following a re-key link backwards
+  reaches history that erasure closed, so the walk terminates there and the field reads its value
+  as of the re-key and no earlier. Reconstructing what erasure closed is what the termination
+  exists to prevent.
 
 Derived state holding a copy is handled by what it is. Materialized views and shredded document
 trees are recomputable, so a refresh drops the row. Two cases are not:
@@ -434,12 +611,16 @@ What must never reach the log is an operational list that moves as APIs move, so
 
 ```
 table system.crypto.ScrubRule : Configuration {
-  pattern : Text where isValidRegex,
-  applies : FieldName | DocKey | Both,
-  reason  : Text,
+  pattern   : Text where isValidRegex,
+  applies   : FieldName | DocKey | Both,
+  rationale : Text,
   unique rulePattern { pattern, applies }
 }
 ```
+
+`rationale`, not `reason`: `reason` is reserved, deliberately and with the trade recorded
+([schema/railroad.md](schema/railroad.md#reserved-words)), so a table declaring it as a field is
+the defect rather than the reservation.
 
 Rules match on field path and document key. A default set ships covering the obvious names —
 `password`, `passphrase`, `secret`, `token`, `api_key`, `ssn`, `cvv`.
@@ -471,12 +652,27 @@ distinguishable from a user retyping the same wrong password; on the login path 
 [`system.auth.AttemptDigest`](auth.md#failed-attempt-digests), whose key scope and retention
 rules apply.
 
+**Say what that costs, because it is not free and it is not typed.** The field's declared type is
+unchanged while its stored contents stop being values of that type, so every reader of the field
+breaks — silently, with no type change to warn it. That is the same substitution this document
+[refuses](#what-this-is-not) for a `Nonconforming` absence type, and it is worse here, because
+there the breakage would at least have been type-checked. It is admitted only as a stopgap
+against an active leak.
+
+The repair is a **new field** carrying the correct `Secret` type, with the old one deprecated. It
+is not a redeclaration: a field path is bound to its declared type for the life of the table, so
+retyping it in place is rejected with "choose a new name"
+([schema/evolution.md](schema/evolution.md#redeclare-a-table)). The stopgap ends when that field
+ships, and the `Forced` violation is what keeps it visible until it does.
+
 ### Replication and Restore
 
 A scrub node replicates through the ordinary commit fan-out. Two cases sit outside it:
 
 - **A tertiary holds current state only**, so scrubbing a superseded version reaches nothing
-  there and needs no special handling.
+  there and needs no special handling. The same fact bounds what a tertiary can answer: a
+  question about history — a per-field timestamp, a version chain, a re-key predecessor — routes
+  to the primary or a secondary ([distribution.md](distribution.md#tertiary-servers-any-number)).
 - **A restore replays scrubs.** `import shard` reinstates bytes as they were when the dump was
   taken, which would resurrect anything scrubbed since. A restore is not complete until every
   scrub node at or before the restore point has been re-applied, and the shard does not come
@@ -495,16 +691,26 @@ form in [schema/aggregates.md](schema/aggregates.md#branches):
 
 ```
 retain system.integrity.Violation
-  where origin is Derived && state is Repaired
+  where origin is Derived
     for 90 day
     , drop
   otherwise
     forever
 ```
 
-A `Derived` violation is a query over the transaction graph, recomputable at any time, and
-once it is `Repaired` the repair is visible in the subject row's own history — so discarding a
-closed one loses nothing that cannot be recovered.
+A `Derived` violation is a query over the transaction graph, recomputable at any time, so
+discarding one loses nothing: the next scan re-appends it if it still holds, and if it no longer
+holds there was nothing to keep. What is lost by the drop is the finding's recorded age, which is
+the age of the *record* and never was the age of the nonconformance.
+
+The predicate reads `origin` and nothing else, and that is deliberate. `origin` is fixed when the
+row is written, so the branch is decidable at write, is recorded in the segment key, and the
+segment stays prunable as a whole
+([transaction-graph.md](transaction-graph.md#logdata-shard-roots)). An earlier chain also tested
+`state is Repaired`, a column that changed after the row was written — which filed every row
+under `otherwise forever` at write time and meant the 90-day branch could never fire on anything.
+Moving the state to an appended [`Disposition`](#the-state-of-a-violation-is-appended-not-written-onto-it)
+is what removes the mutable column rather than working around it.
 
 Everything else falls to `otherwise forever`:
 
@@ -512,9 +718,15 @@ Everything else falls to `otherwise forever`:
   policy existed only during a login attempt.
 - **`Forced`** violations were raised by an operator for a reason not expressible as a functor,
   so nothing can re-derive them.
-- **`Waived`** violations carry the waiver and its reason, which is itself part of the audit
-  trail. `Waived "legacy import, tracked in TICKET-4471"` is precisely the record someone
-  wants two years later, and pruning it destroys the evidence that a decision was made.
+
+**A disposed violation is kept with its disposition.** `system.integrity.Disposition` declares no
+`retain` chain, so it is never pruned — silence means keep — and it holds a live foreign key to
+its violation, so the violation goes nowhere either. The `Derived` branch therefore drops exactly
+the findings nobody acted on, which are exactly the ones a re-scan reproduces.
+`Waived "legacy import, tracked in TICKET-4471"` is precisely the record someone wants two years
+later, and nothing in the chain can reach it. The cost is stated rather than hidden: a segment
+holding a disposed violation is no longer prunable as a unit and falls to the row scan
+([schema/aggregates.md](schema/aggregates.md#retention-prunes-whole-segments)).
 
 This satisfies the constraint that made retention an open question: pruning the log shard can
 no longer silently destroy audit evidence, because it is not a manual operation at all. Log
@@ -522,6 +734,6 @@ data is discarded only by a declared chain, and a `LogData` table with no chain 
 pruned. See
 [schema/aggregates.md](schema/aggregates.md#pruning-is-only-ever-a-consequence).
 
-A useful consequence in the other direction: once a violation is resolved and pruned, the
+A useful consequence in the other direction: once a `Derived` violation is dropped, the
 transaction records that only existed to carry it can be compacted too, by the ordinary
 maintenance path rather than a special case.
